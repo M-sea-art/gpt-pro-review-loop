@@ -22,11 +22,19 @@ Each quick tunnel URL is different. ChatGPT's MCP app/connector must point to th
 
 Use a new ChatGPT chat for each review round. Existing `/c/` conversation URLs can preserve an older tool environment where the DevSpace app is not available, even when a newly opened project chat shows DevSpace. Treat that condition as a blocked connector preflight, not as a project review.
 
-Before sending the review prompt, run `PreflightConnector`. It checks local and public `/healthz`, then watches `devspace.out.log` for a non-healthcheck HTTP request after preflight starts. PowerShell health checks are ignored. If the only log entries are local health checks, ChatGPT has not reached this DevSpace instance; the likely causes are stale MCP URL, disconnected app account, or OAuth failure before reaching DevSpace.
+Before sending the review prompt, run `PreflightConnector`. It checks local and public `/healthz`, verifies DevSpace OAuth discovery metadata at `/.well-known/oauth-protected-resource/mcp` and `/.well-known/oauth-authorization-server`, then watches `devspace.out.log` for a non-healthcheck HTTP request after preflight starts. PowerShell health checks are ignored. If the only log entries are local health checks, ChatGPT has not reached this DevSpace instance; the likely causes are stale MCP URL, disconnected app account, or OAuth failure before reaching DevSpace.
+
+During the wait, the script prints:
+
+- the current `/mcp` URL to enter into the ChatGPT DevSpace app.
+- the ChatGPT project/new-chat URL.
+- the local owner token path. Read the Owner password from that file and enter it only into the DevSpace approval page, never into the ChatGPT conversation.
 
 Failure handling:
 
 - `devspace_or_tunnel_unreachable`: start a fresh session; do not use an old quick tunnel URL.
+- `oauth_metadata_unreachable`: public `/healthz` may work, but OAuth discovery does not; do not try ChatGPT until the `.well-known` endpoints return valid metadata.
+- `oauth_request_rejected`: ChatGPT reached DevSpace, but OAuth/connection failed; reconnect the app with the current `/mcp` URL and complete Owner password approval.
 - `no_chatgpt_request_seen`: disconnect/reconnect or recreate the ChatGPT DevSpace app using the current `/mcp` URL while the tunnel is running.
 - On either failure, close the quick tunnel and DevSpace before retrying.
 

@@ -52,7 +52,7 @@ Default v1 policy:
    & "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action PreflightConnector -Root "<project-root>" -ConnectorTimeoutSeconds 300
    ```
 
-   This starts a fresh session if none is running, prints the current MCP URL, waits for the user to reconnect or approve the DevSpace app in ChatGPT, and passes only when DevSpace logs a non-healthcheck request from ChatGPT. If it times out or cannot reach DevSpace/tunnel, it marks the round blocked and closes the public exposure.
+   This starts a fresh session if none is running, checks local/public health and DevSpace OAuth discovery metadata, prints the current MCP URL and local Owner token path, waits for the user to reconnect or approve the DevSpace app in ChatGPT, and passes only when DevSpace logs a non-healthcheck request from ChatGPT. If it times out, sees OAuth rejection, or cannot reach DevSpace/tunnel/OAuth metadata, it marks the round blocked and closes the public exposure.
 
 8. Send the generated review prompt to a new ChatGPT chat in the configured project. The script refuses existing `/c/` conversation URLs and refuses to send until connector preflight has passed:
 
@@ -102,7 +102,7 @@ This prepares the report, starts DevSpace and the quick tunnel, waits for connec
 - Close the quick tunnel at the end of each round or when the user pauses.
 - If connector preflight fails, close the quick tunnel and DevSpace immediately. Do not send the review prompt.
 - Refuse existing ChatGPT `/c/` conversation URLs as send targets. Use a project or new-chat URL so DevSpace can attach to the new chat.
-- Do not paste owner tokens, OAuth callbacks, cookies, or browser session data into ChatGPT.
+- Do not paste owner tokens, OAuth callbacks, cookies, or browser session data into ChatGPT. The Owner password may be entered only into the DevSpace approval page opened by the OAuth flow.
 - Keep experience records process-level. Do not copy secrets, account details, proprietary source snippets, or private business data into public issue drafts.
 
 ## References

@@ -363,6 +363,97 @@ function Test-ConnectorCandidateRequest {
   return $true
 }
 
+function Test-OAuthFailureRequest {
+  param($Request)
+
+  if (-not (Test-ConnectorCandidateRequest $Request)) {
+    return $false
+  }
+  $path = [string]$Request.path
+  $status = [int]$Request.status
+  $isOAuthPath = $path -match "^/(authorize|token|register|revoke|\.well-known/)"
+  return ($isOAuthPath -and $status -ge 400)
+}
+
+function Format-ObservedRequest {
+  param($Request)
+
+  if (-not $Request) {
+    return $null
+  }
+  return [ordered]@{
+    ts = $Request.ts
+    method = $Request.method
+    path = $Request.path
+    status = $Request.status
+    host = $Request.host
+    userAgent = $Request.userAgent
+    requestId = $Request.requestId
+  }
+}
+
+function Invoke-OAuthDiscoveryCheck {
+  param(
+    [string]$TunnelUrl,
+    [string]$McpUrl,
+    [int]$TimeoutSeconds = 20
+  )
+
+  $resourceUrl = "$TunnelUrl/.well-known/oauth-protected-resource/mcp"
+  $authUrl = "$TunnelUrl/.well-known/oauth-authorization-server"
+  $result = [ordered]@{
+    resource_metadata_url = $resourceUrl
+    authorization_server_metadata_url = $authUrl
+    checked_at = (Get-Date).ToString("o")
+    ok = $false
+  }
+
+  try {
+    $resourceResponse = Invoke-WebRequest -Uri $resourceUrl -Method Get -TimeoutSec $TimeoutSeconds -SkipHttpErrorCheck
+    $authResponse = Invoke-WebRequest -Uri $authUrl -Method Get -TimeoutSec $TimeoutSeconds -SkipHttpErrorCheck
+    $result.resource_status = [int]$resourceResponse.StatusCode
+    $result.authorization_server_status = [int]$authResponse.StatusCode
+
+    if ([int]$resourceResponse.StatusCode -ne 200) {
+      $result.error = "OAuth protected resource metadata returned HTTP $([int]$resourceResponse.StatusCode)."
+      return [pscustomobject]$result
+    }
+    if ([int]$authResponse.StatusCode -ne 200) {
+      $result.error = "OAuth authorization server metadata returned HTTP $([int]$authResponse.StatusCode)."
+      return [pscustomobject]$result
+    }
+
+    $resourceMetadata = $resourceResponse.Content | ConvertFrom-Json
+    $authMetadata = $authResponse.Content | ConvertFrom-Json
+    $result.resource = $resourceMetadata.resource
+    $result.authorization_servers = @($resourceMetadata.authorization_servers)
+    $result.issuer = $authMetadata.issuer
+    $result.authorization_endpoint = $authMetadata.authorization_endpoint
+    $result.token_endpoint = $authMetadata.token_endpoint
+    $result.registration_endpoint = $authMetadata.registration_endpoint
+    $result.scopes_supported = @($authMetadata.scopes_supported)
+
+    if ($resourceMetadata.resource -ne $McpUrl) {
+      $result.error = "OAuth resource metadata does not match the current MCP URL."
+      return [pscustomobject]$result
+    }
+    if (-not $authMetadata.authorization_endpoint -or -not $authMetadata.token_endpoint -or -not $authMetadata.registration_endpoint) {
+      $result.error = "OAuth authorization metadata is missing required endpoints."
+      return [pscustomobject]$result
+    }
+    if (@($resourceMetadata.authorization_servers) -notcontains $authMetadata.issuer) {
+      $result.error = "OAuth resource metadata does not list the authorization server issuer."
+      return [pscustomobject]$result
+    }
+
+    $result.ok = $true
+    return [pscustomobject]$result
+  } catch {
+    $result.error = $_.Exception.Message
+    return [pscustomobject]$result
+  }
+}
+
 function Invoke-SensitiveScan {
   param(
     [string]$ProjectRoot,
@@ -828,6 +919,10 @@ function Start-Session {
     Wait-ForHttpStatus "http://127.0.0.1:$LocalPort/healthz" 200 $StartupTimeoutSeconds | Out-Null
     Wait-ForHttpStatus "$tunnelUrl/healthz" 200 $StartupTimeoutSeconds | Out-Null
     Wait-ForHttpStatus $mcpUrl 401 $StartupTimeoutSeconds "Post" | Out-Null
+    $oauthDiscovery = Invoke-OAuthDiscoveryCheck $tunnelUrl $mcpUrl 20
+    if (-not $oauthDiscovery.ok) {
+      throw "OAuth discovery check failed: $($oauthDiscovery.error)"
+    }
 
     $latestReport = Get-ChildItem -LiteralPath $paths.Reports -File -Filter "*-review-request.md" |
       Sort-Object LastWriteTime -Descending |
@@ -881,6 +976,7 @@ Feedback format:
       target_chatgpt_url = $targetChatGptProjectUrl
       conversation_policy = "new_chat_per_review_round"
       connector_preflight_required = $true
+      oauth_discovery = $oauthDiscovery
       connector_preflight = [ordered]@{
         status = "not_started"
         reason = $null
@@ -902,6 +998,7 @@ Feedback format:
 
     Write-Host "Review session started." -ForegroundColor Green
     Write-Host "MCP URL: $mcpUrl"
+    Write-Host "OAuth discovery: OK"
     Write-Host "Owner token path: $($runtime.OwnerToken)"
     Write-Host "Prompt file: $promptPath"
     Write-Host "Expected feedback: $($session.expected_feedback_path)"
@@ -931,15 +1028,22 @@ function Wait-ConnectorPreflight {
   try {
     Wait-ForHttpStatus ("http://127.0.0.1:{0}/healthz" -f $session.local_port) 200 10 | Out-Null
     Wait-ForHttpStatus ("{0}/healthz" -f $session.tunnel_url) 200 20 | Out-Null
+    $oauthDiscovery = Invoke-OAuthDiscoveryCheck $session.tunnel_url $session.mcp_url 20
+    if (-not $oauthDiscovery.ok) {
+      throw "OAuth discovery failed: $($oauthDiscovery.error)"
+    }
+    Set-ObjectProperty $session "oauth_discovery" $oauthDiscovery
+    Save-Session $ProjectRoot $session
   } catch {
-    Set-ConnectorPreflight $ProjectRoot $session "blocked" "devspace_or_tunnel_unreachable" ([pscustomobject][ordered]@{
+    $reason = if ($_.Exception.Message -match "OAuth discovery") { "oauth_metadata_unreachable" } else { "devspace_or_tunnel_unreachable" }
+    Set-ConnectorPreflight $ProjectRoot $session "blocked" $reason ([pscustomobject][ordered]@{
       mcp_url = $session.mcp_url
       local_port = $session.local_port
       tunnel_url = $session.tunnel_url
-      next_action = "Start a fresh review session and reconnect the ChatGPT DevSpace app to the new MCP URL."
+      next_action = "Start a fresh review session. Confirm /healthz and OAuth .well-known metadata are reachable before reconnecting ChatGPT."
       error = $_.Exception.Message
     })
-    throw "Connector preflight cannot start because DevSpace or the public tunnel is unreachable: $($_.Exception.Message)"
+    throw "Connector preflight cannot start because the DevSpace public endpoint is not fully reachable: $($_.Exception.Message)"
   }
 
   $startedAt = Get-Date
@@ -948,13 +1052,20 @@ function Wait-ConnectorPreflight {
     timeout_seconds = $TimeoutSeconds
     mcp_url = $session.mcp_url
     devspace_log = $logPath
-    next_action = "In ChatGPT, disconnect/reconnect the DevSpace app with this MCP URL while this command is waiting."
+    owner_token_path = $session.owner_token_path
+    next_action = "In ChatGPT, disconnect or recreate the DevSpace app with this MCP URL, scan tools/connect, and enter the local Owner password from owner_token_path only in the DevSpace approval page."
   })
 
   Write-Host "Connector preflight waiting for ChatGPT to reach DevSpace." -ForegroundColor Yellow
   Write-Host "MCP URL: $($session.mcp_url)"
   Write-Host "Target ChatGPT project/new-chat URL: $($session.target_chatgpt_project_url)"
-  Write-Host "Reconnect or approve the DevSpace app in ChatGPT now. This check passes only after DevSpace logs a non-healthcheck request from ChatGPT."
+  Write-Host "Owner token path: $($session.owner_token_path)"
+  Write-Host "Manual steps while this waits:"
+  Write-Host "  1. In ChatGPT settings, disconnect or recreate the DevSpace app."
+  Write-Host "  2. Set the app endpoint to the MCP URL above, then scan tools/connect."
+  Write-Host "  3. If an Owner password page opens, paste the password from owner token path there only."
+  Write-Host "  4. Open a new chat in the configured ChatGPT project."
+  Write-Host "This check passes only after DevSpace logs a non-healthcheck request from ChatGPT."
 
   $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
   while ((Get-Date) -lt $deadline) {
@@ -963,6 +1074,21 @@ function Wait-ConnectorPreflight {
     if ($candidates.Count -gt 0) {
       $last = $candidates[-1]
       $session = Get-RunningSession $ProjectRoot
+      $oauthFailures = @($candidates | Where-Object { Test-OAuthFailureRequest $_ })
+      if ($oauthFailures.Count -gt 0) {
+        $failure = $oauthFailures[-1]
+        Set-ConnectorPreflight $ProjectRoot $session "blocked" "oauth_request_rejected" ([pscustomobject][ordered]@{
+          started_at = $startedAt.ToString("o")
+          completed_at = (Get-Date).ToString("o")
+          timeout_seconds = $TimeoutSeconds
+          mcp_url = $session.mcp_url
+          devspace_log = $logPath
+          observed_request_count = $candidates.Count
+          observed_request = (Format-ObservedRequest $failure)
+          next_action = "ChatGPT reached DevSpace, but an OAuth/connection request returned an error. Reconnect the app with the current MCP URL and complete Owner password approval."
+        })
+        throw "Connector preflight saw a ChatGPT-side OAuth request, but it was rejected: $($failure.method) $($failure.path) -> $($failure.status)"
+      }
       Set-ConnectorPreflight $ProjectRoot $session "passed" "chatgpt_request_seen" ([pscustomobject][ordered]@{
         started_at = $startedAt.ToString("o")
         completed_at = (Get-Date).ToString("o")
@@ -970,15 +1096,7 @@ function Wait-ConnectorPreflight {
         mcp_url = $session.mcp_url
         devspace_log = $logPath
         observed_request_count = $candidates.Count
-        observed_request = [ordered]@{
-          ts = $last.ts
-          method = $last.method
-          path = $last.path
-          status = $last.status
-          host = $last.host
-          userAgent = $last.userAgent
-          requestId = $last.requestId
-        }
+        observed_request = (Format-ObservedRequest $last)
       })
       Write-Host "Connector preflight passed. DevSpace saw a ChatGPT-side request: $($last.method) $($last.path) -> $($last.status)" -ForegroundColor Green
       return
@@ -987,6 +1105,7 @@ function Wait-ConnectorPreflight {
   }
 
   $allRequests = @(Get-DevSpaceHttpRequests $logPath $startedAt)
+  $healthOnlyRequests = @($allRequests | Where-Object { $_.path -eq "/healthz" })
   $session = Get-RunningSession $ProjectRoot
   Set-ConnectorPreflight $ProjectRoot $session "blocked" "no_chatgpt_request_seen" ([pscustomobject][ordered]@{
     started_at = $startedAt.ToString("o")
@@ -995,7 +1114,10 @@ function Wait-ConnectorPreflight {
     mcp_url = $session.mcp_url
     devspace_log = $logPath
     total_http_requests_seen = $allRequests.Count
-    next_action = "ChatGPT likely points to an old MCP URL or OAuth failed before reaching DevSpace. Recreate or reconnect the app with the current MCP URL while the tunnel is running."
+    healthcheck_requests_seen = $healthOnlyRequests.Count
+    owner_token_path = $session.owner_token_path
+    oauth_discovery_ok = [bool]($session.oauth_discovery -and $session.oauth_discovery.ok)
+    next_action = "ChatGPT did not reach this DevSpace instance. Disconnect/recreate the app with the current MCP URL, scan tools/connect while the tunnel is running, and complete Owner password approval from owner_token_path."
   })
   throw "Connector preflight timed out. DevSpace did not see a ChatGPT-side request for the current MCP URL."
 }

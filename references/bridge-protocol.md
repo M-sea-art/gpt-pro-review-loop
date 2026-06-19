@@ -44,18 +44,21 @@ docs/ai-bridge/
 - `active_session.target_chatgpt_project_url`: the project/new-chat URL used by browser automation.
 - `active_session.conversation_policy`: normally `new_chat_per_review_round`.
 - `active_session.connector_preflight_required`: must be true for v1 rounds.
+- `active_session.oauth_discovery`: local record of DevSpace OAuth `.well-known` metadata checks.
 - `active_session.connector_preflight`: connection gate state before prompt sending.
 
 Connector preflight states:
 
 - `not_started`: session exists, but ChatGPT reachability has not been checked.
-- `waiting`: Codex is waiting for ChatGPT to reconnect or approve the app and call the current DevSpace endpoint.
-- `passed`: DevSpace logged a non-healthcheck request after preflight started; `SendPrompt` may continue.
+- `waiting`: Codex verified health/OAuth metadata and is waiting for ChatGPT to reconnect or approve the app and call the current DevSpace endpoint.
+- `passed`: DevSpace logged a non-healthcheck, non-error request after preflight started; `SendPrompt` may continue.
 - `blocked`: DevSpace/tunnel was unreachable or no ChatGPT request reached DevSpace before timeout.
 
 Common blocked reasons:
 
 - `devspace_or_tunnel_unreachable`: local `/healthz` or public `/healthz` failed.
+- `oauth_metadata_unreachable`: DevSpace OAuth discovery metadata did not return valid metadata for the current MCP URL.
+- `oauth_request_rejected`: ChatGPT reached DevSpace, but an OAuth/connection request returned an error.
 - `no_chatgpt_request_seen`: the tunnel was healthy, but DevSpace saw no ChatGPT-side request; usually stale MCP URL or OAuth failure before reaching DevSpace.
 
 Codex reports must include metadata fields:
