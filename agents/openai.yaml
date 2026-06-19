@@ -1,0 +1,4 @@
+interface:
+  display_name: "GPT Pro Review Loop"
+  short_description: "Route Codex reports through GPT Pro review"
+  default_prompt: "Use $gpt-pro-review-loop to send this project status to GPT Pro for review and bring the feedback back into Codex."
