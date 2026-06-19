@@ -34,6 +34,7 @@ Describe "gpt-pro-review-loop state machine" {
     $config.code_map_policy | Should -Be "filesystem_map_with_optional_codegraph_context"
     $config.codex_assessment_required | Should -BeTrue
     $config.feedback_return_policy | Should -Be "send_local_assessment_to_same_chat"
+    $config.url_selection_policy | Should -Be "ask_once_when_missing_or_changed"
     $state.PSObject.Properties.Name | Should -Contain "pending_prompts"
     $state.PSObject.Properties.Name | Should -Contain "captured_reviews"
     @($state.pending_prompts).Count | Should -Be 0
@@ -44,6 +45,8 @@ Describe "gpt-pro-review-loop state machine" {
     $state.latest_prompt_opened_tab_url | Should -Be $null
     $state.latest_assessment_target_url | Should -Be $null
     $state.latest_assessment_opened_tab_url | Should -Be $null
+    $state.url_confirmation_required | Should -BeFalse
+    $state.url_confirmation_reason | Should -Be $null
 
     $statusText = (& $script:Skill -Action Status -Root $project | Out-String)
     $statusText | Should -Match "target_chatgpt_url"
@@ -53,6 +56,41 @@ Describe "gpt-pro-review-loop state machine" {
   It "rejects invalid ChatGPT URLs at init" {
     $project = New-TestProject "bad-url"
     { & $script:Skill -Action Init -Root $project -TargetChatGptUrl "https://example.com/not-chatgpt" } | Should -Throw
+  }
+
+  It "requires one-time target URL confirmation before prepare" {
+    $project = New-TestProject "missing-url"
+    & $script:Skill -Action Init -Root $project
+
+    $state = Read-State $project
+    $state.url_confirmation_required | Should -BeTrue
+    $state.url_confirmation_reason | Should -Be "missing_target_chatgpt_url"
+
+    { & $script:Skill -Action Prepare -Root $project } | Should -Throw -ExpectedMessage "*Ask the user once*"
+
+    & $script:Skill -Action Init -Root $project -TargetChatGptUrl "https://chatgpt.com/g/test-project"
+    $state = Read-State $project
+    $state.url_confirmation_required | Should -BeFalse
+    $state.url_confirmation_reason | Should -Be $null
+  }
+
+  It "requires one-time confirmation after target URL changes outside Init" {
+    $project = New-TestProject "changed-url"
+    & $script:Skill -Action Init -Root $project -TargetChatGptUrl "https://chatgpt.com/g/old-project"
+    $configPath = Join-Path $project "docs/ai-review-loop/project-config.json"
+    $config = Get-Content -Raw -LiteralPath $configPath | ConvertFrom-Json
+    $config.target_chatgpt_conversation_url = "https://chatgpt.com/g/new-project"
+    $config.target_chatgpt_url = "https://chatgpt.com/g/new-project"
+    $config | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $configPath -Encoding UTF8
+
+    { & $script:Skill -Action Prepare -Root $project } | Should -Throw -ExpectedMessage "*one-time user confirmation*"
+    $state = Read-State $project
+    $state.url_confirmation_required | Should -BeTrue
+    $state.url_confirmation_reason | Should -Be "target_chatgpt_url_changed"
+
+    & $script:Skill -Action Init -Root $project -TargetChatGptUrl "https://chatgpt.com/g/new-project"
+    $state = Read-State $project
+    $state.url_confirmation_required | Should -BeFalse
   }
 
   It "prepares prompt queue without mixing prompt into review queue" {

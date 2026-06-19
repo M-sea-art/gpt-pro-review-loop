@@ -36,7 +36,8 @@ docs/ai-review-loop/
   "sensitive_scan_policy": "block_unless_allow_sensitive",
   "code_map_policy": "filesystem_map_with_optional_codegraph_context",
   "codex_assessment_required": true,
-  "feedback_return_policy": "send_local_assessment_to_same_chat"
+  "feedback_return_policy": "send_local_assessment_to_same_chat",
+  "url_selection_policy": "ask_once_when_missing_or_changed"
 }
 ```
 
@@ -60,6 +61,12 @@ docs/ai-review-loop/
 - `next_action`: compact machine-readable next step.
 - `stop_reason`: null unless the loop has stopped or paused.
 - `continuation_required`: true when `NextDecision` leaves `loop_status` as `running`; the outer Codex agent must continue with `next_action` instead of giving a final answer.
+- `url_confirmation_required`: true when this project needs a one-time user confirmation of its ChatGPT project/conversation URL.
+- `url_confirmation_reason`: `missing_target_chatgpt_url`, `target_chatgpt_url_changed`, or null.
+
+## URL Confirmation
+
+The ChatGPT target URL is project-local. A new project must not inherit another project's review conversation by default. If `url_confirmation_required` is true, Codex should ask the user once for the target ChatGPT project or conversation URL, then run `Init -TargetChatGptUrl` and continue. Later loop iterations reuse the saved URL without asking again unless the URL changes, is invalid, or the visible browser conversation is clearly different from the configured one.
 
 Review material files should use project-relative paths and avoid local absolute paths.
 

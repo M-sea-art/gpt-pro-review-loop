@@ -52,6 +52,8 @@ Initialize a project once:
 & "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action Init -Root "<project-root>" -TargetChatGptUrl "https://chatgpt.com/..."
 ```
 
+For a new project, this is the one-time URL confirmation gate. If the project has no ChatGPT target URL, `Prepare`, `Run`, `RunLoop`, `SendPrompt`, and `SendAssessment` stop and require the operator to ask the user once for the target ChatGPT project or conversation URL. After `Init -TargetChatGptUrl` records it, later iterations reuse the project-local URL without asking again unless it changes or becomes invalid.
+
 Start a continuous loop after explicit authorization:
 
 ```powershell
@@ -160,7 +162,9 @@ Generated review-loop files are excluded from later code maps and sensitive scan
   "pending_reviews": [],
   "captured_reviews": [],
   "baseline_sent_to_url": null,
-  "baseline_sent_hash": null
+  "baseline_sent_hash": null,
+  "url_confirmation_required": false,
+  "url_confirmation_reason": null
 }
 ```
 
@@ -189,6 +193,7 @@ High-risk actions still pause: account login, CAPTCHA, payment, permission chang
 ## Troubleshooting
 
 - Invalid URL: `Init` accepts only `https://chatgpt.com/...`.
+- Missing project URL: ask the user once for the project's ChatGPT conversation URL, then run `Init -TargetChatGptUrl`; do not reuse another project's URL by default.
 - Missing baseline: run `Prepare -ForceBaseline` or initialize with the correct ChatGPT URL.
 - Secret scan blocked: inspect the generated `security-scans/*.json`; use `-AllowSensitive` only after explicit authorization.
 - GPT reply is long: save it to a temporary file and pass `-ReviewFile`.

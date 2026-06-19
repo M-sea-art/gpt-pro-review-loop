@@ -44,6 +44,8 @@ GPT Pro and Codex efficiency review are both `reviewer` values in the same event
    & "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action Init -Root "<project-root>" -TargetChatGptUrl "https://chatgpt.com/..."
    ```
 
+   If the project has no configured URL, ask the user once for the ChatGPT project/conversation URL before preparing or sending review material. After the user confirms it, store it with `Init -TargetChatGptUrl`; do not ask again in later loop iterations unless the URL changes, is invalid, or the browser is clearly on a different ChatGPT conversation.
+
 3. Prepare the offline review package:
 
    ```powershell
@@ -167,6 +169,7 @@ Always cite local evidence. Evidence can be a file path, command result, test fa
 - Do not inspect cookies, passwords, browser storage, or session files.
 - Do not enter account credentials, purchases, or permission changes through browser automation.
 - If the ChatGPT conversation changes or GPT says context is missing, resend a compressed baseline before asking for another verdict.
+- If a new project has no ChatGPT target URL, stop and ask the user once. Do not guess a conversation URL from unrelated projects.
 - The script requires PowerShell 7+.
 
 ## References

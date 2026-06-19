@@ -216,6 +216,7 @@ function Ensure-ReviewLoop {
     code_map_policy = "filesystem_map_with_optional_codegraph_context"
     codex_assessment_required = $true
     feedback_return_policy = "send_local_assessment_to_same_chat"
+    url_selection_policy = "ask_once_when_missing_or_changed"
   }
   foreach ($key in $requiredConfig.Keys) {
     Set-ObjectProperty $config $key $requiredConfig[$key]
@@ -251,10 +252,12 @@ function Ensure-ReviewLoop {
       latest_assessment_target_url = $null
       latest_assessment_opened_tab_url = $null
       continuation_required = $false
+      url_confirmation_required = -not (Test-ChatGptUrl $targetUrl)
+      url_confirmation_reason = if (Test-ChatGptUrl $targetUrl) { $null } else { "missing_target_chatgpt_url" }
     }
   } else {
     $state = Read-JsonFile $paths.State
-    foreach ($field in @("version", "iteration_counter", "loop_mode", "loop_status", "latest_review", "goal_verdict", "next_action", "stop_reason", "baseline_sent_to_url", "baseline_sent_hash", "latest_prompt_target_url", "latest_prompt_opened_tab_url", "latest_assessment_target_url", "latest_assessment_opened_tab_url", "continuation_required")) {
+    foreach ($field in @("version", "iteration_counter", "loop_mode", "loop_status", "latest_review", "goal_verdict", "next_action", "stop_reason", "baseline_sent_to_url", "baseline_sent_hash", "latest_prompt_target_url", "latest_prompt_opened_tab_url", "latest_assessment_target_url", "latest_assessment_opened_tab_url", "continuation_required", "url_confirmation_required", "url_confirmation_reason")) {
       if (-not ($state.PSObject.Properties.Name -contains $field)) {
         $default = $null
         if ($field -eq "version") { $default = 3 }
@@ -264,6 +267,7 @@ function Ensure-ReviewLoop {
         if ($field -eq "goal_verdict") { $default = "CONTINUE" }
         if ($field -eq "next_action") { $default = "prepare_review" }
         if ($field -eq "continuation_required") { $default = $false }
+        if ($field -eq "url_confirmation_required") { $default = $true }
         Set-ObjectProperty $state $field $default
       }
     }
@@ -286,13 +290,43 @@ function Ensure-ReviewLoop {
       Set-ObjectProperty $state "baseline_sent_to_url" $null
       Set-ObjectProperty $state "baseline_sent_hash" $null
       Set-ObjectProperty $state "next_action" "prepare_review"
+      Set-ObjectProperty $state "url_confirmation_required" $true
+      Set-ObjectProperty $state "url_confirmation_reason" "target_chatgpt_url_changed"
     }
   }
   if ($config.target_chatgpt_conversation_url -and $state.target_chatgpt_conversation_url -ne $config.target_chatgpt_conversation_url) {
     Set-ObjectProperty $state "target_chatgpt_conversation_url" $config.target_chatgpt_conversation_url
   }
+  $effectiveTarget = $config.target_chatgpt_conversation_url
+  if (-not $effectiveTarget) { $effectiveTarget = $config.target_chatgpt_url }
+  if (Test-ChatGptUrl $effectiveTarget) {
+    if ($targetUrl -or -not $state.url_confirmation_required -or $state.url_confirmation_reason -ne "target_chatgpt_url_changed") {
+      Set-ObjectProperty $state "url_confirmation_required" $false
+      Set-ObjectProperty $state "url_confirmation_reason" $null
+    }
+  } else {
+    Set-ObjectProperty $state "url_confirmation_required" $true
+    Set-ObjectProperty $state "url_confirmation_reason" "missing_target_chatgpt_url"
+    Set-ObjectProperty $state "next_action" "confirm_target_chatgpt_url"
+  }
   Save-State $ProjectRoot $state
   return $paths
+}
+
+function Assert-TargetChatGptUrl {
+  param([Parameter(Mandatory = $true)][string]$ProjectRoot)
+  $config = Get-Config -ProjectRoot $ProjectRoot
+  $state = Get-State -ProjectRoot $ProjectRoot
+  $target = $config.target_chatgpt_conversation_url
+  if (-not $target) { $target = $config.target_chatgpt_url }
+  if ($state.url_confirmation_required) {
+    $reason = if ($state.url_confirmation_reason) { $state.url_confirmation_reason } else { "target_chatgpt_url_needs_confirmation" }
+    throw "Target ChatGPT URL requires one-time user confirmation ($reason). Ask the user once for this project's ChatGPT project/conversation URL, then run -Action Init -TargetChatGptUrl https://chatgpt.com/..."
+  }
+  if (-not (Test-ChatGptUrl $target)) {
+    throw "Target ChatGPT URL is not configured. Ask the user once for this project's ChatGPT project/conversation URL, then run -Action Init -TargetChatGptUrl https://chatgpt.com/..."
+  }
+  return $target
 }
 
 function Get-Config {
@@ -1103,6 +1137,8 @@ function Show-Status {
     latest_assessment_target_url = if ($state) { $state.latest_assessment_target_url } else { $null }
     latest_assessment_opened_tab_url = if ($state) { $state.latest_assessment_opened_tab_url } else { $null }
     continuation_required = if ($state) { $state.continuation_required } else { $false }
+    url_confirmation_required = if ($state) { $state.url_confirmation_required } else { $null }
+    url_confirmation_reason = if ($state) { $state.url_confirmation_reason } else { $null }
     pending_prompt_count = if ($state -and $state.pending_prompts) { @($state.pending_prompts).Count } else { 0 }
     captured_review_count = if ($state -and $state.captured_reviews) { @($state.captured_reviews).Count } else { 0 }
     goal_verdict = if ($state) { $state.goal_verdict } else { $null }
@@ -1122,11 +1158,13 @@ switch ($Action) {
   }
   "Prepare" {
     Ensure-ReviewLoop -ProjectRoot $ProjectRoot -ChatUrl $TargetChatGptUrl | Out-Null
+    Assert-TargetChatGptUrl -ProjectRoot $ProjectRoot | Out-Null
     $scan = Invoke-SensitiveScan -ProjectRoot $ProjectRoot -Allow:$AllowSensitive
     New-ReviewPackage -ProjectRoot $ProjectRoot -ScanPath $scan -ForceFullBaseline:$ForceBaseline | Out-Null
   }
   "SendPrompt" {
     Ensure-ReviewLoop -ProjectRoot $ProjectRoot -ChatUrl $TargetChatGptUrl | Out-Null
+    Assert-TargetChatGptUrl -ProjectRoot $ProjectRoot | Out-Null
     Show-PromptHandoff -ProjectRoot $ProjectRoot -MarkSent:$Send
   }
   "CaptureFeedback" {
@@ -1152,6 +1190,7 @@ switch ($Action) {
   }
   "SendAssessment" {
     Ensure-ReviewLoop -ProjectRoot $ProjectRoot -ChatUrl $TargetChatGptUrl | Out-Null
+    Assert-TargetChatGptUrl -ProjectRoot $ProjectRoot | Out-Null
     New-AssessmentPrompt -ProjectRoot $ProjectRoot
   }
   "NextDecision" {
@@ -1160,6 +1199,7 @@ switch ($Action) {
   }
   "RunLoop" {
     Ensure-ReviewLoop -ProjectRoot $ProjectRoot -ChatUrl $TargetChatGptUrl | Out-Null
+    Assert-TargetChatGptUrl -ProjectRoot $ProjectRoot | Out-Null
     $scan = Invoke-SensitiveScan -ProjectRoot $ProjectRoot -Allow:$AllowSensitive
     New-ReviewPackage -ProjectRoot $ProjectRoot -ScanPath $scan -ForceFullBaseline:$ForceBaseline | Out-Null
     Show-PromptHandoff -ProjectRoot $ProjectRoot -MarkSent:$Send
@@ -1172,6 +1212,7 @@ switch ($Action) {
   }
   "Run" {
     Ensure-ReviewLoop -ProjectRoot $ProjectRoot -ChatUrl $TargetChatGptUrl | Out-Null
+    Assert-TargetChatGptUrl -ProjectRoot $ProjectRoot | Out-Null
     $scan = Invoke-SensitiveScan -ProjectRoot $ProjectRoot -Allow:$AllowSensitive
     New-ReviewPackage -ProjectRoot $ProjectRoot -ScanPath $scan -ForceFullBaseline:$ForceBaseline | Out-Null
     Show-PromptHandoff -ProjectRoot $ProjectRoot -MarkSent:$Send
