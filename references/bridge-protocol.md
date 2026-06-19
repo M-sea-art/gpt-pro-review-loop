@@ -2,7 +2,7 @@
 
 The skill creates project-local coordination files under `docs/ai-review-loop/`.
 
-This protocol is intentionally file-based. It gives Codex a durable ledger of what was sent to GPT Pro, what GPT Pro replied, how Codex judged that advice against local facts, and what still needs the user's confirmation.
+This protocol is intentionally file-based. It gives Codex a durable ledger of what was sent for review, what each reviewer replied, how Codex judged the review events against local facts, and what the next loop decision is.
 
 Required layout:
 
@@ -15,8 +15,9 @@ docs/ai-review-loop/
   code-maps/
   round-requests/
   prompts/
-  gpt-feedback/
-  codex-assessments/
+  reviews/
+  assessments/
+  loop-runs/
   security-scans/
   experience-log.md
   experience-issues/
@@ -29,7 +30,7 @@ docs/ai-review-loop/
   "target_chatgpt_conversation_url": "https://chatgpt.com/...",
   "target_chatgpt_url": "https://chatgpt.com/...",
   "transport": "browser_dossier",
-  "run_mode": "semi_auto",
+  "run_mode": "continuous_until_stopped",
   "review_memory": "chatgpt_project_conversation",
   "baseline_policy": "first_round_full_then_delta",
   "sensitive_scan_policy": "block_unless_allow_sensitive",
@@ -44,12 +45,15 @@ docs/ai-review-loop/
 - `baseline_sent`: whether the full dossier and code map have been submitted to the configured ChatGPT conversation.
 - `baseline_hash`: hash of the latest dossier and code map.
 - `round_counter`: monotonically increasing local round number.
+- `iteration_counter`: monotonically increasing loop iteration number.
+- `loop_mode`: default `continuous_until_stopped`.
+- `loop_status`: `idle`, `running`, `complete`, `paused`, or `blocked`.
 - `latest_prompt`: prompt waiting for GPT Pro or already sent.
-- `latest_feedback`: GPT Pro feedback captured by Codex from ChatGPT.
-- `latest_assessment`: Codex's local practice assessment.
-- `pending_for_gpt`: prompt files that need GPT Pro review.
-- `pending_for_codex`: GPT feedback files waiting for Codex assessment.
-- `pending_assessments_for_gpt`: Codex assessments that should be returned to GPT Pro.
+- `latest_review`: latest unified review event.
+- `latest_assessment`: latest unified local assessment.
+- `goal_verdict`: `GOAL_ACHIEVED`, `CONTINUE`, `NEEDS_EVIDENCE`, `NEEDS_PROCESS_FIX`, `NEEDS_HUMAN_DECISION`, or `BLOCKED`.
+- `next_action`: compact machine-readable next step.
+- `stop_reason`: null unless the loop has stopped or paused.
 
 Review material files should use project-relative paths and avoid local absolute paths.
 
@@ -59,35 +63,41 @@ Review material files should use project-relative paths and avoid local absolute
 - `code-maps/`: filesystem and optional CodeGraph-derived structure summary.
 - `round-requests/`: per-round delta, git status, diff stat, verification notes, and questions.
 - `prompts/`: assembled ChatGPT messages for review requests or Codex assessment returns.
-- `gpt-feedback/`: replies copied from ChatGPT by Codex.
-- `codex-assessments/`: local practice assessment of GPT recommendations.
+- `reviews/`: all external and internal review events. GPT Pro initial review, GPT Pro recheck, Codex efficiency process audit, and Codex efficiency goal audit all live here.
+- `assessments/`: local-practice and combined-next-decision assessments.
+- `loop-runs/`: small JSON records emitted by `NextDecision`.
 
-## Feedback Capture
+## Review Capture
 
-GPT Pro cannot write local files. Codex captures visible ChatGPT replies and stores them under `gpt-feedback/` with metadata:
+GPT Pro cannot write local files. Codex captures visible ChatGPT replies and stores them under `reviews/` with metadata. Codex efficiency review uses the same format:
 
 ```markdown
-- source: gpt-pro
-- target: codex
-- transport: browser_dossier
-- status: ready_for_codex_local_assessment
+- reviewer: gpt-pro | codex-efficiency-auditor
+- phase: initial | recheck | process-audit | goal-audit
+- round:
+- iteration:
+- status: captured
 - related_prompt:
 ```
 
 ## Local Assessment
 
-Codex must assess every actionable GPT recommendation before implementation:
+Codex must assess every actionable review recommendation before implementation:
 
 ```markdown
+- assessment_type: local-practice | combined-next-decision
+- goal_verdict: GOAL_ACHIEVED | CONTINUE | NEEDS_EVIDENCE | NEEDS_PROCESS_FIX | NEEDS_HUMAN_DECISION | BLOCKED
+- next_action:
+
 | GPT recommendation | Codex decision | Local evidence | Action |
 |---|---|---|---|
 | ... | accept|modify|reject|needs-more-info | ... | ... |
 ```
 
-Decisions must be grounded in local facts such as code, tests, acceptance gates, project goals, user boundaries, cost, or risk.
+Decisions must be grounded in local facts such as code, tests, acceptance gates, project goals, user boundaries, cost, or risk. The assessment also includes the overall goal verdict so the loop can continue, gather evidence, fix process, stop, or pause for the user.
 
 The assessment is the handoff contract between "GPT suggested it" and "Codex should act." A recommendation without local evidence remains advisory.
 
 ## Offline Boundary
 
-GPT Pro reviews only the Markdown material in the ChatGPT conversation. Codex remains responsible for reading local files, running tests, saving feedback, and deciding whether a recommendation fits local constraints.
+GPT Pro reviews only the Markdown material in the ChatGPT conversation. Codex remains responsible for reading local files, running tests, saving reviews, and deciding whether a recommendation fits local constraints.

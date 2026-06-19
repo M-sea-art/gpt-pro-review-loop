@@ -10,12 +10,12 @@ Use `edge-browser-control` for ChatGPT web UI operations. Do not use Edge remote
    - prompt file path.
 3. Use `edge-browser-control` to open or claim the target ChatGPT tab.
 4. Paste the full prompt file into the ChatGPT composer.
-5. Submit only after the user has authorized the review round.
+5. Submit only after the user has authorized the review loop or review round.
 6. Run `SendPrompt -Send` after the browser submission succeeds so local state records `baseline_sent`.
 
 If the target conversation is missing context or GPT asks for a baseline, rerun `Prepare` after setting `baseline_sent` to false in `review-state.json`, or send the latest dossier and code map manually.
 
-## Capture GPT Feedback
+## Capture Review
 
 Default to automatic completion detection; do not require the user to say the reply is finished.
 
@@ -26,16 +26,18 @@ Default to automatic completion detection; do not require the user to say the re
    - Do not take repeated screenshots unless visual state is ambiguous.
 3. If the stop control is still visible, wait another 30-60 seconds and check again.
 4. When the stop control disappears and the composer/send controls are stable, extract only the latest assistant reply.
-5. Copy only the GPT Pro review text, not browser metadata or private account details.
+5. Copy only the review text, not browser metadata or private account details.
 6. Save it with:
 
    ```powershell
-   & "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action CaptureFeedback -Root "<project-root>" -FeedbackText "<GPT reply>"
+   & "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action CaptureReview -Root "<project-root>" -Reviewer gpt-pro -Phase initial -ReviewText "<GPT reply>"
    ```
 
-   For long replies, write the reply to a temporary file and pass `-FeedbackFile`.
+   For GPT Pro rechecks, use `-Phase recheck`. For long replies, write the reply to a temporary file and pass `-ReviewFile`.
 
-If generation exceeds a practical wait window, keep checking at low frequency and report status briefly. Hand off only for login, CAPTCHA, permission prompts, or account-security blockers.
+`CaptureFeedback` remains as a compatibility alias for old operator muscle memory, but new docs and automations should use `CaptureReview`.
+
+If generation exceeds a practical wait window, keep checking at low frequency and report status briefly. Hand off only for login, CAPTCHA, permission prompts, account-security blockers, or explicit user stop.
 
 ## Return Codex Local Assessment
 

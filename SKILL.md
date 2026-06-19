@@ -1,6 +1,6 @@
 ---
 name: gpt-pro-review-loop
-description: Run a semi-automatic offline review loop between Codex and GPT Pro using Markdown review packages, code maps, ChatGPT conversation memory, and Codex local practice assessments. Use when the user explicitly asks to send a project, Codex report, milestone status, implementation plan, verification result, or local practice assessment to GPT Pro for review through ChatGPT, then bring GPT Pro feedback back into Codex. Also use for the Chinese request "Pro 审阅循环".
+description: Run a compact offline review loop between Codex, GPT Pro, and Codex efficiency review using Markdown review packages, code maps, ChatGPT conversation memory, local assessments, and next-decision events. Use when the user explicitly asks to send a project, Codex report, milestone status, implementation plan, verification result, or local practice assessment to GPT Pro for review through ChatGPT, then bring feedback back into Codex. Also use for the Chinese request "Pro 审阅循环".
 ---
 
 # GPT Pro Review Loop
@@ -9,16 +9,14 @@ Chinese alias: `Pro 审阅循环`.
 
 ## What This Skill Does
 
-This skill turns a local Codex project into review material that GPT Pro can read in a normal ChatGPT conversation. Codex prepares the project dossier, code map, per-round delta, and prompt; GPT Pro reviews that material; Codex captures the reply, checks it against local facts, and sends a practice-based assessment back to GPT Pro.
+This skill turns a local Codex project into review material that GPT Pro can read in a normal ChatGPT conversation. Codex prepares the project dossier, code map, per-round delta, and prompt; GPT Pro reviews that material; Codex captures the reply; Codex efficiency review can add process or goal audit notes; Codex then checks all review events against local facts and records one next decision.
 
 The loop is useful when the user wants an outside GPT Pro review without exposing the project directory as a live tool workspace.
 
 The mental model is:
 
 ```text
-Codex local project -> Markdown review package -> ChatGPT/GPT Pro
-GPT Pro feedback -> Codex local assessment -> ChatGPT/GPT Pro
-Codex executes only after user confirmation
+review package -> external/internal review -> local assessment -> next decision
 ```
 
 ## Core Rule
@@ -34,6 +32,8 @@ This v2 skill is offline by design:
 - Do not assume GPT Pro can write local files.
 
 Codex owns all local reads, writes, tests, and final execution decisions. GPT Pro reviews only the Markdown material and conversation context that Codex sends through ChatGPT.
+
+GPT Pro and Codex efficiency review are both `reviewer` values in the same event stream. Do not create separate subsystems, directories, or bespoke actions for rechecks, process audits, goal audits, or combined verdicts when the generic review and assessment fields can express the same thing.
 
 ## Workflow
 
@@ -66,25 +66,33 @@ Codex owns all local reads, writes, tests, and final execution decisions. GPT Pr
    & "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action SendPrompt -Root "<project-root>" -Send
    ```
 
-5. After submitting the prompt, automatically wait for GPT Pro to finish with low-frequency Edge checks. Do not require the user to watch the page. When generation completes, read the latest visible GPT Pro reply through Edge and save it locally:
+5. After submitting the prompt, automatically wait for GPT Pro to finish with low-frequency Edge checks. Do not require the user to watch the page. When generation completes, read the latest visible GPT Pro reply through Edge and save it as a review event:
 
    ```powershell
-   & "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action CaptureFeedback -Root "<project-root>" -FeedbackText "<GPT reply>"
+   & "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action CaptureReview -Root "<project-root>" -Reviewer gpt-pro -Phase initial -ReviewText "<GPT reply>"
    ```
 
-   For long replies, save the reply to a temporary file and pass `-FeedbackFile`.
+   For long replies, save the reply to a temporary file and pass `-ReviewFile`.
 
    Completion detection should be conservative: check for the ChatGPT stop-generating control no more often than every 30-60 seconds, avoid full-page dumps during the wait, and capture only the final assistant reply after the stop control disappears. Hand off to the user only for login, CAPTCHA, permission, or account-security blockers.
 
-6. Assess GPT Pro feedback against local reality before acting:
+6. Optionally capture Codex efficiency review in the same event stream:
 
    ```powershell
-   & "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action AssessFeedback -Root "<project-root>" -AssessmentText "<Codex local assessment>"
+   & "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action CaptureReview -Root "<project-root>" -Reviewer codex-efficiency-auditor -Phase goal-audit -ReviewText "<audit>"
+   ```
+
+   The efficiency review checks execution quality, evidence quality, false-completion risk, empty polling, repeated failure, scope drift, and whether the overall goal is achieved.
+
+7. Assess the review events against local reality before acting:
+
+   ```powershell
+   & "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action AssessFeedback -Root "<project-root>" -AssessmentType combined-next-decision -GoalVerdict CONTINUE -NextAction "collect_evidence" -AssessmentText "<Codex local assessment>"
    ```
 
    Each GPT recommendation must be classified as `accept`, `modify`, `reject`, or `needs-more-info` using local evidence such as code, tests, project goals, user constraints, cost, and risk. Do not treat GPT Pro feedback as a final verdict by itself.
 
-7. Return the local practice assessment to GPT Pro:
+8. Return the local practice assessment to GPT Pro:
 
    ```powershell
    & "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action SendAssessment -Root "<project-root>"
@@ -96,9 +104,15 @@ Codex owns all local reads, writes, tests, and final execution decisions. GPT Pr
    & "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action SendAssessment -Root "<project-root>" -Send
    ```
 
-8. Pause before implementing changes or starting another formal review round unless the user explicitly confirms continuation.
+9. Decide the next loop state:
 
-9. Record project-local experience when the round produced a reusable lesson:
+   ```powershell
+   & "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action NextDecision -Root "<project-root>"
+   ```
+
+   `GOAL_ACHIEVED` stops with a final report requirement. `CONTINUE`, `NEEDS_EVIDENCE`, and `NEEDS_PROCESS_FIX` can continue automatically inside an explicitly started loop. `NEEDS_HUMAN_DECISION` and `BLOCKED` pause.
+
+10. Record project-local experience when the round produced a reusable lesson:
 
    ```powershell
    & "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action RecordExperience -Root "<project-root>" -ExperienceOutcome "success|blocked|needs-improvement" -ExperienceLesson "<short reusable lesson>" -ExperienceNotes "<sanitized notes>"
@@ -114,8 +128,24 @@ When the target ChatGPT URL is already configured and the user explicitly asks f
 
 `Run` prepares the review package and prints the Edge handoff. It does not submit to ChatGPT unless the user or Codex explicitly performs the browser step.
 
+## Continuous Loop
+
+When the user explicitly starts continuous review, use:
+
+```powershell
+& "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action RunLoop -Root "<project-root>"
+```
+
+`RunLoop` is the compact loop entry. After that explicit authorization, ordinary next rounds do not require confirmation. Continue until `NextDecision` reports `GOAL_ACHIEVED`, `NEEDS_HUMAN_DECISION`, `BLOCKED`, or the user stops the session. Safety blockers, human gates, external account/login/CAPTCHA, publish/push, destructive file operations, and permission changes still pause.
+
 ## Local Practice Assessment Rules
 
+- `GOAL_ACHIEVED`: acceptance gates and evidence show the requested goal is done.
+- `CONTINUE`: proceed to the next ordinary implementation, evidence, or review step.
+- `NEEDS_EVIDENCE`: automatically gather missing local evidence and send it back.
+- `NEEDS_PROCESS_FIX`: fix loop/process quality before continuing.
+- `NEEDS_HUMAN_DECISION`: pause for user choice or human gate.
+- `BLOCKED`: pause because Codex cannot continue without an external state change.
 - `accept`: GPT advice fits local code, tests, project goals, user scope, and risk budget.
 - `modify`: GPT advice is directionally useful but must be narrowed or adapted.
 - `reject`: GPT advice conflicts with local facts, user constraints, acceptance gates, or practical cost.

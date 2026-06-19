@@ -20,7 +20,7 @@ Record:
 - Whether GPT had enough baseline context.
 - Whether Codex accepted, modified, rejected, or asked for more context on GPT recommendations.
 - What should change in the skill, scripts, prompts, safety checks, or docs.
-- Which prompt, GPT feedback file, and Codex assessment file provide evidence.
+- Which prompt, review event, assessment event, and loop-run record provide evidence.
 
 Do not record:
 

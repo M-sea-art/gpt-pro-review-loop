@@ -1,15 +1,26 @@
 [CmdletBinding()]
 param(
-  [ValidateSet("Init", "Prepare", "SendPrompt", "CaptureFeedback", "WaitFeedback", "AssessFeedback", "SendAssessment", "RecordExperience", "Status", "Run")]
+  [ValidateSet("Init", "Prepare", "SendPrompt", "CaptureFeedback", "CaptureReview", "WaitFeedback", "AssessFeedback", "SendAssessment", "NextDecision", "RunLoop", "RecordExperience", "Status", "Run")]
   [string]$Action = "Run",
   [string]$Root,
   [string]$TargetChatGptUrl,
   [switch]$AllowSensitive,
   [switch]$Send,
+  [ValidateSet("gpt-pro", "codex-efficiency-auditor")]
+  [string]$Reviewer = "gpt-pro",
+  [ValidateSet("initial", "recheck", "process-audit", "goal-audit")]
+  [string]$Phase = "initial",
+  [string]$ReviewText,
+  [string]$ReviewFile,
   [string]$FeedbackText,
   [string]$FeedbackFile,
   [string]$AssessmentText,
   [string]$AssessmentFile,
+  [ValidateSet("local-practice", "combined-next-decision")]
+  [string]$AssessmentType = "combined-next-decision",
+  [ValidateSet("GOAL_ACHIEVED", "CONTINUE", "NEEDS_EVIDENCE", "NEEDS_PROCESS_FIX", "NEEDS_HUMAN_DECISION", "BLOCKED")]
+  [string]$GoalVerdict = "CONTINUE",
+  [string]$NextAction = "collect_evidence",
   [string]$ExperienceOutcome = "unspecified",
   [string]$ExperienceLesson,
   [string]$ExperienceNotes
@@ -17,11 +28,9 @@ param(
 
 $ErrorActionPreference = "Stop"
 
-# This script is the deterministic part of the offline review loop.
-# It never opens a local service or grants GPT direct filesystem access; it only
-# writes review material, records copied GPT feedback, and prepares prompts for
-# Edge/ChatGPT handoff.
-
+# Deterministic local ledger for the offline review loop. Browser operations and
+# Codex efficiency review happen outside this script; this script stores their
+# results in one event stream and decides the next loop state.
 $SkipDirectories = @(
   ".git", ".hg", ".svn", ".codegraph",
   "node_modules", ".venv", "venv", "__pycache__",
@@ -31,11 +40,7 @@ $SkipDirectories = @(
 
 function Resolve-ProjectRoot {
   param([string]$Candidate)
-
-  if ($Candidate) {
-    return (Resolve-Path -LiteralPath $Candidate).Path
-  }
-
+  if ($Candidate) { return (Resolve-Path -LiteralPath $Candidate).Path }
   try {
     $gitRoot = (& git -C (Get-Location).Path rev-parse --show-toplevel 2>$null)
     if ($LASTEXITCODE -eq 0 -and $gitRoot) {
@@ -45,7 +50,6 @@ function Resolve-ProjectRoot {
   } finally {
     $global:LASTEXITCODE = 0
   }
-
   return (Resolve-Path -LiteralPath (Get-Location).Path).Path
 }
 
@@ -54,7 +58,6 @@ function ConvertTo-JsonFile {
     [Parameter(Mandatory = $true)]$Value,
     [Parameter(Mandatory = $true)][string]$Path
   )
-
   $dir = Split-Path -Parent $Path
   if ($dir -and -not (Test-Path -LiteralPath $dir)) {
     New-Item -ItemType Directory -Path $dir -Force | Out-Null
@@ -73,7 +76,6 @@ function Set-ObjectProperty {
     [Parameter(Mandatory = $true)][string]$Name,
     $Value
   )
-
   if ($Object.PSObject.Properties.Name -contains $Name) {
     $Object.$Name = $Value
   } else {
@@ -83,9 +85,6 @@ function Set-ObjectProperty {
 
 function Get-ReviewPaths {
   param([Parameter(Mandatory = $true)][string]$ProjectRoot)
-
-  # Keep all loop artifacts under the project so review history travels with the
-  # worktree and can be audited without reading external runtime state.
   $base = Join-Path $ProjectRoot "docs\ai-review-loop"
   return [pscustomobject]@{
     Base = $base
@@ -96,8 +95,9 @@ function Get-ReviewPaths {
     CodeMaps = Join-Path $base "code-maps"
     RoundRequests = Join-Path $base "round-requests"
     Prompts = Join-Path $base "prompts"
-    Feedback = Join-Path $base "gpt-feedback"
-    Assessments = Join-Path $base "codex-assessments"
+    Reviews = Join-Path $base "reviews"
+    Assessments = Join-Path $base "assessments"
+    LoopRuns = Join-Path $base "loop-runs"
     SecurityScans = Join-Path $base "security-scans"
     ExperienceLog = Join-Path $base "experience-log.md"
     ExperienceIssues = Join-Path $base "experience-issues"
@@ -106,18 +106,7 @@ function Get-ReviewPaths {
 
 function Test-ChatGptUrl {
   param([string]$Url)
-  if (-not $Url) {
-    return $false
-  }
-  return ($Url.Trim() -match "^https://chatgpt\.com/")
-}
-
-function ConvertTo-ChatGptTargetUrl {
-  param([string]$Url)
-  if (-not $Url) {
-    return $null
-  }
-  return $Url.Trim()
+  return ($Url -and $Url.Trim() -match "^https://chatgpt\.com/")
 }
 
 function Get-RelativePath {
@@ -125,7 +114,45 @@ function Get-RelativePath {
     [Parameter(Mandatory = $true)][string]$Root,
     [Parameter(Mandatory = $true)][string]$Path
   )
+  if (-not $Root) { throw "Get-RelativePath received an empty Root." }
+  if (-not $Path) { throw "Get-RelativePath received an empty Path." }
   return ([System.IO.Path]::GetRelativePath($Root, $Path) -replace "\\", "/")
+}
+
+function Get-State {
+  param([Parameter(Mandatory = $true)][string]$ProjectRoot)
+  $paths = Get-ReviewPaths -ProjectRoot $ProjectRoot
+  if (-not (Test-Path -LiteralPath $paths.State)) {
+    throw "Missing review state. Run -Action Init first."
+  }
+  return Read-JsonFile $paths.State
+}
+
+function Save-State {
+  param(
+    [Parameter(Mandatory = $true)][string]$ProjectRoot,
+    [Parameter(Mandatory = $true)]$State
+  )
+  $paths = Get-ReviewPaths -ProjectRoot $ProjectRoot
+  Set-ObjectProperty $State "updated_at" (Get-Date).ToString("o")
+  ConvertTo-JsonFile $State $paths.State
+}
+
+function Add-StateItem {
+  param(
+    [Parameter(Mandatory = $true)][string]$ProjectRoot,
+    [Parameter(Mandatory = $true)][string]$Field,
+    [Parameter(Mandatory = $true)][string]$Value
+  )
+  $state = Get-State $ProjectRoot
+  if (-not ($state.PSObject.Properties.Name -contains $Field) -or $null -eq $state.$Field) {
+    Set-ObjectProperty $state $Field @()
+  }
+  $items = @($state.$Field)
+  if ($items -notcontains $Value) {
+    Set-ObjectProperty $state $Field @($items + $Value)
+  }
+  Save-State $ProjectRoot $state
 }
 
 function Ensure-ReviewLoop {
@@ -133,17 +160,12 @@ function Ensure-ReviewLoop {
     [Parameter(Mandatory = $true)][string]$ProjectRoot,
     [string]$ChatUrl
   )
-
-  # Initialize or migrate the project-local ledger. Existing config/state are
-  # updated in place so a project can keep its ChatGPT conversation memory across
-  # multiple review rounds.
-  $paths = Get-ReviewPaths $ProjectRoot
-  foreach ($dir in @($paths.Base, $paths.Dossiers, $paths.CodeMaps, $paths.RoundRequests, $paths.Prompts, $paths.Feedback, $paths.Assessments, $paths.SecurityScans, $paths.ExperienceIssues)) {
+  $paths = Get-ReviewPaths -ProjectRoot $ProjectRoot
+  foreach ($dir in @($paths.Base, $paths.Dossiers, $paths.CodeMaps, $paths.RoundRequests, $paths.Prompts, $paths.Reviews, $paths.Assessments, $paths.LoopRuns, $paths.SecurityScans, $paths.ExperienceIssues)) {
     if (-not (Test-Path -LiteralPath $dir)) {
       New-Item -ItemType Directory -Path $dir -Force | Out-Null
     }
   }
-
   if (-not (Test-Path -LiteralPath $paths.Decisions)) {
     Set-Content -LiteralPath $paths.Decisions -Encoding UTF8 -Value "# GPT Pro Review Loop Decisions`n"
   }
@@ -151,7 +173,7 @@ function Ensure-ReviewLoop {
     Set-Content -LiteralPath $paths.ExperienceLog -Encoding UTF8 -Value "# GPT Pro Review Loop Experience Log`n"
   }
 
-  $targetUrl = ConvertTo-ChatGptTargetUrl $ChatUrl
+  $targetUrl = if ($ChatUrl) { $ChatUrl.Trim() } else { $null }
   if (Test-Path -LiteralPath $paths.Config) {
     $config = Read-JsonFile $paths.Config
     if ($targetUrl) {
@@ -163,63 +185,64 @@ function Ensure-ReviewLoop {
       target_chatgpt_conversation_url = $targetUrl
       target_chatgpt_url = $targetUrl
       transport = "browser_dossier"
-      run_mode = "semi_auto"
+      run_mode = "continuous_until_stopped"
       review_memory = "chatgpt_project_conversation"
       baseline_policy = "first_round_full_then_delta"
       sensitive_scan_policy = "block_unless_allow_sensitive"
-      code_map_policy = "filesystem_map_with_optional_codegraph_context"
-      codex_assessment_required = $true
-      feedback_return_policy = "send_local_assessment_to_same_chat"
       local_project_name = (Split-Path -Leaf $ProjectRoot)
     }
   }
-
   Set-ObjectProperty $config "transport" "browser_dossier"
-  Set-ObjectProperty $config "run_mode" "semi_auto"
-  Set-ObjectProperty $config "review_memory" "chatgpt_project_conversation"
-  Set-ObjectProperty $config "baseline_policy" "first_round_full_then_delta"
-  Set-ObjectProperty $config "codex_assessment_required" $true
-  Set-ObjectProperty $config "feedback_return_policy" "send_local_assessment_to_same_chat"
+  Set-ObjectProperty $config "run_mode" "continuous_until_stopped"
   Set-ObjectProperty $config "local_project_name" (Split-Path -Leaf $ProjectRoot)
   ConvertTo-JsonFile $config $paths.Config
 
   if (-not (Test-Path -LiteralPath $paths.State)) {
     $state = [ordered]@{
-      version = 2
+      version = 3
       updated_at = (Get-Date).ToString("o")
       baseline_sent = $false
       baseline_hash = $null
       round_counter = 0
-      pending_for_gpt = @()
-      pending_for_codex = @()
-      pending_assessments_for_gpt = @()
+      iteration_counter = 0
+      loop_mode = "continuous_until_stopped"
+      loop_status = "idle"
       latest_prompt = $null
-      latest_feedback = $null
+      latest_review = $null
       latest_assessment = $null
+      goal_verdict = "CONTINUE"
+      next_action = "prepare_review"
+      stop_reason = $null
+      pending_reviews = @()
+      pending_assessments = @()
       target_chatgpt_conversation_url = $targetUrl
     }
-    ConvertTo-JsonFile $state $paths.State
   } else {
     $state = Read-JsonFile $paths.State
-    Set-ObjectProperty $state "version" 2
-    Set-ObjectProperty $state "target_chatgpt_conversation_url" $config.target_chatgpt_conversation_url
-    Set-ObjectProperty $state "updated_at" (Get-Date).ToString("o")
-    foreach ($field in @("pending_for_gpt", "pending_for_codex", "pending_assessments_for_gpt")) {
+    foreach ($field in @("version", "iteration_counter", "loop_mode", "loop_status", "latest_review", "goal_verdict", "next_action", "stop_reason")) {
+      if (-not ($state.PSObject.Properties.Name -contains $field)) {
+        $default = $null
+        if ($field -eq "version") { $default = 3 }
+        if ($field -eq "iteration_counter") { $default = 0 }
+        if ($field -eq "loop_mode") { $default = "continuous_until_stopped" }
+        if ($field -eq "loop_status") { $default = "idle" }
+        if ($field -eq "goal_verdict") { $default = "CONTINUE" }
+        if ($field -eq "next_action") { $default = "prepare_review" }
+        Set-ObjectProperty $state $field $default
+      }
+    }
+    foreach ($field in @("pending_reviews", "pending_assessments")) {
       if (-not ($state.PSObject.Properties.Name -contains $field) -or $null -eq $state.$field) {
         Set-ObjectProperty $state $field @()
       }
     }
-    foreach ($field in @("baseline_sent", "baseline_hash", "round_counter", "latest_prompt", "latest_feedback", "latest_assessment")) {
-      if (-not ($state.PSObject.Properties.Name -contains $field)) {
-        $default = $null
-        if ($field -eq "baseline_sent") { $default = $false }
-        if ($field -eq "round_counter") { $default = 0 }
-        Set-ObjectProperty $state $field $default
-      }
+    Set-ObjectProperty $state "version" 3
+    Set-ObjectProperty $state "loop_mode" "continuous_until_stopped"
+    if ($config.target_chatgpt_conversation_url) {
+      Set-ObjectProperty $state "target_chatgpt_conversation_url" $config.target_chatgpt_conversation_url
     }
-    ConvertTo-JsonFile $state $paths.State
   }
-
+  Save-State $ProjectRoot $state
   return $paths
 }
 
@@ -232,54 +255,14 @@ function Get-Config {
   return Read-JsonFile $paths.Config
 }
 
-function Get-State {
-  param([Parameter(Mandatory = $true)][string]$ProjectRoot)
-  $paths = Get-ReviewPaths $ProjectRoot
-  if (-not (Test-Path -LiteralPath $paths.State)) {
-    throw "Missing review state. Run -Action Init first."
-  }
-  return Read-JsonFile $paths.State
-}
-
-function Save-State {
-  param(
-    [Parameter(Mandatory = $true)][string]$ProjectRoot,
-    [Parameter(Mandatory = $true)]$State
-  )
-  $paths = Get-ReviewPaths $ProjectRoot
-  Set-ObjectProperty $State "updated_at" (Get-Date).ToString("o")
-  ConvertTo-JsonFile $State $paths.State
-}
-
-function Add-StateItem {
-  param(
-    [Parameter(Mandatory = $true)][string]$ProjectRoot,
-    [Parameter(Mandatory = $true)][string]$Field,
-    [Parameter(Mandatory = $true)][string]$Value
-  )
-
-  $state = Get-State -ProjectRoot $ProjectRoot
-  if (-not ($state.PSObject.Properties.Name -contains $Field) -or $null -eq $state.$Field) {
-    Set-ObjectProperty $state $Field @()
-  }
-  $items = @($state.$Field)
-  if ($items -notcontains $Value) {
-    Set-ObjectProperty $state $Field @($items + $Value)
-  }
-  Save-State $ProjectRoot $state
-}
-
 function Get-GitText {
   param(
     [Parameter(Mandatory = $true)][string]$ProjectRoot,
     [Parameter(Mandatory = $true)][string[]]$Args
   )
-
   try {
     $output = & git -C $ProjectRoot @Args 2>$null
-    if ($LASTEXITCODE -eq 0) {
-      return ($output -join "`n").Trim()
-    }
+    if ($LASTEXITCODE -eq 0) { return ($output -join "`n").Trim() }
   } catch {
   } finally {
     $global:LASTEXITCODE = 0
@@ -288,14 +271,9 @@ function Get-GitText {
 }
 
 function Test-SkippedPath {
-  param(
-    [Parameter(Mandatory = $true)][string]$RelativePath
-  )
-  $parts = $RelativePath -split "[\\/]"
-  foreach ($part in $parts) {
-    if ($SkipDirectories -contains $part) {
-      return $true
-    }
+  param([Parameter(Mandatory = $true)][string]$RelativePath)
+  foreach ($part in ($RelativePath -split "[\\/]")) {
+    if ($SkipDirectories -contains $part) { return $true }
   }
   return $false
 }
@@ -305,10 +283,9 @@ function Get-ProjectFiles {
     [Parameter(Mandatory = $true)][string]$ProjectRoot,
     [int]$Limit = 500
   )
-
-  $files = @(Get-ChildItem -LiteralPath $ProjectRoot -Recurse -File -Force -ErrorAction SilentlyContinue |
+  return @(Get-ChildItem -LiteralPath $ProjectRoot -Recurse -File -Force -ErrorAction SilentlyContinue |
     ForEach-Object {
-      $relative = Get-RelativePath $ProjectRoot $_.FullName
+      $relative = Get-RelativePath -Root $ProjectRoot -Path $_.FullName
       if (-not (Test-SkippedPath $relative)) {
         [pscustomobject]@{
           path = $relative
@@ -320,20 +297,15 @@ function Get-ProjectFiles {
     } |
     Sort-Object path |
     Select-Object -First $Limit)
-
-  return $files
 }
 
 function Get-ProjectTreeText {
   param([Parameter(Mandatory = $true)][string]$ProjectRoot)
-
   $items = @(Get-ChildItem -LiteralPath $ProjectRoot -Force -ErrorAction SilentlyContinue |
     Where-Object { -not ($SkipDirectories -contains $_.Name) } |
     Sort-Object @{ Expression = { -not $_.PSIsContainer } }, Name |
     Select-Object -First 100)
-  if ($items.Count -eq 0) {
-    return "(empty project root)"
-  }
+  if ($items.Count -eq 0) { return "(empty project root)" }
   return ($items | ForEach-Object {
     if ($_.PSIsContainer) { "[dir]  " + $_.Name } else { "[file] " + $_.Name }
   }) -join "`n"
@@ -341,22 +313,12 @@ function Get-ProjectTreeText {
 
 function Get-KeyFiles {
   param([Parameter(Mandatory = $true)][string]$ProjectRoot)
-
-  $patterns = @(
-    "AGENTS.md", "README.md", "package.json", "pnpm-lock.yaml", "yarn.lock", "package-lock.json",
-    "pyproject.toml", "requirements.txt", "Cargo.toml", "go.mod", "deno.json", "tsconfig.json",
-    "vite.config.*", "next.config.*", "godot.project", "project.godot", "*.sln", "*.csproj"
-  )
+  $patterns = @("AGENTS.md", "README.md", "package.json", "pyproject.toml", "requirements.txt", "Cargo.toml", "go.mod", "tsconfig.json", "godot.project", "project.godot", "*.sln", "*.csproj")
   $found = New-Object System.Collections.Generic.List[string]
   foreach ($pattern in $patterns) {
-    $matches = @(Get-ChildItem -LiteralPath $ProjectRoot -Recurse -File -Force -Filter $pattern -ErrorAction SilentlyContinue |
-      Where-Object {
-        $relative = Get-RelativePath $ProjectRoot $_.FullName
-        -not (Test-SkippedPath $relative)
-      } |
-      Select-Object -First 20)
-    foreach ($item in $matches) {
-      $found.Add((Get-RelativePath $ProjectRoot $item.FullName)) | Out-Null
+    foreach ($item in @(Get-ChildItem -LiteralPath $ProjectRoot -Recurse -File -Force -Filter $pattern -ErrorAction SilentlyContinue | Select-Object -First 20)) {
+      $relative = Get-RelativePath -Root $ProjectRoot -Path $item.FullName
+      if (-not (Test-SkippedPath $relative)) { $found.Add($relative) | Out-Null }
     }
   }
   return @($found.ToArray() | Sort-Object -Unique)
@@ -364,7 +326,6 @@ function Get-KeyFiles {
 
 function Get-TestHints {
   param([Parameter(Mandatory = $true)][string]$ProjectRoot)
-
   $hints = New-Object System.Collections.Generic.List[string]
   $packagePath = Join-Path $ProjectRoot "package.json"
   if (Test-Path -LiteralPath $packagePath) {
@@ -381,13 +342,9 @@ function Get-TestHints {
     }
   }
   foreach ($candidate in @("pytest.ini", "pyproject.toml", "tox.ini", "Cargo.toml", "go.mod", "Makefile")) {
-    if (Test-Path -LiteralPath (Join-Path $ProjectRoot $candidate)) {
-      $hints.Add("Detected $candidate") | Out-Null
-    }
+    if (Test-Path -LiteralPath (Join-Path $ProjectRoot $candidate)) { $hints.Add("Detected $candidate") | Out-Null }
   }
-  if ($hints.Count -eq 0) {
-    $hints.Add("(no obvious test command discovered)") | Out-Null
-  }
+  if ($hints.Count -eq 0) { $hints.Add("(no obvious test command discovered)") | Out-Null }
   return @($hints.ToArray())
 }
 
@@ -396,16 +353,11 @@ function Get-ContentExcerpt {
     [Parameter(Mandatory = $true)][string]$Path,
     [int]$MaxChars = 6000
   )
-
   try {
     $fileInfo = Get-Item -LiteralPath $Path -ErrorAction Stop
-    if ($fileInfo.Length -gt 524288) {
-      return "(skipped: file larger than 512 KiB)"
-    }
+    if ($fileInfo.Length -gt 524288) { return "(skipped: file larger than 512 KiB)" }
     $text = Get-Content -Raw -LiteralPath $Path -ErrorAction Stop
-    if ($text.Length -gt $MaxChars) {
-      return $text.Substring(0, $MaxChars) + "`n...(truncated)"
-    }
+    if ($text.Length -gt $MaxChars) { return $text.Substring(0, $MaxChars) + "`n...(truncated)" }
     return $text
   } catch {
     return "(unreadable: $($_.Exception.Message))"
@@ -417,10 +369,6 @@ function Invoke-SensitiveScan {
     [Parameter(Mandatory = $true)][string]$ProjectRoot,
     [switch]$Allow
   )
-
-  # The scan is intentionally conservative. It blocks obvious secrets before any
-  # review package is assembled, because the generated prompt is meant to be
-  # pasted into a third-party ChatGPT conversation.
   $paths = Get-ReviewPaths $ProjectRoot
   $stamp = Get-Date -Format "yyyyMMdd-HHmmss"
   $scanPath = Join-Path $paths.SecurityScans "$stamp-sensitive-scan.json"
@@ -431,9 +379,7 @@ function Invoke-SensitiveScan {
     @{ name = "Token/password assignment"; pattern = "(?i)(api[_-]?key|access[_-]?token|refresh[_-]?token|session[_-]?token|cookie|password)\s*[:=]\s*['""]?[^'""\s]{12,}" }
   )
   $issues = New-Object System.Collections.Generic.List[object]
-  $files = Get-ProjectFiles $ProjectRoot 20000
-
-  foreach ($file in $files) {
+  foreach ($file in @(Get-ProjectFiles $ProjectRoot 20000)) {
     $name = Split-Path -Leaf $file.path
     foreach ($rule in $riskyNames) {
       if ($name -match $rule) {
@@ -441,29 +387,16 @@ function Invoke-SensitiveScan {
         break
       }
     }
-
-    if ($file.length -gt 1048576) {
-      continue
-    }
-
+    if ($file.length -gt 1048576) { continue }
     $fullPath = Join-Path $ProjectRoot ($file.path -replace "/", "\")
-    try {
-      $text = Get-Content -Raw -LiteralPath $fullPath -ErrorAction Stop
-    } catch {
-      continue
-    }
-
+    try { $text = Get-Content -Raw -LiteralPath $fullPath -ErrorAction Stop } catch { continue }
     foreach ($rule in $patterns) {
       if ($text -match $rule.pattern) {
         $issues.Add([pscustomobject]@{ path = $file.path; type = "content_pattern"; rule = $rule.name }) | Out-Null
       }
     }
-
-    if ($issues.Count -ge 50) {
-      break
-    }
+    if ($issues.Count -ge 50) { break }
   }
-
   $result = [ordered]@{
     created_at = (Get-Date).ToString("o")
     project_name = (Split-Path -Leaf $ProjectRoot)
@@ -473,7 +406,6 @@ function Invoke-SensitiveScan {
     issues = @($issues.ToArray())
   }
   ConvertTo-JsonFile $result $scanPath
-
   if ($issues.Count -gt 0 -and -not $Allow) {
     Write-Host "Sensitive-data scan failed. Review this file:" -ForegroundColor Red
     Write-Host $scanPath
@@ -482,25 +414,18 @@ function Invoke-SensitiveScan {
     }
     throw "Sensitive-data scan blocked the review. Re-run with -AllowSensitive only after explicit user authorization."
   }
-
   Write-Host "Sensitive-data scan passed: $scanPath" -ForegroundColor Green
   return $scanPath
 }
 
 function New-ProjectDossier {
   param(
-    [Parameter(Mandatory = $true, Position = 0)][string]$ProjectRoot,
-    [Parameter(Mandatory = $true, Position = 1)][string]$ScanPath,
-    [Parameter(Mandatory = $true, Position = 2)][string]$RoundId
+    [Parameter(Mandatory = $true)][string]$ProjectRoot,
+    [Parameter(Mandatory = $true)][string]$ScanPath,
+    [Parameter(Mandatory = $true)][string]$RoundId
   )
-
-  # The dossier is the first-round baseline: project shape, visible manifests,
-  # test hints, and git state. It avoids absolute local paths in the body.
-  $dossierDir = [System.IO.Path]::Combine($ProjectRoot, "docs", "ai-review-loop", "dossiers")
-  if (-not (Test-Path -LiteralPath $dossierDir)) {
-    New-Item -ItemType Directory -Path $dossierDir -Force | Out-Null
-  }
-  $dossierPath = [System.IO.Path]::Combine($dossierDir, "$RoundId-project-dossier.md")
+  $paths = Get-ReviewPaths $ProjectRoot
+  $dossierPath = Join-Path $paths.Dossiers "$RoundId-project-dossier.md"
   $projectName = Split-Path -Leaf $ProjectRoot
   $branch = Get-GitText $ProjectRoot @("branch", "--show-current")
   if (-not $branch) { $branch = "(not a git repo or detached)" }
@@ -508,37 +433,33 @@ function New-ProjectDossier {
   if (-not $gitStatus) { $gitStatus = "(clean, not a git repo, or unavailable)" }
   $recentCommits = Get-GitText $ProjectRoot @("log", "--oneline", "-8")
   if (-not $recentCommits) { $recentCommits = "(not available)" }
-  $tree = Get-ProjectTreeText $ProjectRoot
   $keyFiles = Get-KeyFiles $ProjectRoot
   if ($keyFiles.Count -eq 0) { $keyFiles = @("(none discovered)") }
   $tests = Get-TestHints $ProjectRoot
-  $scanRel = Get-RelativePath $ProjectRoot $ScanPath
-
+  $scanRel = Get-RelativePath -Root $ProjectRoot -Path $ScanPath
   $body = @"
 # Project Dossier
 
 - id: $RoundId-dossier
 - created_at: $(Get-Date -Format o)
 - source: codex
-- target: gpt-pro
 - transport: browser_dossier
 - status: baseline_material
 - project_name: $projectName
 
 ## Use
 
-This dossier is a local, sanitized project baseline for GPT Pro review. It replaces direct file access. Treat paths as project-relative. Do not assume access to local files beyond the material Codex sends in this ChatGPT conversation.
+This dossier is a sanitized baseline for offline review. Treat paths as project-relative. Ask Codex for missing snippets or command output.
 
 ## Project Snapshot
 
 - branch: $branch
 - security_scan: $scanRel
-- code_access_policy: summaries, code map, diffs, and necessary excerpts only
 
 ## Top-Level Layout
 
 ```text
-$tree
+$(Get-ProjectTreeText $ProjectRoot)
 ```
 
 ## Key Files And Manifests
@@ -565,74 +486,41 @@ $gitStatus
 $recentCommits
 ```
 
-## Reviewer Instructions
-
-- Review the material Codex provides in this conversation.
-- Ask Codex for missing snippets instead of assuming direct repository access.
-- Give concrete concerns, expected tests, and recommended actions.
-- Codex will locally assess each recommendation before execution and report back.
 "@
-
   Set-Content -LiteralPath $dossierPath -Encoding UTF8 -Value $body
   return $dossierPath
 }
 
 function New-CodeMap {
   param(
-    [Parameter(Mandatory = $true, Position = 0)][string]$ProjectRoot,
-    [Parameter(Mandatory = $true, Position = 1)][string]$RoundId
+    [Parameter(Mandatory = $true)][string]$ProjectRoot,
+    [Parameter(Mandatory = $true)][string]$RoundId
   )
-
-  # The code map is a compact replacement for direct repository browsing. It is
-  # file-system based by default and can be enriched by Codex with CodeGraph
-  # context in the chat prompt when that context is available.
-  $codeMapDir = [System.IO.Path]::Combine($ProjectRoot, "docs", "ai-review-loop", "code-maps")
-  if (-not (Test-Path -LiteralPath $codeMapDir)) {
-    New-Item -ItemType Directory -Path $codeMapDir -Force | Out-Null
-  }
-  $codeMapPath = [System.IO.Path]::Combine($codeMapDir, "$RoundId-code-map.md")
-  $files = @(Get-ProjectFiles -ProjectRoot $ProjectRoot -Limit 1200)
-  $byExt = @($files |
-    Group-Object extension |
-    Sort-Object Count -Descending |
-    Select-Object -First 20 |
-    ForEach-Object {
-      $name = if ($_.Name) { $_.Name } else { "(no extension)" }
-      "{0}: {1}" -f $name, $_.Count
-    })
+  $paths = Get-ReviewPaths -ProjectRoot $ProjectRoot
+  $codeMapPath = Join-Path $paths.CodeMaps "$RoundId-code-map.md"
+  $files = @(Get-ProjectFiles $ProjectRoot 1200)
+  $byExt = @($files | Group-Object extension | Sort-Object Count -Descending | Select-Object -First 20 | ForEach-Object {
+    $name = if ($_.Name) { $_.Name } else { "(no extension)" }
+    "{0}: {1}" -f $name, $_.Count
+  })
   if ($byExt.Count -eq 0) { $byExt = @("(no files)") }
-
   $important = @($files | Where-Object {
     $_.path -match "(^|/)(src|app|lib|server|client|tests?|spec|docs|scripts|tools)/" -or
     $_.path -match "(AGENTS|README|package|pyproject|Cargo|go\.mod|tsconfig|vite|next|godot|project)\."
   } | Select-Object -First 300)
-  if ($important.Count -eq 0) {
-    $important = @($files | Select-Object -First 120)
-  }
-
-  $fileLines = @($important | ForEach-Object {
-    "- {0} ({1} bytes)" -f $_.path, $_.length
-  })
+  if ($important.Count -eq 0) { $important = @($files | Select-Object -First 120) }
+  $fileLines = @($important | ForEach-Object { "- {0} ({1} bytes)" -f $_.path, $_.length })
   if ($fileLines.Count -eq 0) { $fileLines = @("- (no project files discovered)") }
-
-  $diffSummary = Get-GitText -ProjectRoot $ProjectRoot -Args @("diff", "--stat")
+  $diffSummary = Get-GitText $ProjectRoot @("diff", "--stat")
   if (-not $diffSummary) { $diffSummary = "(no unstaged diff stat or unavailable)" }
-  $stagedDiffSummary = Get-GitText -ProjectRoot $ProjectRoot -Args @("diff", "--cached", "--stat")
-  if (-not $stagedDiffSummary) { $stagedDiffSummary = "(no staged diff stat or unavailable)" }
-
   $bodyLines = @(
     "# Code Map",
     "",
     "- id: $RoundId-code-map",
     "- created_at: $(Get-Date -Format o)",
     "- source: codex",
-    "- target: gpt-pro",
     "- transport: browser_dossier",
     "- status: code_map",
-    "",
-    "## CodeGraph Note",
-    "",
-    "If Codex has CodeGraph available in the active project, Codex should add structural summaries from CodeGraph to the review prompt. This script provides a deterministic filesystem fallback and does not require CodeGraph.",
     "",
     "## File Type Summary",
     "",
@@ -648,59 +536,38 @@ function New-CodeMap {
     "",
     '```text',
     $diffSummary,
-    '```',
-    "",
-    "## Staged Diff Stat",
-    "",
-    '```text',
-    $stagedDiffSummary,
     '```'
   )
-
   Set-Content -LiteralPath $codeMapPath -Encoding UTF8 -Value ($bodyLines -join [Environment]::NewLine)
   return $codeMapPath
 }
 
 function New-RoundRequest {
   param(
-    [Parameter(Mandatory = $true, Position = 0)][string]$ProjectRoot,
-    [Parameter(Mandatory = $true, Position = 1)][string]$RoundId,
-    [Parameter(Mandatory = $true, Position = 2)][string]$ScanPath
+    [Parameter(Mandatory = $true)][string]$ProjectRoot,
+    [Parameter(Mandatory = $true)][string]$RoundId,
+    [Parameter(Mandatory = $true)][string]$ScanPath
   )
-
-  # Round requests are the delta layer. After the baseline has been sent once,
-  # GPT Pro should primarily review these per-round changes plus conversation
-  # memory.
-  if ([string]::IsNullOrWhiteSpace($ProjectRoot)) {
-    throw "New-RoundRequest received an empty ProjectRoot."
-  }
-  $requestDir = [System.IO.Path]::Combine($ProjectRoot, "docs", "ai-review-loop", "round-requests")
-  if (-not (Test-Path -LiteralPath $requestDir)) {
-    New-Item -ItemType Directory -Path $requestDir -Force | Out-Null
-  }
-  $requestPath = [System.IO.Path]::Combine($requestDir, "$RoundId-round-request.md")
-  $gitStatus = Get-GitText -ProjectRoot $ProjectRoot -Args @("status", "--short")
+  $paths = Get-ReviewPaths -ProjectRoot $ProjectRoot
+  $requestPath = Join-Path $paths.RoundRequests "$RoundId-round-request.md"
+  $gitStatus = Get-GitText $ProjectRoot @("status", "--short")
   if (-not $gitStatus) { $gitStatus = "(clean, not a git repo, or unavailable)" }
-  $diffStat = Get-GitText -ProjectRoot $ProjectRoot -Args @("diff", "--stat")
+  $diffStat = Get-GitText $ProjectRoot @("diff", "--stat")
   if (-not $diffStat) { $diffStat = "(no unstaged diff stat or unavailable)" }
-  $cachedDiffStat = Get-GitText -ProjectRoot $ProjectRoot -Args @("diff", "--cached", "--stat")
-  if (-not $cachedDiffStat) { $cachedDiffStat = "(no staged diff stat or unavailable)" }
   $scanRel = Get-RelativePath -Root $ProjectRoot -Path $ScanPath
-
   $bodyLines = @(
-    "# GPT Pro Review Request",
+    "# Review Request",
     "",
     "- id: $RoundId-request",
     "- created_at: $(Get-Date -Format o)",
     "- source: codex",
-    "- target: gpt-pro",
     "- transport: browser_dossier",
     "- status: ready_for_review",
     "- security_scan: $scanRel",
     "",
     "## Requested Review",
     "",
-    "Review this round using the baseline already present in this ChatGPT conversation plus the material below. Focus on correctness, risks, missing tests, privacy/security concerns, and whether Codex should proceed.",
+    "Review this round with the conversation baseline and material below. GPT Pro should focus on product/technical risks. Codex efficiency auditor should focus on process quality and whether the total goal is achieved.",
     "",
     "## Local Changes Since Last Review",
     "",
@@ -708,44 +575,22 @@ function New-RoundRequest {
     $gitStatus,
     '```',
     "",
-    "## Unstaged Diff Stat",
+    "## Diff Stat",
     "",
     '```text',
     $diffStat,
-    '```',
-    "",
-    "## Staged Diff Stat",
-    "",
-    '```text',
-    $cachedDiffStat,
-    '```',
-    "",
-    "## Feedback Format",
-    "",
-    "Return:",
-    "",
-    "1. Verdict: APPROVE, NEEDS_CHANGES, BLOCKED, or NEEDS_MORE_CONTEXT.",
-    "2. Findings ordered by severity.",
-    "3. Recommended Codex actions.",
-    "4. Tests or verification expected from Codex.",
-    "5. Anything to reject or defer.",
-    "",
-    "Codex will locally assess each recommendation before acting and will send you a practice-based response."
+    '```'
   )
-
   Set-Content -LiteralPath $requestPath -Encoding UTF8 -Value ($bodyLines -join [Environment]::NewLine)
   return $requestPath
 }
 
 function Get-FileHashText {
   param([string[]]$Paths)
-
   $sha = [System.Security.Cryptography.SHA256]::Create()
   $builder = New-Object System.Text.StringBuilder
   foreach ($path in $Paths) {
-    if (Test-Path -LiteralPath $path) {
-      [void]$builder.AppendLine((Get-Content -Raw -LiteralPath $path))
-    }
+    if (Test-Path -LiteralPath $path) { [void]$builder.AppendLine((Get-Content -Raw -LiteralPath $path)) }
   }
   $bytes = [System.Text.Encoding]::UTF8.GetBytes($builder.ToString())
   return [System.BitConverter]::ToString($sha.ComputeHash($bytes)).Replace("-", "").ToLowerInvariant()
@@ -753,30 +598,30 @@ function Get-FileHashText {
 
 function New-ReviewPrompt {
   param(
-    [Parameter(Mandatory = $true, Position = 0)][string]$ProjectRoot,
-    [Parameter(Mandatory = $true, Position = 1)][string]$RoundId,
-    [Parameter(Mandatory = $true, Position = 2)][string]$DossierPath,
-    [Parameter(Mandatory = $true, Position = 3)][string]$CodeMapPath,
-    [Parameter(Mandatory = $true, Position = 4)][string]$RequestPath
+    [Parameter(Mandatory = $true)][string]$ProjectRoot,
+    [Parameter(Mandatory = $true)][string]$RoundId,
+    [Parameter(Mandatory = $true)][string]$DossierPath,
+    [Parameter(Mandatory = $true)][string]$CodeMapPath,
+    [Parameter(Mandatory = $true)][string]$RequestPath
   )
-
-  # Assemble the exact text intended for ChatGPT. Baseline material is included
-  # only until the state records a successful send; later prompts stay compact.
-  $paths = Get-ReviewPaths $ProjectRoot
-  $state = Get-State $ProjectRoot
-  $promptPath = Join-Path $paths.Prompts "$RoundId-review-prompt.md"
+  $paths = Get-ReviewPaths -ProjectRoot $ProjectRoot
+  $state = Get-State -ProjectRoot $ProjectRoot
+  if (-not $paths.Prompts) { throw "Review path set is missing Prompts directory." }
+  if (-not (Test-Path -LiteralPath $paths.Prompts)) {
+    New-Item -ItemType Directory -Path $paths.Prompts -Force | Out-Null
+  }
+  $promptPath = [System.IO.Path]::Combine([string]$paths.Prompts, "$RoundId-review-prompt.md")
+  if (-not $promptPath) { throw "Could not build review prompt path." }
   $includeBaseline = -not [bool]$state.baseline_sent
-
-  $dossier = if ($includeBaseline) { Get-ContentExcerpt $DossierPath 18000 } else { "(baseline already sent in this ChatGPT conversation; ask Codex if you need it repeated)" }
+  $dossier = if ($includeBaseline) { Get-ContentExcerpt $DossierPath 18000 } else { "(baseline already sent in this ChatGPT conversation)" }
   $codeMap = if ($includeBaseline) { Get-ContentExcerpt $CodeMapPath 22000 } else { "(baseline code map already sent; this round is delta-only)" }
   $request = Get-ContentExcerpt $RequestPath 18000
-
   $prompt = @"
 You are GPT Pro reviewing a Codex project through an offline review loop.
 
-Use only the project baseline and round material in this ChatGPT conversation. You do not have direct local file access. If you need more context, ask Codex for a specific snippet or command result.
+Use only the project baseline and round material in this ChatGPT conversation. Ask Codex for missing snippets or command output.
 
-Codex must locally assess your recommendations before acting and will report back with accept/modify/reject/needs-more-info decisions based on real project constraints.
+Codex will also run a local Codex efficiency auditor review. Your feedback and the efficiency review will be merged into a local assessment and next decision.
 
 ## Round
 
@@ -794,38 +639,40 @@ $codeMap
 
 $request
 "@
-
-  Set-Content -LiteralPath $promptPath -Encoding UTF8 -Value $prompt
-  Set-ObjectProperty $state "latest_prompt" (Get-RelativePath $ProjectRoot $promptPath)
-  Add-StateItem $ProjectRoot "pending_for_gpt" (Get-RelativePath $ProjectRoot $promptPath)
-  return $promptPath
+  $promptOutputPath = [System.IO.Path]::Combine([string]$paths.Prompts, "$RoundId-review-prompt.md")
+  if (-not $promptOutputPath) { throw "Could not build review prompt output path." }
+  Set-Content -LiteralPath $promptOutputPath -Encoding UTF8 -Value $prompt
+  $rel = Get-RelativePath -Root $ProjectRoot -Path $promptOutputPath
+  Set-ObjectProperty $state "latest_prompt" $rel
+  Add-StateItem -ProjectRoot $ProjectRoot -Field "pending_reviews" -Value $rel
+  return $promptOutputPath
 }
 
 function New-ReviewPackage {
   param(
-    [Parameter(Mandatory = $true, Position = 0)][string]$ProjectRoot,
-    [Parameter(Mandatory = $true, Position = 1)][string]$ScanPath
+    [Parameter(Mandatory = $true)][string]$ProjectRoot,
+    [Parameter(Mandatory = $true)][string]$ScanPath
   )
-
-  $state = Get-State $ProjectRoot
+  $state = Get-State -ProjectRoot $ProjectRoot
   $roundNumber = [int]$state.round_counter + 1
-  $roundId = "round-{0:000}-{1}" -f $roundNumber, (Get-Date -Format "yyyyMMdd-HHmmss")
-
+  $iterationNumber = [int]$state.iteration_counter + 1
+  $roundId = "round-{0:000}-iter-{1:000}-{2}" -f $roundNumber, $iterationNumber, (Get-Date -Format "yyyyMMdd-HHmmss")
   $dossierPath = New-ProjectDossier -ProjectRoot $ProjectRoot -ScanPath $ScanPath -RoundId $roundId
   $codeMapPath = New-CodeMap -ProjectRoot $ProjectRoot -RoundId $roundId
   $requestPath = New-RoundRequest -ProjectRoot $ProjectRoot -RoundId $roundId -ScanPath $ScanPath
   $promptPath = New-ReviewPrompt -ProjectRoot $ProjectRoot -RoundId $roundId -DossierPath $dossierPath -CodeMapPath $codeMapPath -RequestPath $requestPath
-  $baselineHash = Get-FileHashText @($dossierPath, $codeMapPath)
-
+  $baselineHash = Get-FileHashText -Paths @($dossierPath, $codeMapPath)
   $state = Get-State -ProjectRoot $ProjectRoot
-  Set-ObjectProperty -Object $state -Name "round_counter" -Value $roundNumber
-  Set-ObjectProperty -Object $state -Name "baseline_hash" -Value $baselineHash
-  Set-ObjectProperty -Object $state -Name "latest_dossier" -Value (Get-RelativePath -Root $ProjectRoot -Path $dossierPath)
-  Set-ObjectProperty -Object $state -Name "latest_code_map" -Value (Get-RelativePath -Root $ProjectRoot -Path $codeMapPath)
-  Set-ObjectProperty -Object $state -Name "latest_round_request" -Value (Get-RelativePath -Root $ProjectRoot -Path $requestPath)
-  Set-ObjectProperty -Object $state -Name "latest_prompt" -Value (Get-RelativePath -Root $ProjectRoot -Path $promptPath)
-  Save-State -ProjectRoot $ProjectRoot -State $state
-
+  Set-ObjectProperty $state "round_counter" $roundNumber
+  Set-ObjectProperty $state "iteration_counter" $iterationNumber
+  Set-ObjectProperty $state "baseline_hash" $baselineHash
+  Set-ObjectProperty $state "latest_dossier" (Get-RelativePath -Root $ProjectRoot -Path $dossierPath)
+  Set-ObjectProperty $state "latest_code_map" (Get-RelativePath -Root $ProjectRoot -Path $codeMapPath)
+  Set-ObjectProperty $state "latest_round_request" (Get-RelativePath -Root $ProjectRoot -Path $requestPath)
+  Set-ObjectProperty $state "latest_prompt" (Get-RelativePath -Root $ProjectRoot -Path $promptPath)
+  Set-ObjectProperty $state "loop_status" "running"
+  Set-ObjectProperty $state "next_action" "send_or_capture_review"
+  Save-State $ProjectRoot $state
   Write-Host "Review package created:" -ForegroundColor Green
   Write-Host "  Dossier: $dossierPath"
   Write-Host "  Code map: $codeMapPath"
@@ -839,11 +686,11 @@ function Complete-PromptSend {
     [Parameter(Mandatory = $true)][string]$ProjectRoot,
     [Parameter(Mandatory = $true)][string]$PromptPath
   )
-
   $state = Get-State $ProjectRoot
   Set-ObjectProperty $state "baseline_sent" $true
-  Set-ObjectProperty $state "latest_prompt" (Get-RelativePath $ProjectRoot $PromptPath)
+  Set-ObjectProperty $state "latest_prompt" (Get-RelativePath -Root $ProjectRoot -Path $PromptPath)
   Set-ObjectProperty $state "latest_prompt_sent_at" (Get-Date).ToString("o")
+  Set-ObjectProperty $state "next_action" "capture_gpt_pro_review"
   Save-State $ProjectRoot $state
 }
 
@@ -852,38 +699,24 @@ function Show-PromptHandoff {
     [Parameter(Mandatory = $true)][string]$ProjectRoot,
     [switch]$MarkSent
   )
-
-  # Browser automation is deliberately outside this script. The script prints a
-  # stable handoff target and prompt file so edge-browser-control can perform the
-  # UI action with the user's existing ChatGPT session.
-  $paths = Get-ReviewPaths $ProjectRoot
   $config = Get-Config $ProjectRoot
   $state = Get-State $ProjectRoot
-  $promptRel = $state.latest_prompt
-  if (-not $promptRel) {
-    throw "No prompt is prepared. Run -Action Prepare first."
-  }
-  $promptPath = Join-Path $ProjectRoot ($promptRel -replace "/", "\")
-  if (-not (Test-Path -LiteralPath $promptPath)) {
-    throw "Prepared prompt does not exist: $promptPath"
-  }
+  if (-not $state.latest_prompt) { throw "No prompt is prepared. Run -Action Prepare first." }
+  $promptPath = Join-Path $ProjectRoot ($state.latest_prompt -replace "/", "\")
+  if (-not (Test-Path -LiteralPath $promptPath)) { throw "Prepared prompt does not exist: $promptPath" }
   $target = $config.target_chatgpt_conversation_url
   if (-not $target) { $target = $config.target_chatgpt_url }
-  if (-not (Test-ChatGptUrl $target)) {
-    throw "project-config.json needs target_chatgpt_conversation_url set to a https://chatgpt.com/... URL."
-  }
-
+  if (-not (Test-ChatGptUrl $target)) { throw "project-config.json needs a https://chatgpt.com/... URL." }
   Write-Host "Open this ChatGPT target with the edge-browser-control skill:" -ForegroundColor Cyan
   Write-Host $target
   Write-Host "Paste or send this prompt file:" -ForegroundColor Cyan
   Write-Host $promptPath
   Write-Host "Offline browser dossier only. No local service or public endpoint is used." -ForegroundColor Green
-
   if ($MarkSent) {
     Complete-PromptSend $ProjectRoot $promptPath
-    Write-Host "Marked prompt as sent. Baseline is now recorded as sent for delta-only future rounds." -ForegroundColor Green
+    Write-Host "Marked prompt as sent." -ForegroundColor Green
   } else {
-    Write-Host "After Edge successfully submits it, rerun SendPrompt with -Send to mark it as sent." -ForegroundColor Yellow
+    Write-Host "After Edge submits it, rerun SendPrompt with -Send to mark it as sent." -ForegroundColor Yellow
   }
 }
 
@@ -892,95 +725,93 @@ function Get-LatestFile {
     [Parameter(Mandatory = $true)][string]$Directory,
     [string]$Filter = "*.md"
   )
-  if (-not (Test-Path -LiteralPath $Directory)) {
-    return $null
-  }
+  if (-not (Test-Path -LiteralPath $Directory)) { return $null }
   return Get-ChildItem -LiteralPath $Directory -File -Filter $Filter -ErrorAction SilentlyContinue |
     Sort-Object LastWriteTime -Descending |
     Select-Object -First 1
 }
 
-function Save-GptFeedback {
+function Save-Review {
   param(
     [Parameter(Mandatory = $true)][string]$ProjectRoot,
+    [Parameter(Mandatory = $true)][string]$ReviewerName,
+    [Parameter(Mandatory = $true)][string]$ReviewPhase,
     [string]$Text,
     [string]$File
   )
-
-  # GPT cannot write local files in this workflow. Codex captures the visible
-  # reply from ChatGPT and stores it here as the local source of truth.
   $paths = Get-ReviewPaths $ProjectRoot
-  if ($File) {
-    $feedbackText = Get-Content -Raw -LiteralPath $File
-  } elseif ($Text) {
-    $feedbackText = $Text
-  } else {
-    throw "CaptureFeedback requires -FeedbackText or -FeedbackFile."
-  }
-
+  $reviewText = if ($File) { Get-Content -Raw -LiteralPath $File } elseif ($Text) { $Text } else { throw "CaptureReview requires -ReviewText/-ReviewFile or CaptureFeedback requires -FeedbackText/-FeedbackFile." }
   $state = Get-State $ProjectRoot
   $round = if ($state.round_counter) { "round-{0:000}" -f [int]$state.round_counter } else { "round-000" }
-  $feedbackPath = Join-Path $paths.Feedback ("{0}-{1}-gpt-feedback.md" -f $round, (Get-Date -Format "yyyyMMdd-HHmmss"))
+  $iteration = if ($state.iteration_counter) { "iter-{0:000}" -f [int]$state.iteration_counter } else { "iter-000" }
+  $safeReviewer = $ReviewerName -replace "[^A-Za-z0-9_.-]", "-"
+  $safePhase = $ReviewPhase -replace "[^A-Za-z0-9_.-]", "-"
+  $reviewPath = Join-Path $paths.Reviews ("{0}-{1}-{2}-{3}-review.md" -f $round, $iteration, $safeReviewer, $safePhase)
   $relatedPrompt = if ($state.latest_prompt) { $state.latest_prompt } else { "(unknown)" }
-
   $body = @"
-# GPT Pro Feedback
+# Review Event
 
-- id: $round-gpt-feedback
+- id: $round-$iteration-$safeReviewer-$safePhase-review
 - created_at: $(Get-Date -Format o)
-- source: gpt-pro
-- target: codex
-- transport: browser_dossier
-- status: ready_for_codex_local_assessment
+- reviewer: $ReviewerName
+- phase: $ReviewPhase
+- round: $round
+- iteration: $iteration
+- status: captured
 - related_prompt: $relatedPrompt
 
-## Feedback
+## Review
 
-$feedbackText
+$reviewText
 "@
-
-  Set-Content -LiteralPath $feedbackPath -Encoding UTF8 -Value $body
-  $feedbackRel = Get-RelativePath $ProjectRoot $feedbackPath
-  Add-StateItem $ProjectRoot "pending_for_codex" $feedbackRel
-  $state = Get-State $ProjectRoot
-  Set-ObjectProperty $state "latest_feedback" $feedbackRel
+  Set-Content -LiteralPath $reviewPath -Encoding UTF8 -Value $body
+  $rel = Get-RelativePath -Root $ProjectRoot -Path $reviewPath
+  Add-StateItem -ProjectRoot $ProjectRoot -Field "pending_reviews" -Value $rel
+  $state = Get-State -ProjectRoot $ProjectRoot
+  Set-ObjectProperty $state "latest_review" $rel
+  if ($ReviewerName -eq "gpt-pro") {
+    Set-ObjectProperty $state "next_action" "capture_or_run_efficiency_review"
+  } elseif ($ReviewerName -eq "codex-efficiency-auditor") {
+    Set-ObjectProperty $state "next_action" "build_assessment"
+  }
   Save-State $ProjectRoot $state
-  Write-Host "GPT feedback saved: $feedbackPath" -ForegroundColor Green
-  return $feedbackPath
+  Write-Host "Review saved: $reviewPath" -ForegroundColor Green
+  return $reviewPath
+}
+
+function Get-ReviewEvents {
+  param([Parameter(Mandatory = $true)][string]$ProjectRoot)
+  $paths = Get-ReviewPaths $ProjectRoot
+  if (-not (Test-Path -LiteralPath $paths.Reviews)) { return @() }
+  return @(Get-ChildItem -LiteralPath $paths.Reviews -File -Filter "*.md" -ErrorAction SilentlyContinue | Sort-Object LastWriteTime)
 }
 
 function New-LocalAssessment {
   param(
     [Parameter(Mandatory = $true)][string]$ProjectRoot,
     [string]$Text,
-    [string]$File
+    [string]$File,
+    [string]$Type,
+    [string]$Verdict,
+    [string]$ActionText
   )
-
-  # This is the key safety valve: GPT advice is converted into Codex decisions
-  # only after checking local code, tests, constraints, cost, and risk.
   $paths = Get-ReviewPaths $ProjectRoot
   $state = Get-State $ProjectRoot
-  $latestFeedback = if ($state.latest_feedback) { Join-Path $ProjectRoot ($state.latest_feedback -replace "/", "\") } else { $null }
-  if (-not $latestFeedback -or -not (Test-Path -LiteralPath $latestFeedback)) {
-    $candidate = Get-LatestFile $paths.Feedback
-    if ($candidate) { $latestFeedback = $candidate.FullName }
-  }
-  if (-not $latestFeedback -or -not (Test-Path -LiteralPath $latestFeedback)) {
-    throw "No GPT feedback found. Run -Action CaptureFeedback first."
-  }
-
+  $reviews = @(Get-ReviewEvents $ProjectRoot)
+  if ($reviews.Count -eq 0) { throw "No review events found. Run -Action CaptureReview first." }
   if ($File) {
     $assessmentText = Get-Content -Raw -LiteralPath $File
   } elseif ($Text) {
     $assessmentText = $Text
   } else {
-    $feedbackExcerpt = Get-ContentExcerpt $latestFeedback 12000
+    $reviewList = @($reviews | Select-Object -Last 6 | ForEach-Object { "- " + (Get-RelativePath -Root $ProjectRoot -Path $_.FullName) })
     $gitStatus = Get-GitText $ProjectRoot @("status", "--short")
     if (-not $gitStatus) { $gitStatus = "(clean, not a git repo, or unavailable)" }
     $assessmentText = @"
-## Codex Local Judgment Required
+## Combined Local Assessment Draft
 
-Codex must replace this draft with local practice-based judgments before implementation. Classify each GPT recommendation as `accept`, `modify`, `reject`, or `needs-more-info`.
+Review events considered:
+$($reviewList -join "`n")
 
 ## Local Evidence Snapshot
 
@@ -988,97 +819,120 @@ Codex must replace this draft with local practice-based judgments before impleme
 $gitStatus
 ```
 
-## GPT Feedback To Assess
-
-$feedbackExcerpt
-
 ## Assessment Table
 
-| GPT recommendation | Codex decision | Local evidence | Action |
+| Review item | Codex decision | Local evidence | Action |
 |---|---|---|---|
-| (fill from GPT feedback) | needs-more-info | (cite local code/test/constraint) | (ask GPT or user) |
+| (fill from latest reviews) | needs-more-info | (cite local code/test/constraint) | (collect evidence or continue) |
+
+## Goal And Process Judgment
+
+- Goal verdict: $Verdict
+- Next action: $ActionText
 "@
   }
-
   $round = if ($state.round_counter) { "round-{0:000}" -f [int]$state.round_counter } else { "round-000" }
-  $assessmentPath = Join-Path $paths.Assessments ("{0}-{1}-codex-local-assessment.md" -f $round, (Get-Date -Format "yyyyMMdd-HHmmss"))
-  $feedbackRel = Get-RelativePath $ProjectRoot $latestFeedback
-
+  $iteration = if ($state.iteration_counter) { "iter-{0:000}" -f [int]$state.iteration_counter } else { "iter-000" }
+  $assessmentPath = Join-Path $paths.Assessments ("{0}-{1}-{2}-assessment.md" -f $round, $iteration, $Type)
   $body = @"
-# Codex Local Assessment
+# Assessment Event
 
-- id: $round-codex-local-assessment
+- id: $round-$iteration-$Type-assessment
 - created_at: $(Get-Date -Format o)
 - source: codex
-- target: gpt-pro
-- transport: browser_dossier
-- status: ready_to_return_to_gpt
-- related_feedback: $feedbackRel
+- assessment_type: $Type
+- goal_verdict: $Verdict
+- next_action: $ActionText
+- status: ready_for_next_decision
 
 $assessmentText
 "@
-
   Set-Content -LiteralPath $assessmentPath -Encoding UTF8 -Value $body
-  $assessmentRel = Get-RelativePath $ProjectRoot $assessmentPath
-  Add-StateItem $ProjectRoot "pending_assessments_for_gpt" $assessmentRel
-  $state = Get-State $ProjectRoot
-  Set-ObjectProperty $state "latest_assessment" $assessmentRel
+  $rel = Get-RelativePath -Root $ProjectRoot -Path $assessmentPath
+  Add-StateItem -ProjectRoot $ProjectRoot -Field "pending_assessments" -Value $rel
+  $state = Get-State -ProjectRoot $ProjectRoot
+  Set-ObjectProperty $state "latest_assessment" $rel
+  Set-ObjectProperty $state "goal_verdict" $Verdict
+  Set-ObjectProperty $state "next_action" $ActionText
   Save-State $ProjectRoot $state
-  Write-Host "Codex local assessment saved: $assessmentPath" -ForegroundColor Green
+  Write-Host "Assessment saved: $assessmentPath" -ForegroundColor Green
   return $assessmentPath
 }
 
 function New-AssessmentPrompt {
   param([Parameter(Mandatory = $true)][string]$ProjectRoot)
-
-  # Send Codex's local judgment back to the same ChatGPT conversation so GPT Pro
-  # can correct or refine its recommendations before another round.
   $paths = Get-ReviewPaths $ProjectRoot
   $config = Get-Config $ProjectRoot
   $state = Get-State $ProjectRoot
-  $assessmentRel = $state.latest_assessment
-  if (-not $assessmentRel) {
-    throw "No local assessment found. Run -Action AssessFeedback first."
-  }
-  $assessmentPath = Join-Path $ProjectRoot ($assessmentRel -replace "/", "\")
-  if (-not (Test-Path -LiteralPath $assessmentPath)) {
-    throw "Assessment file does not exist: $assessmentPath"
-  }
-
+  if (-not $state.latest_assessment) { throw "No assessment found. Run -Action AssessFeedback first." }
+  $assessmentPath = Join-Path $ProjectRoot ($state.latest_assessment -replace "/", "\")
+  if (-not (Test-Path -LiteralPath $assessmentPath)) { throw "Assessment file does not exist: $assessmentPath" }
   $target = $config.target_chatgpt_conversation_url
   if (-not $target) { $target = $config.target_chatgpt_url }
-  if (-not (Test-ChatGptUrl $target)) {
-    throw "project-config.json needs target_chatgpt_conversation_url set to a https://chatgpt.com/... URL."
-  }
-
+  if (-not (Test-ChatGptUrl $target)) { throw "project-config.json needs a https://chatgpt.com/... URL." }
   $round = if ($state.round_counter) { "round-{0:000}" -f [int]$state.round_counter } else { "round-000" }
-  $promptPath = Join-Path $paths.Prompts ("{0}-{1}-codex-assessment-return-prompt.md" -f $round, (Get-Date -Format "yyyyMMdd-HHmmss"))
-  $assessment = Get-ContentExcerpt $assessmentPath 22000
+  $iteration = if ($state.iteration_counter) { "iter-{0:000}" -f [int]$state.iteration_counter } else { "iter-000" }
+  $promptPath = Join-Path $paths.Prompts ("{0}-{1}-assessment-return-prompt.md" -f $round, $iteration)
+  $assessment = Get-ContentExcerpt $assessmentPath 24000
   $prompt = @"
-Codex has locally assessed your GPT Pro feedback against the real project state.
+Codex has merged project review, local evidence, and Codex efficiency review into one assessment.
 
-Please review this practice-based response, correct any recommendation that no longer fits, and identify the next narrow review question if another round is useful.
+Please recheck this assessment, correct any recommendation that no longer fits, and identify the next narrow review question if another loop iteration is useful.
 
-## Codex Local Assessment
+## Combined Assessment
 
 $assessment
 "@
-
   Set-Content -LiteralPath $promptPath -Encoding UTF8 -Value $prompt
-  Set-ObjectProperty $state "latest_assessment_prompt" (Get-RelativePath $ProjectRoot $promptPath)
+  Set-ObjectProperty $state "latest_assessment_prompt" (Get-RelativePath -Root $ProjectRoot -Path $promptPath)
   Save-State $ProjectRoot $state
-
   Write-Host "Open this ChatGPT target with the edge-browser-control skill:" -ForegroundColor Cyan
   Write-Host $target
   Write-Host "Send this assessment-return prompt:" -ForegroundColor Cyan
   Write-Host $promptPath
   if ($Send) {
     Set-ObjectProperty $state "latest_assessment_sent_at" (Get-Date).ToString("o")
+    Set-ObjectProperty $state "next_action" "capture_gpt_pro_recheck"
     Save-State $ProjectRoot $state
-    Write-Host "Marked local assessment as sent to GPT." -ForegroundColor Green
+    Write-Host "Marked assessment as sent." -ForegroundColor Green
   } else {
-    Write-Host "After Edge successfully submits it, rerun SendAssessment with -Send to mark it as sent." -ForegroundColor Yellow
+    Write-Host "After Edge submits it, rerun SendAssessment with -Send to mark it as sent." -ForegroundColor Yellow
   }
+}
+
+function Invoke-NextDecision {
+  param([Parameter(Mandatory = $true)][string]$ProjectRoot)
+  $paths = Get-ReviewPaths $ProjectRoot
+  $state = Get-State $ProjectRoot
+  $verdict = if ($state.goal_verdict) { [string]$state.goal_verdict } else { "CONTINUE" }
+  $status = "running"
+  $stopReason = $null
+  switch ($verdict) {
+    "GOAL_ACHIEVED" { $status = "complete"; $stopReason = "goal_achieved" }
+    "NEEDS_HUMAN_DECISION" { $status = "paused"; $stopReason = "human_decision_required" }
+    "BLOCKED" { $status = "blocked"; $stopReason = "blocked_by_assessment" }
+    default { $status = "running" }
+  }
+  Set-ObjectProperty $state "loop_status" $status
+  Set-ObjectProperty $state "stop_reason" $stopReason
+  Save-State $ProjectRoot $state
+  $iteration = if ($state.iteration_counter) { "iter-{0:000}" -f [int]$state.iteration_counter } else { "iter-000" }
+  $runPath = Join-Path $paths.LoopRuns ("{0}-{1}-loop-run.json" -f (Get-Date -Format "yyyyMMdd-HHmmss"), $iteration)
+  $summary = [ordered]@{
+    created_at = (Get-Date).ToString("o")
+    iteration = $state.iteration_counter
+    loop_status = $status
+    goal_verdict = $verdict
+    next_action = $state.next_action
+    stop_reason = $stopReason
+    latest_prompt = $state.latest_prompt
+    latest_review = $state.latest_review
+    latest_assessment = $state.latest_assessment
+  }
+  ConvertTo-JsonFile $summary $runPath
+  Write-Host "Next decision: $verdict" -ForegroundColor Green
+  Write-Host "Loop status: $status"
+  Write-Host "Loop run record: $runPath"
 }
 
 function New-ExperienceRecord {
@@ -1088,29 +942,21 @@ function New-ExperienceRecord {
     [string]$Lesson,
     [string]$Notes
   )
-
-  # Experience records are process lessons, not project disclosures. They are
-  # useful for improving the reusable skill without copying private source or
-  # account details into public issue drafts.
-  Ensure-ReviewLoop $ProjectRoot $null | Out-Null
-  $paths = Get-ReviewPaths $ProjectRoot
-  $state = Get-State $ProjectRoot
+  Ensure-ReviewLoop -ProjectRoot $ProjectRoot -ChatUrl $null | Out-Null
+  $paths = Get-ReviewPaths -ProjectRoot $ProjectRoot
+  $state = Get-State -ProjectRoot $ProjectRoot
   $stamp = Get-Date -Format "yyyy-MM-dd-HHmmss"
   $safeOutcome = if ($Outcome) { $Outcome } else { "unspecified" }
   $safeLesson = if ($Lesson) { $Lesson } else { "(fill in the reusable lesson)" }
   $safeNotes = if ($Notes) { $Notes } else { "(fill in what happened, without secrets or private data)" }
-  $latestPrompt = if ($state.latest_prompt) { $state.latest_prompt } else { "(none)" }
-  $latestFeedback = if ($state.latest_feedback) { $state.latest_feedback } else { "(none)" }
-  $latestAssessment = if ($state.latest_assessment) { $state.latest_assessment } else { "(none)" }
-
   $entry = @(
     "",
     "## $stamp",
     "",
     "- outcome: $safeOutcome",
-    "- latest_prompt: $latestPrompt",
-    "- latest_feedback: $latestFeedback",
-    "- latest_assessment: $latestAssessment",
+    "- latest_review: $($state.latest_review)",
+    "- latest_assessment: $($state.latest_assessment)",
+    "- goal_verdict: $($state.goal_verdict)",
     "",
     "### Notes",
     "",
@@ -1121,111 +967,98 @@ function New-ExperienceRecord {
     $safeLesson
   ) -join [Environment]::NewLine
   Add-Content -LiteralPath $paths.ExperienceLog -Encoding UTF8 -Value $entry
-
   $issuePath = Join-Path $paths.ExperienceIssues ("{0}-github-issue-draft.md" -f $stamp)
-  $issue = @"
-# [experience] browser dossier review loop - $safeOutcome
-
-## Scenario
-
-Project-local use of `gpt-pro-review-loop` v2 browser dossier transport.
-
-## Observed behavior
-
-$safeNotes
-
-## Reusable lesson
-
-$safeLesson
-
-## Local evidence
-
-- Latest prompt: $latestPrompt
-- Latest GPT feedback: $latestFeedback
-- Latest Codex assessment: $latestAssessment
-
-## Privacy check
-
-This draft should contain only process-level experience. Do not paste API keys, cookies, private account data, proprietary source snippets, or private business data into the public GitHub issue.
-"@
-  Set-Content -LiteralPath $issuePath -Encoding UTF8 -Value $issue
-
+  Set-Content -LiteralPath $issuePath -Encoding UTF8 -Value "# [experience] review event loop - $safeOutcome`n`n$safeNotes`n`n## Reusable lesson`n`n$safeLesson`n"
   Write-Host "Experience recorded: $($paths.ExperienceLog)" -ForegroundColor Green
   Write-Host "GitHub issue draft created: $issuePath" -ForegroundColor Green
 }
 
 function Show-Status {
   param([Parameter(Mandatory = $true)][string]$ProjectRoot)
-
   $paths = Get-ReviewPaths $ProjectRoot
   $config = if (Test-Path -LiteralPath $paths.Config) { Read-JsonFile $paths.Config } else { $null }
   $state = if (Test-Path -LiteralPath $paths.State) { Read-JsonFile $paths.State } else { $null }
   [pscustomobject]@{
     project_name = (Split-Path -Leaf $ProjectRoot)
     review_loop_exists = (Test-Path -LiteralPath $paths.Base)
+    transport = if ($config) { $config.transport } else { $null }
+    loop_mode = if ($state) { $state.loop_mode } else { $null }
+    loop_status = if ($state) { $state.loop_status } else { $null }
+    round_counter = if ($state) { $state.round_counter } else { 0 }
+    iteration_counter = if ($state) { $state.iteration_counter } else { 0 }
+    latest_prompt = if ($state) { $state.latest_prompt } else { $null }
+    latest_review = if ($state) { $state.latest_review } else { $null }
+    latest_assessment = if ($state) { $state.latest_assessment } else { $null }
+    goal_verdict = if ($state) { $state.goal_verdict } else { $null }
+    next_action = if ($state) { $state.next_action } else { $null }
+    stop_reason = if ($state) { $state.stop_reason } else { $null }
     config_path = $paths.Config
     state_path = $paths.State
-    transport = if ($config) { $config.transport } else { $null }
-    target_chatgpt_conversation_url = if ($config) { $config.target_chatgpt_conversation_url } else { $null }
-    baseline_sent = if ($state) { $state.baseline_sent } else { $false }
-    round_counter = if ($state) { $state.round_counter } else { 0 }
-    latest_prompt = if ($state) { $state.latest_prompt } else { $null }
-    latest_feedback = if ($state) { $state.latest_feedback } else { $null }
-    latest_assessment = if ($state) { $state.latest_assessment } else { $null }
   } | Format-List
 }
 
 $ProjectRoot = Resolve-ProjectRoot $Root
 
-# The public actions form a small state machine:
-# Init/Prepare -> SendPrompt -> CaptureFeedback -> AssessFeedback ->
-# SendAssessment, with Run as "Prepare + handoff".
 switch ($Action) {
   "Init" {
-    Ensure-ReviewLoop $ProjectRoot $TargetChatGptUrl | Out-Null
-    Write-Host "GPT Pro review loop v2 initialized for project: $(Split-Path -Leaf $ProjectRoot)" -ForegroundColor Green
+    Ensure-ReviewLoop -ProjectRoot $ProjectRoot -ChatUrl $TargetChatGptUrl | Out-Null
+    Write-Host "GPT Pro review loop initialized for project: $(Split-Path -Leaf $ProjectRoot)" -ForegroundColor Green
   }
   "Prepare" {
-    Ensure-ReviewLoop $ProjectRoot $TargetChatGptUrl | Out-Null
-    $scan = Invoke-SensitiveScan $ProjectRoot -Allow:$AllowSensitive
-    New-ReviewPackage $ProjectRoot $scan | Out-Null
+    Ensure-ReviewLoop -ProjectRoot $ProjectRoot -ChatUrl $TargetChatGptUrl | Out-Null
+    $scan = Invoke-SensitiveScan -ProjectRoot $ProjectRoot -Allow:$AllowSensitive
+    New-ReviewPackage -ProjectRoot $ProjectRoot -ScanPath $scan | Out-Null
   }
   "SendPrompt" {
-    Ensure-ReviewLoop $ProjectRoot $TargetChatGptUrl | Out-Null
-    Show-PromptHandoff $ProjectRoot -MarkSent:$Send
+    Ensure-ReviewLoop -ProjectRoot $ProjectRoot -ChatUrl $TargetChatGptUrl | Out-Null
+    Show-PromptHandoff -ProjectRoot $ProjectRoot -MarkSent:$Send
   }
   "CaptureFeedback" {
-    Ensure-ReviewLoop $ProjectRoot $TargetChatGptUrl | Out-Null
-    Save-GptFeedback $ProjectRoot $FeedbackText $FeedbackFile | Out-Null
+    Ensure-ReviewLoop -ProjectRoot $ProjectRoot -ChatUrl $TargetChatGptUrl | Out-Null
+    $text = if ($FeedbackText) { $FeedbackText } else { $ReviewText }
+    $file = if ($FeedbackFile) { $FeedbackFile } else { $ReviewFile }
+    Save-Review -ProjectRoot $ProjectRoot -ReviewerName "gpt-pro" -ReviewPhase "initial" -Text $text -File $file | Out-Null
+  }
+  "CaptureReview" {
+    Ensure-ReviewLoop -ProjectRoot $ProjectRoot -ChatUrl $TargetChatGptUrl | Out-Null
+    Save-Review -ProjectRoot $ProjectRoot -ReviewerName $Reviewer -ReviewPhase $Phase -Text $ReviewText -File $ReviewFile | Out-Null
   }
   "WaitFeedback" {
-    Ensure-ReviewLoop $ProjectRoot $TargetChatGptUrl | Out-Null
-    $paths = Get-ReviewPaths $ProjectRoot
-    $latest = Get-LatestFile $paths.Feedback
-    if (-not $latest) {
-      throw "No GPT feedback has been captured yet. Use -Action CaptureFeedback after reading the ChatGPT reply through Edge."
-    }
-    Write-Host "Latest captured GPT feedback: $($latest.FullName)" -ForegroundColor Green
+    Ensure-ReviewLoop -ProjectRoot $ProjectRoot -ChatUrl $TargetChatGptUrl | Out-Null
+    $paths = Get-ReviewPaths -ProjectRoot $ProjectRoot
+    $latest = Get-LatestFile $paths.Reviews
+    if (-not $latest) { throw "No review has been captured yet. Use -Action CaptureReview." }
+    Write-Host "Latest captured review: $($latest.FullName)" -ForegroundColor Green
   }
   "AssessFeedback" {
-    Ensure-ReviewLoop $ProjectRoot $TargetChatGptUrl | Out-Null
-    New-LocalAssessment $ProjectRoot $AssessmentText $AssessmentFile | Out-Null
+    Ensure-ReviewLoop -ProjectRoot $ProjectRoot -ChatUrl $TargetChatGptUrl | Out-Null
+    New-LocalAssessment -ProjectRoot $ProjectRoot -Text $AssessmentText -File $AssessmentFile -Type $AssessmentType -Verdict $GoalVerdict -ActionText $NextAction | Out-Null
   }
   "SendAssessment" {
-    Ensure-ReviewLoop $ProjectRoot $TargetChatGptUrl | Out-Null
-    New-AssessmentPrompt $ProjectRoot
+    Ensure-ReviewLoop -ProjectRoot $ProjectRoot -ChatUrl $TargetChatGptUrl | Out-Null
+    New-AssessmentPrompt -ProjectRoot $ProjectRoot
+  }
+  "NextDecision" {
+    Ensure-ReviewLoop -ProjectRoot $ProjectRoot -ChatUrl $TargetChatGptUrl | Out-Null
+    Invoke-NextDecision -ProjectRoot $ProjectRoot
+  }
+  "RunLoop" {
+    Ensure-ReviewLoop -ProjectRoot $ProjectRoot -ChatUrl $TargetChatGptUrl | Out-Null
+    $scan = Invoke-SensitiveScan -ProjectRoot $ProjectRoot -Allow:$AllowSensitive
+    New-ReviewPackage -ProjectRoot $ProjectRoot -ScanPath $scan | Out-Null
+    Show-PromptHandoff -ProjectRoot $ProjectRoot -MarkSent:$Send
   }
   "RecordExperience" {
-    New-ExperienceRecord $ProjectRoot $ExperienceOutcome $ExperienceLesson $ExperienceNotes
+    New-ExperienceRecord -ProjectRoot $ProjectRoot -Outcome $ExperienceOutcome -Lesson $ExperienceLesson -Notes $ExperienceNotes
   }
   "Status" {
-    Show-Status $ProjectRoot
+    Show-Status -ProjectRoot $ProjectRoot
   }
   "Run" {
-    Ensure-ReviewLoop $ProjectRoot $TargetChatGptUrl | Out-Null
-    $scan = Invoke-SensitiveScan $ProjectRoot -Allow:$AllowSensitive
-    New-ReviewPackage $ProjectRoot $scan | Out-Null
-    Show-PromptHandoff $ProjectRoot -MarkSent:$Send
+    Ensure-ReviewLoop -ProjectRoot $ProjectRoot -ChatUrl $TargetChatGptUrl | Out-Null
+    $scan = Invoke-SensitiveScan -ProjectRoot $ProjectRoot -Allow:$AllowSensitive
+    New-ReviewPackage -ProjectRoot $ProjectRoot -ScanPath $scan | Out-Null
+    Show-PromptHandoff -ProjectRoot $ProjectRoot -MarkSent:$Send
   }
 }
 
