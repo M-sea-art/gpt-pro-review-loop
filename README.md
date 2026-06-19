@@ -190,6 +190,9 @@ High-risk actions still pause: account login, CAPTCHA, payment, permission chang
 - Missing baseline: run `Prepare -ForceBaseline` or initialize with the correct ChatGPT URL.
 - Secret scan blocked: inspect the generated `security-scans/*.json`; use `-AllowSensitive` only after explicit authorization.
 - GPT reply is long: save it to a temporary file and pass `-ReviewFile`.
+- Edge tab grouping error: reconnect the browser runtime once, list tabs once, then open a fresh extension tab or stop with the prompt path. Do not repeatedly retry the same tab claim.
+- In-app browser fallback: use it only as a diagnostic or when ChatGPT login state is not required. Its tab API uses `tab.playwright`, not a raw `.page` property, and it may not share Edge login.
+- Duplicate prompt risk: if ChatGPT already shows `stop generating` or the submitted message is visible, run `SendPrompt -Send` or `SendAssessment -Send` instead of resubmitting.
 - PowerShell error on path APIs: run with PowerShell 7+.
 
 ## Repository Notes

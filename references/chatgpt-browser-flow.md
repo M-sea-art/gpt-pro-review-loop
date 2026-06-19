@@ -15,6 +15,17 @@ Use `edge-browser-control` for ChatGPT web UI operations. Do not use Edge remote
 
 If the target conversation is missing context or GPT asks for a baseline, rerun `Prepare` after setting `baseline_sent` to false in `review-state.json`, or send the latest dossier and code map manually.
 
+## Edge Runtime Guardrails
+
+Before operating ChatGPT, read the current `edge-browser-control` skill body and follow its bundled browser-client API. Do not reuse stale snippets from older browser plugins.
+
+- The Codex extension backend may expose Edge as `extension` or with a Chrome-flavored name. Trust the returned tab URLs, not the display name.
+- Tab objects are controlled through `tab.playwright`. Do not assume a raw Playwright `page` property exists.
+- If claiming an existing tab fails with a tab grouping or window grouping error, do not retry the same claim in a tight loop.
+- After a claim/grouping failure, reconnect the browser runtime once, list tabs once, and either open a fresh extension tab or mark the browser handoff blocked with the target URL and prompt path.
+- Use the in-app browser only as a last-resort diagnostic or when a logged-in ChatGPT state is not required. It may not share the user's Edge ChatGPT login.
+- If the ChatGPT page already shows a submitted message or a stop-generating control, do not submit the same prompt again. Mark the prompt as sent, then move to low-frequency capture.
+
 ## Capture Review
 
 Default to automatic completion detection at the Codex agent layer; do not require the user to say the reply is finished. The PowerShell script records captured text but does not control Edge or wait for ChatGPT by itself.
