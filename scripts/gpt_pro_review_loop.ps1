@@ -345,7 +345,7 @@ function Get-DevSpaceHttpRequests {
       requestId = $entry.requestId
     }) | Out-Null
   }
-  return @($requests)
+  return @($requests.ToArray())
 }
 
 function Test-ConnectorCandidateRequest {
