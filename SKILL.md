@@ -2,7 +2,6 @@
 name: gpt-pro-review-loop
 description: Run a compact offline review loop between Codex, GPT Pro, and Codex efficiency review using Markdown review packages, code maps, ChatGPT conversation memory, local assessments, and next-decision events. Use when the user explicitly asks to send a project, Codex report, milestone status, implementation plan, verification result, or local practice assessment to GPT Pro for review through ChatGPT, then bring feedback back into Codex. Also use for the Chinese request "Pro 审阅循环".
 ---
-
 # GPT Pro Review Loop
 
 Chinese alias: `Pro 审阅循环`.
@@ -35,88 +34,92 @@ Codex owns all local reads, writes, tests, and final execution decisions. GPT Pr
 
 GPT Pro and Codex efficiency review are both `reviewer` values in the same event stream. Do not create separate subsystems, directories, or bespoke actions for rechecks, process audits, goal audits, or combined verdicts when the generic review and assessment fields can express the same thing.
 
+## Proxy Pattern
+
+The skill follows a proxy pattern to mediate between the external reviewer (GPT Pro) and the local project. GPT Pro operates only on high‑level artefacts (the dossier, code map and round request) transmitted via ChatGPT. All sensitive operations—reading or modifying code, running tests, scanning for secrets, and making execution decisions—are performed by Codex on the user's machine. In this design, GPT Pro acts as a remote consultant while Codex acts as a trusted proxy that controls resource access and side effects. This ensures that GPT Pro never gains direct access to the file system or command line and enforces a clear separation of responsibilities.
+
 ## Workflow
 
 1. Resolve the current project root. Prefer an explicit user path; otherwise use the current working directory or Git top-level directory.
 2. Ensure the project has a target ChatGPT project or conversation URL:
 
-   ```powershell
-   & "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action Init -Root "<project-root>" -TargetChatGptUrl "https://chatgpt.com/..."
-   ```
+    ```powershell
+    & "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action Init -Root "<project-root>" -TargetChatGptUrl "https://chatgpt.com/..."
+    ```
 
 3. Prepare the offline review package:
 
-   ```powershell
-   & "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action Prepare -Root "<project-root>"
-   ```
+    ```powershell
+    & "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action Prepare -Root "<project-root>"
+    ```
 
-   This writes under `docs/ai-review-loop/`, runs the sensitive-data scan, creates a project dossier, creates a code map, creates a round request, and assembles a ChatGPT prompt.
+    This writes under `docs/ai-review-loop/`, runs the sensitive-data scan, creates a project dossier, creates a code map, creates a round request, and assembles a ChatGPT prompt.
 
 4. Send the prompt through Edge using `edge-browser-control`.
 
-   First print the target URL and prompt path:
+    First print the target URL and prompt path:
 
-   ```powershell
-   & "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action SendPrompt -Root "<project-root>"
-   ```
+    ```powershell
+    & "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action SendPrompt -Root "<project-root>"
+    ```
 
-   Then use `edge-browser-control` to open the target ChatGPT URL, paste the prompt file, and submit it. After the message is actually submitted, mark the prompt sent:
+    Then use `edge-browser-control` to open the target ChatGPT URL, paste the prompt file, and submit it. After the message is actually submitted, mark the prompt sent:
 
-   ```powershell
-   & "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action SendPrompt -Root "<project-root>" -Send
-   ```
+    ```powershell
+    & "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action SendPrompt -Root "<project-root>" -Send
+    ```
 
 5. After submitting the prompt, automatically wait for GPT Pro to finish with low-frequency Edge checks. Do not require the user to watch the page. When generation completes, read the latest visible GPT Pro reply through Edge and save it as a review event:
 
-   ```powershell
-   & "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action CaptureReview -Root "<project-root>" -Reviewer gpt-pro -Phase initial -ReviewText "<GPT reply>"
-   ```
+    ```powershell
+    & "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action CaptureReview -Root "<project-root>" -Reviewer gpt-pro -Phase initial -ReviewText "<GPT reply>"
+    ```
 
-   For long replies, save the reply to a temporary file and pass `-ReviewFile`.
+    For long replies, save the reply to a temporary file and pass `-ReviewFile`.
 
-   Completion detection should be conservative: check for the ChatGPT stop-generating control no more often than every 30-60 seconds, avoid full-page dumps during the wait, and capture only the final assistant reply after the stop control disappears. Hand off to the user only for login, CAPTCHA, permission, or account-security blockers.
+    Completion detection should be conservative: check for the ChatGPT stop-generating control no more often than every 30‑60 seconds, avoid full-page dumps during the wait, and capture only the final assistant reply after the stop control disappears. Hand off to the user only for login, CAPTCHA, permission, or account-security blockers.
 
 6. Optionally capture Codex efficiency review in the same event stream:
 
-   ```powershell
-   & "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action CaptureReview -Root "<project-root>" -Reviewer codex-efficiency-auditor -Phase goal-audit -ReviewText "<audit>"
-   ```
+    ```powershell
+    & "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action CaptureReview -Root "<project-root>" -Reviewer codex-efficiency-auditor -Phase goal-audit -ReviewText "<audit>"
+    ```
 
-   The efficiency review checks execution quality, evidence quality, false-completion risk, empty polling, repeated failure, scope drift, and whether the overall goal is achieved.
+    The efficiency review checks execution quality, evidence quality, false-completion risk, empty polling, repeated failure, scope drift, and whether the overall goal is achieved.
 
 7. Assess the review events against local reality before acting:
 
-   ```powershell
-   & "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action AssessFeedback -Root "<project-root>" -AssessmentType combined-next-decision -GoalVerdict CONTINUE -NextAction "collect_evidence" -AssessmentText "<Codex local assessment>"
-   ```
+    ```powershell
+    & "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action AssessFeedback -Root "<project-root>" -AssessmentType combined-next-decision -GoalVerdict CONTINUE -NextAction "collect_evidence" -AssessmentText "<Codex local assessment>"
+    ```
 
-   Each GPT recommendation must be classified as `accept`, `modify`, `reject`, or `needs-more-info` using local evidence such as code, tests, project goals, user constraints, cost, and risk. Do not treat GPT Pro feedback as a final verdict by itself.
+    Each GPT recommendation must be classified as `accept`, `modify`, `reject`, or `needs-more-info` using local evidence such as code, tests, project goals, user constraints, cost, and risk. Do not treat GPT Pro feedback as a final verdict by itself.
 
 8. Return the local practice assessment to GPT Pro:
 
-   ```powershell
-   & "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action SendAssessment -Root "<project-root>"
-   ```
+    ```powershell
+    & "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action SendAssessment -Root "<project-root>"
+    ```
 
-   Send the generated prompt through Edge, then mark it sent:
+    Send the generated prompt through Edge, then mark it sent:
 
-   ```powershell
-   & "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action SendAssessment -Root "<project-root>" -Send
-   ```
+    ```powershell
+    & "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action SendAssessment -Root "<project-root>" -Send
+    ```
 
 9. Decide the next loop state:
 
-   ```powershell
-   & "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action NextDecision -Root "<project-root>"
-   ```
+    ```powershell
+    & "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action NextDecision -Root "<project-root>"
+    ```
 
-   `GOAL_ACHIEVED` stops with a final report requirement. `CONTINUE`, `NEEDS_EVIDENCE`, and `NEEDS_PROCESS_FIX` can continue automatically inside an explicitly started loop. `NEEDS_HUMAN_DECISION` and `BLOCKED` pause.
+    `GOAL_ACHIEVED` stops with a final report requirement. `CONTINUE`, `NEEDS_EVIDENCE`, and `NEEDS_PROCESS_FIX` can continue automatically inside an explicitly started loop. `NEEDS_HUMAN_DECISION` and `BLOCKED` pause.
 
 10. Record project-local experience when the round produced a reusable lesson:
 
-   ```powershell
-   & "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action RecordExperience -Root "<project-root>" -ExperienceOutcome "success|blocked|needs-improvement" -ExperienceLesson "<short reusable lesson>" -ExperienceNotes "<sanitized notes>"
-   ```
+    ```powershell
+    & "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action RecordExperience -Root "<project-root>" -ExperienceOutcome "success|blocked|needs-improvement" -ExperienceLesson "<short reusable lesson>" -ExperienceNotes "<sanitized notes>"
+    ```
 
 ## One-Command Prepare
 
