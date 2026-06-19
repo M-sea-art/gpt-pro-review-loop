@@ -65,6 +65,44 @@ function Read-JsonFile {
   return Get-Content -Raw -LiteralPath $Path | ConvertFrom-Json
 }
 
+function Set-ObjectProperty {
+  param(
+    [Parameter(Mandatory = $true)]$Object,
+    [Parameter(Mandatory = $true)][string]$Name,
+    $Value
+  )
+
+  if ($Object.PSObject.Properties.Name -contains $Name) {
+    $Object.$Name = $Value
+  } else {
+    $Object | Add-Member -NotePropertyName $Name -NotePropertyValue $Value
+  }
+}
+
+function Test-ChatGptConversationUrl {
+  param([string]$Url)
+
+  if (-not $Url) {
+    return $false
+  }
+  return ($Url.Trim() -match "^https://chatgpt\.com/(?:.+/)?c/[0-9A-Fa-f-]+")
+}
+
+function ConvertTo-ChatGptProjectUrl {
+  param([string]$Url)
+
+  if (-not $Url) {
+    return $null
+  }
+
+  $trimmed = $Url.Trim()
+  if ($trimmed -match "^(https://chatgpt\.com/.+?)/c/[0-9A-Fa-f-]+(?:[/?#].*)?$") {
+    return $matches[1].TrimEnd("/")
+  }
+
+  return $trimmed
+}
+
 function Get-BridgePaths {
   param([string]$ProjectRoot)
 
@@ -123,19 +161,39 @@ function Ensure-Bridge {
   if (Test-Path -LiteralPath $paths.Config) {
     $config = Read-JsonFile $paths.Config
     if ($ChatUrl) {
-      $config.target_chatgpt_url = $ChatUrl
+      $projectUrl = ConvertTo-ChatGptProjectUrl $ChatUrl
+      Set-ObjectProperty $config "target_chatgpt_project_url" $projectUrl
+      Set-ObjectProperty $config "target_chatgpt_url" $projectUrl
+      if ($projectUrl -ne $ChatUrl.Trim()) {
+        Set-ObjectProperty $config "legacy_target_chatgpt_url" $ChatUrl.Trim()
+      }
+    } elseif (-not $config.target_chatgpt_project_url -and $config.target_chatgpt_url) {
+      $legacyUrl = $config.target_chatgpt_url
+      $projectUrl = ConvertTo-ChatGptProjectUrl $legacyUrl
+      Set-ObjectProperty $config "target_chatgpt_project_url" $projectUrl
+      Set-ObjectProperty $config "target_chatgpt_url" $projectUrl
+      if ($projectUrl -ne $legacyUrl) {
+        Set-ObjectProperty $config "legacy_target_chatgpt_url" $legacyUrl
+      }
     }
   } else {
+    $projectUrl = ConvertTo-ChatGptProjectUrl $ChatUrl
     $config = [ordered]@{
-      target_chatgpt_url = $ChatUrl
+      target_chatgpt_project_url = $projectUrl
+      target_chatgpt_url = $projectUrl
+      legacy_target_chatgpt_url = if ($ChatUrl -and $projectUrl -ne $ChatUrl.Trim()) { $ChatUrl.Trim() } else { $null }
       allowed_root = $ProjectRoot
       run_mode = "semi_auto"
       review_scope = "whole_project"
       gpt_write_policy = "feedback_only"
       tunnel_policy = "quick_tunnel_per_session"
+      conversation_policy = "new_chat_per_review_round"
+      connector_preflight_required = $true
     }
   }
-  $config.allowed_root = $ProjectRoot
+  Set-ObjectProperty $config "allowed_root" $ProjectRoot
+  Set-ObjectProperty $config "conversation_policy" "new_chat_per_review_round"
+  Set-ObjectProperty $config "connector_preflight_required" $true
   ConvertTo-JsonFile $config $paths.Config
 
   if (-not (Test-Path -LiteralPath $paths.State)) {
@@ -157,7 +215,7 @@ function Get-Config {
 
   $paths = Get-BridgePaths $ProjectRoot
   if (-not (Test-Path -LiteralPath $paths.Config)) {
-    throw "Missing project config. Run -Action Init -TargetChatGptUrl <url> first."
+    throw "Missing project config. Run -Action Init -TargetChatGptUrl <chatgpt-project-url> first."
   }
   return Read-JsonFile $paths.Config
 }
@@ -594,8 +652,15 @@ function Start-Session {
   $runtime = Get-RuntimePaths $ProjectRoot
   $paths = Get-BridgePaths $ProjectRoot
   $config = Get-Config $ProjectRoot
-  if (-not $config.target_chatgpt_url -or $config.target_chatgpt_url -notmatch "^https://chatgpt\.com/") {
-    throw "project-config.json must contain a ChatGPT URL in target_chatgpt_url."
+  $targetChatGptProjectUrl = $config.target_chatgpt_project_url
+  if (-not $targetChatGptProjectUrl -and $config.target_chatgpt_url) {
+    $targetChatGptProjectUrl = ConvertTo-ChatGptProjectUrl $config.target_chatgpt_url
+  }
+  if (-not $targetChatGptProjectUrl -or $targetChatGptProjectUrl -notmatch "^https://chatgpt\.com/") {
+    throw "project-config.json must contain a ChatGPT project or new-chat URL in target_chatgpt_project_url."
+  }
+  if (Test-ChatGptConversationUrl $targetChatGptProjectUrl) {
+    throw "Refusing to send to an existing ChatGPT /c/ conversation URL because DevSpace apps may not attach there. Re-run Init with a ChatGPT project or new-chat URL."
   }
 
   foreach ($dir in @($runtime.Base, $runtime.Logs, $runtime.DevspaceConfig, $runtime.DevspaceState, $runtime.Worktrees)) {
@@ -674,6 +739,13 @@ Project root to open in DevSpace: $ProjectRoot
 Review report to read first: $reportRelative
 Write your feedback file exactly here: $feedbackRelative
 
+Connector preflight is mandatory before review:
+1. Confirm the DevSpace AI Bridge app/tool is available in this new ChatGPT chat.
+2. Confirm the active DevSpace connector points to the current MCP URL above.
+3. Open the project root above and read the review report above.
+4. If any preflight step fails, write a BLOCKED feedback file if possible. If you cannot write the file, reply BLOCKED in chat and do not invent review findings.
+5. Continue to source review only after the preflight succeeds.
+
 Review scope:
 - You may inspect files in the opened project because the user selected whole_project scope.
 - Do not edit source code, tests, configs, or docs outside docs/ai-bridge/gpt-pro-feedback/.
@@ -695,7 +767,10 @@ Feedback format:
       local_port = $LocalPort
       tunnel_url = $tunnelUrl
       mcp_url = $mcpUrl
-      target_chatgpt_url = $config.target_chatgpt_url
+      target_chatgpt_project_url = $targetChatGptProjectUrl
+      target_chatgpt_url = $targetChatGptProjectUrl
+      conversation_policy = "new_chat_per_review_round"
+      connector_preflight_required = $true
       owner_token_path = $runtime.OwnerToken
       prompt_path = $promptPath
       report_path = $latestReport.FullName
@@ -740,13 +815,20 @@ function Send-Prompt {
     throw "No active session file found. Run -Action StartSession first."
   }
   $session = Read-JsonFile $runtime.Session
+  $chatUrl = $session.target_chatgpt_project_url
+  if (-not $chatUrl) {
+    $chatUrl = $session.target_chatgpt_url
+  }
+  if (Test-ChatGptConversationUrl $chatUrl) {
+    throw "Refusing to open an existing ChatGPT /c/ conversation URL. Start from the project or new-chat URL so DevSpace can attach to the new chat."
+  }
   $helper = Join-Path $PSScriptRoot "edge_send_review_prompt.py"
   $python = Join-Path $env:USERPROFILE ".agents\skills\browser-use\scripts\.venv\Scripts\python.exe"
   if (-not (Test-Path -LiteralPath $python)) {
     $python = (Get-Command python -ErrorAction Stop).Source
   }
 
-  $args = @($helper, "--chat-url", $session.target_chatgpt_url, "--prompt-file", $session.prompt_path)
+  $args = @($helper, "--chat-url", $chatUrl, "--prompt-file", $session.prompt_path, "--require-new-chat")
   if ($Submit) {
     $args += "--send"
   }

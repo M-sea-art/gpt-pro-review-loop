@@ -20,4 +20,6 @@ The tunnel does not require opening inbound router/firewall ports because `cloud
 
 Each quick tunnel URL is different. ChatGPT's MCP app/connector must point to the current `/mcp` URL. If ChatGPT cannot call DevSpace, open ChatGPT Settings > Connectors, edit or recreate the DevSpace MCP app with the current URL, and approve OAuth with the owner token printed by the session script.
 
+Use a new ChatGPT chat for each review round. Existing `/c/` conversation URLs can preserve an older tool environment where the DevSpace app is not available, even when a newly opened project chat shows DevSpace. Treat that condition as a blocked connector preflight, not as a project review.
+
 Do not store the owner token in the project directory.

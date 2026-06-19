@@ -17,24 +17,33 @@ docs/ai-bridge/
   experience-issues/
 ```
 
-`project-config.json` records the target ChatGPT conversation and fixed policy defaults:
+`project-config.json` records the target ChatGPT project/new-chat entry point and fixed policy defaults:
 
 ```json
 {
+  "target_chatgpt_project_url": "https://chatgpt.com/...",
   "target_chatgpt_url": "https://chatgpt.com/...",
+  "legacy_target_chatgpt_url": null,
   "allowed_root": "<project root>",
   "run_mode": "semi_auto",
   "review_scope": "whole_project",
   "gpt_write_policy": "feedback_only",
-  "tunnel_policy": "quick_tunnel_per_session"
+  "tunnel_policy": "quick_tunnel_per_session",
+  "conversation_policy": "new_chat_per_review_round",
+  "connector_preflight_required": true
 }
 ```
+
+`target_chatgpt_project_url` is the primary send target. Existing ChatGPT `/c/` conversation URLs are not valid send targets because apps/connectors may not attach to old chats. When a project-scoped old chat URL is provided, the script derives the project URL, stores the original in `legacy_target_chatgpt_url`, and sends future rounds to the project/new-chat entry point.
 
 `bridge-state.json` tracks the current loop:
 
 - `pending_for_gpt`: review reports waiting for GPT Pro.
 - `pending_for_codex`: GPT feedback waiting for Codex.
 - `active_session`: runtime metadata for the current short-lived tunnel.
+- `active_session.target_chatgpt_project_url`: the project/new-chat URL used by browser automation.
+- `active_session.conversation_policy`: normally `new_chat_per_review_round`.
+- `active_session.connector_preflight_required`: must be true for v1 rounds.
 
 Codex reports must include metadata fields:
 
@@ -58,6 +67,8 @@ GPT feedback should be written only under `docs/ai-bridge/gpt-pro-feedback/` and
 ```
 
 If GPT Pro writes elsewhere, treat that as an out-of-bounds write and pause.
+
+If GPT Pro cannot access DevSpace in the new chat, treat the round as `BLOCKED`. Do not infer any project approval from a blocked connector preflight.
 
 Experience records are project-local by default:
 

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import asyncio
+import re
 import sys
 from pathlib import Path
 
@@ -49,12 +50,25 @@ async def set_prompt(locator, prompt):
 
 
 async def main():
-    parser = argparse.ArgumentParser(description="Open a ChatGPT conversation in Edge and insert a review prompt.")
+    parser = argparse.ArgumentParser(description="Open a ChatGPT project/new-chat URL in Edge and insert a review prompt.")
     parser.add_argument("--chat-url", required=True)
     parser.add_argument("--prompt-file", required=True)
     parser.add_argument("--cdp-url", default="http://127.0.0.1:9222")
+    parser.add_argument(
+        "--require-new-chat",
+        action="store_true",
+        help="Reject existing ChatGPT /c/ conversation URLs because apps may not attach to old chats.",
+    )
     parser.add_argument("--send", action="store_true")
     args = parser.parse_args()
+
+    if args.require_new_chat and re.match(r"^https://chatgpt\.com/(?:.+/)?c/[0-9A-Fa-f-]+", args.chat_url.strip()):
+        print(
+            "Refusing to open an existing ChatGPT /c/ conversation URL. "
+            "Use a project or new-chat URL so DevSpace can attach to the new chat.",
+            file=sys.stderr,
+        )
+        return 4
 
     prompt_path = Path(args.prompt_file)
     prompt = prompt_path.read_text(encoding="utf-8")
