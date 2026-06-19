@@ -2,6 +2,8 @@
 
 The skill creates project-local coordination files under `docs/ai-review-loop/`.
 
+This protocol is intentionally file-based. It gives Codex a durable ledger of what was sent to GPT Pro, what GPT Pro replied, how Codex judged that advice against local facts, and what still needs the user's confirmation.
+
 Required layout:
 
 ```text
@@ -83,6 +85,8 @@ Codex must assess every actionable GPT recommendation before implementation:
 ```
 
 Decisions must be grounded in local facts such as code, tests, acceptance gates, project goals, user boundaries, cost, or risk.
+
+The assessment is the handoff contract between "GPT suggested it" and "Codex should act." A recommendation without local evidence remains advisory.
 
 ## Offline Boundary
 

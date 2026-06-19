@@ -17,6 +17,11 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+# This script is the deterministic part of the offline review loop.
+# It never opens a local service or grants GPT direct filesystem access; it only
+# writes review material, records copied GPT feedback, and prepares prompts for
+# Edge/ChatGPT handoff.
+
 $SkipDirectories = @(
   ".git", ".hg", ".svn", ".codegraph",
   "node_modules", ".venv", "venv", "__pycache__",
@@ -79,6 +84,8 @@ function Set-ObjectProperty {
 function Get-ReviewPaths {
   param([Parameter(Mandatory = $true)][string]$ProjectRoot)
 
+  # Keep all loop artifacts under the project so review history travels with the
+  # worktree and can be audited without reading external runtime state.
   $base = Join-Path $ProjectRoot "docs\ai-review-loop"
   return [pscustomobject]@{
     Base = $base
@@ -127,6 +134,9 @@ function Ensure-ReviewLoop {
     [string]$ChatUrl
   )
 
+  # Initialize or migrate the project-local ledger. Existing config/state are
+  # updated in place so a project can keep its ChatGPT conversation memory across
+  # multiple review rounds.
   $paths = Get-ReviewPaths $ProjectRoot
   foreach ($dir in @($paths.Base, $paths.Dossiers, $paths.CodeMaps, $paths.RoundRequests, $paths.Prompts, $paths.Feedback, $paths.Assessments, $paths.SecurityScans, $paths.ExperienceIssues)) {
     if (-not (Test-Path -LiteralPath $dir)) {
@@ -408,6 +418,9 @@ function Invoke-SensitiveScan {
     [switch]$Allow
   )
 
+  # The scan is intentionally conservative. It blocks obvious secrets before any
+  # review package is assembled, because the generated prompt is meant to be
+  # pasted into a third-party ChatGPT conversation.
   $paths = Get-ReviewPaths $ProjectRoot
   $stamp = Get-Date -Format "yyyyMMdd-HHmmss"
   $scanPath = Join-Path $paths.SecurityScans "$stamp-sensitive-scan.json"
@@ -481,6 +494,8 @@ function New-ProjectDossier {
     [Parameter(Mandatory = $true, Position = 2)][string]$RoundId
   )
 
+  # The dossier is the first-round baseline: project shape, visible manifests,
+  # test hints, and git state. It avoids absolute local paths in the body.
   $dossierDir = [System.IO.Path]::Combine($ProjectRoot, "docs", "ai-review-loop", "dossiers")
   if (-not (Test-Path -LiteralPath $dossierDir)) {
     New-Item -ItemType Directory -Path $dossierDir -Force | Out-Null
@@ -568,6 +583,9 @@ function New-CodeMap {
     [Parameter(Mandatory = $true, Position = 1)][string]$RoundId
   )
 
+  # The code map is a compact replacement for direct repository browsing. It is
+  # file-system based by default and can be enriched by Codex with CodeGraph
+  # context in the chat prompt when that context is available.
   $codeMapDir = [System.IO.Path]::Combine($ProjectRoot, "docs", "ai-review-loop", "code-maps")
   if (-not (Test-Path -LiteralPath $codeMapDir)) {
     New-Item -ItemType Directory -Path $codeMapDir -Force | Out-Null
@@ -650,6 +668,9 @@ function New-RoundRequest {
     [Parameter(Mandatory = $true, Position = 2)][string]$ScanPath
   )
 
+  # Round requests are the delta layer. After the baseline has been sent once,
+  # GPT Pro should primarily review these per-round changes plus conversation
+  # memory.
   if ([string]::IsNullOrWhiteSpace($ProjectRoot)) {
     throw "New-RoundRequest received an empty ProjectRoot."
   }
@@ -739,6 +760,8 @@ function New-ReviewPrompt {
     [Parameter(Mandatory = $true, Position = 4)][string]$RequestPath
   )
 
+  # Assemble the exact text intended for ChatGPT. Baseline material is included
+  # only until the state records a successful send; later prompts stay compact.
   $paths = Get-ReviewPaths $ProjectRoot
   $state = Get-State $ProjectRoot
   $promptPath = Join-Path $paths.Prompts "$RoundId-review-prompt.md"
@@ -830,6 +853,9 @@ function Show-PromptHandoff {
     [switch]$MarkSent
   )
 
+  # Browser automation is deliberately outside this script. The script prints a
+  # stable handoff target and prompt file so edge-browser-control can perform the
+  # UI action with the user's existing ChatGPT session.
   $paths = Get-ReviewPaths $ProjectRoot
   $config = Get-Config $ProjectRoot
   $state = Get-State $ProjectRoot
@@ -881,6 +907,8 @@ function Save-GptFeedback {
     [string]$File
   )
 
+  # GPT cannot write local files in this workflow. Codex captures the visible
+  # reply from ChatGPT and stores it here as the local source of truth.
   $paths = Get-ReviewPaths $ProjectRoot
   if ($File) {
     $feedbackText = Get-Content -Raw -LiteralPath $File
@@ -928,6 +956,8 @@ function New-LocalAssessment {
     [string]$File
   )
 
+  # This is the key safety valve: GPT advice is converted into Codex decisions
+  # only after checking local code, tests, constraints, cost, and risk.
   $paths = Get-ReviewPaths $ProjectRoot
   $state = Get-State $ProjectRoot
   $latestFeedback = if ($state.latest_feedback) { Join-Path $ProjectRoot ($state.latest_feedback -replace "/", "\") } else { $null }
@@ -1001,6 +1031,8 @@ $assessmentText
 function New-AssessmentPrompt {
   param([Parameter(Mandatory = $true)][string]$ProjectRoot)
 
+  # Send Codex's local judgment back to the same ChatGPT conversation so GPT Pro
+  # can correct or refine its recommendations before another round.
   $paths = Get-ReviewPaths $ProjectRoot
   $config = Get-Config $ProjectRoot
   $state = Get-State $ProjectRoot
@@ -1057,6 +1089,9 @@ function New-ExperienceRecord {
     [string]$Notes
   )
 
+  # Experience records are process lessons, not project disclosures. They are
+  # useful for improving the reusable skill without copying private source or
+  # account details into public issue drafts.
   Ensure-ReviewLoop $ProjectRoot $null | Out-Null
   $paths = Get-ReviewPaths $ProjectRoot
   $state = Get-State $ProjectRoot
@@ -1142,6 +1177,9 @@ function Show-Status {
 
 $ProjectRoot = Resolve-ProjectRoot $Root
 
+# The public actions form a small state machine:
+# Init/Prepare -> SendPrompt -> CaptureFeedback -> AssessFeedback ->
+# SendAssessment, with Run as "Prepare + handoff".
 switch ($Action) {
   "Init" {
     Ensure-ReviewLoop $ProjectRoot $TargetChatGptUrl | Out-Null

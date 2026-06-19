@@ -7,6 +7,20 @@ description: Run a semi-automatic offline review loop between Codex and GPT Pro 
 
 Chinese alias: `Pro 审阅循环`.
 
+## What This Skill Does
+
+This skill turns a local Codex project into review material that GPT Pro can read in a normal ChatGPT conversation. Codex prepares the project dossier, code map, per-round delta, and prompt; GPT Pro reviews that material; Codex captures the reply, checks it against local facts, and sends a practice-based assessment back to GPT Pro.
+
+The loop is useful when the user wants an outside GPT Pro review without exposing the project directory as a live tool workspace.
+
+The mental model is:
+
+```text
+Codex local project -> Markdown review package -> ChatGPT/GPT Pro
+GPT Pro feedback -> Codex local assessment -> ChatGPT/GPT Pro
+Codex executes only after user confirmation
+```
+
 ## Core Rule
 
 Use this skill only after an explicit user request such as "use GPT Pro to review this project", "start the review loop", "$gpt-pro-review-loop", or "Pro 审阅循环".
