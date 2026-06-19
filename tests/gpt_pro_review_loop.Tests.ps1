@@ -235,6 +235,123 @@ Describe "gpt-pro-review-loop state machine" {
     $state.next_action | Should -Be "capture_gpt_pro_recheck"
   }
 
+  It "supports disabled Pro mode without target URL or prompt generation" {
+    $project = New-TestProject "pro-disabled"
+    & $script:Skill -Action Init -Root $project -ProReviewMode disabled
+    & $script:Skill -Action Prepare -Root $project -ProReviewMode disabled
+
+    $config = Read-Config $project
+    $state = Read-State $project
+    $config.pro_review_mode | Should -Be "disabled"
+    $state.pro_review_mode | Should -Be "disabled"
+    $state.url_confirmation_required | Should -BeFalse
+    @($state.pending_prompts).Count | Should -Be 0
+    $state.latest_prompt | Should -Be $null
+    $state.should_send_to_gpt | Should -BeFalse
+    $state.send_reason | Should -Be "pro_review_disabled"
+  }
+
+  It "requires GPT Pro evidence before terminal completion when Pro mode is required" {
+    $project = New-TestProject "pro-required"
+    & $script:Skill -Action Init -Root $project -TargetChatGptUrl "https://chatgpt.com/g/test-project" -ProReviewMode required
+    & $script:Skill -Action CaptureReview -Root $project -Reviewer codex-efficiency-auditor -Phase goal-audit -ReviewText "local terminal candidate"
+    & $script:Skill -Action AssessFeedback -Root $project -GoalVerdict GOAL_ACHIEVED -NextAction "final_report"
+    & $script:Skill -Action NextDecision -Root $project
+
+    $state = Read-State $project
+    $state.loop_status | Should -Be "running"
+    $state.goal_achieved_is_terminal | Should -BeFalse
+    $state.project_goal_verdict | Should -Be "CONTINUE"
+    $state.next_action | Should -Be "send_project_goal_completion_to_gpt_pro"
+    $state.should_send_to_gpt | Should -BeTrue
+    $state.send_reason | Should -Be "pro_review_required"
+  }
+
+  It "records auto close state for the target Pro tab" {
+    $project = New-TestProject "close-tab"
+    & $script:Skill -Action Init -Root $project -TargetChatGptUrl "https://chatgpt.com/g/test-project"
+    & $script:Skill -Action Prepare -Root $project
+    & $script:Skill -Action SendPrompt -Root $project -Send -OpenedTabUrl "https://chatgpt.com/g/test-project/c/abc123"
+    & $script:Skill -Action CaptureReview -Root $project -Reviewer codex-efficiency-auditor -Phase goal-audit -ReviewText "continue locally"
+    & $script:Skill -Action AssessFeedback -Root $project -GoalVerdict CONTINUE -NextAction "collect_evidence"
+    & $script:Skill -Action NextDecision -Root $project
+    & $script:Skill -Action CloseProTab -Root $project
+
+    $state = Read-State $project
+    $state.pro_tab_close_policy | Should -Be "target_conversation"
+    $state.pro_tab_close_status | Should -Be "closed"
+    $state.pro_tab_close_target_url | Should -Be "https://chatgpt.com/g/test-project"
+    $state.pro_tab_closed_at | Should -Not -Be $null
+  }
+
+  It "records a blocked close when no Pro tab is known" {
+    $project = New-TestProject "close-tab-blocked"
+    & $script:Skill -Action Init -Root $project -TargetChatGptUrl "https://chatgpt.com/g/test-project"
+    & $script:Skill -Action CloseProTab -Root $project
+
+    $state = Read-State $project
+    $state.pro_tab_close_status | Should -Be "blocked_no_target_tab"
+  }
+
+  It "runs a local expert council meeting with brainstorm before post-evaluation" {
+    $project = New-TestProject "local-council"
+    New-Item -ItemType Directory -Path (Join-Path $project "docs/project") -Force | Out-Null
+    Set-Content -LiteralPath (Join-Path $project "docs/project/FPV0_COMPLETION_ROADMAP.md") -Encoding UTF8 -Value @"
+Demo readiness: `NOT_READY`
+Human Gate: manual visual signoff required
+Big World runtime: Not implemented
+"@
+    & $script:Skill -Action Init -Root $project -TargetChatGptUrl "https://chatgpt.com/g/test-project"
+    & $script:Skill -Action BuildProjectGoalPlan -Root $project
+    & $script:Skill -Action RunLocalCouncil -Root $project
+
+    $state = Read-State $project
+    $state.latest_local_council_review | Should -Match "^docs/ai-review-loop/reviews/"
+    @($state.goal_backlog).Count | Should -BeGreaterThan 0
+    @($state.goal_backlog | Where-Object { $_.status -eq "needs_human_decision" }).Count | Should -BeGreaterThan 0
+    Test-Path -LiteralPath (Join-Path $project "docs/ai-review-loop/local-council.md") | Should -BeTrue
+    Test-Path -LiteralPath (Join-Path $project "docs/ai-review-loop/goal-backlog.md") | Should -BeTrue
+    $reviewPath = Join-Path $project ($state.latest_local_council_review -replace "/", "\")
+    $reviewText = Get-Content -Raw -LiteralPath $reviewPath
+    $reviewText.IndexOf("## Brainstorm") | Should -BeLessThan $reviewText.IndexOf("## Post-Evaluation")
+    $reviewText | Should -Match "鼓励自由发挥"
+    $reviewText | Should -Match "暂停评判"
+    $reviewText | Should -Match "数量优先"
+    $reviewText | Should -Match "相互激发"
+    $reviewText | Should -Match "记录所有的想法"
+    $reviewText | Should -Match "后期评估"
+    $reviewText | Should -Match "开放和包容"
+  }
+
+  It "records progress artifacts and generates a council review" {
+    $project = New-TestProject "record-progress"
+    $artifact = Join-Path $project "progress.md"
+    Set-Content -LiteralPath $artifact -Encoding UTF8 -Value "# Progress"
+    & $script:Skill -Action Init -Root $project -TargetChatGptUrl "https://chatgpt.com/g/test-project"
+    & $script:Skill -Action RecordProgress -Root $project -ProgressArtifact $artifact
+
+    $state = Read-State $project
+    @($state.progress_artifacts).Count | Should -Be 1
+    @($state.local_progress_artifacts).Count | Should -Be 1
+    $state.latest_local_council_review | Should -Match "^docs/ai-review-loop/reviews/"
+    $state.should_send_to_gpt | Should -BeFalse
+  }
+
+  It "promotes the first generated local goal without expanding human-gated scope" {
+    $project = New-TestProject "promote-goal"
+    New-Item -ItemType Directory -Path (Join-Path $project "docs/project") -Force | Out-Null
+    Set-Content -LiteralPath (Join-Path $project "docs/project/FPV0_COMPLETION_ROADMAP.md") -Encoding UTF8 -Value 'Demo readiness: `NOT_READY`'
+    & $script:Skill -Action Init -Root $project -TargetChatGptUrl "https://chatgpt.com/g/test-project"
+    & $script:Skill -Action BuildProjectGoalPlan -Root $project
+    & $script:Skill -Action RunLocalCouncil -Root $project
+    & $script:Skill -Action PromoteGoal -Root $project
+
+    $state = Read-State $project
+    $state.active_generated_goal_id | Should -Match "^G-"
+    $state.local_only_next_action | Should -Match "^collect_evidence_for_"
+    $state.should_send_to_gpt | Should -BeFalse
+  }
+
   It "adds GPT courtesy footer to assessment return after prior external send" {
     $project = New-TestProject "assessment-courtesy"
     & $script:Skill -Action Init -Root $project -TargetChatGptUrl "https://chatgpt.com/g/test-project"

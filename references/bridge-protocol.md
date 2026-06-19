@@ -20,6 +20,8 @@ docs/ai-review-loop/
   loop-runs/
   security-scans/
   project-goal-plan.md
+  local-council.md
+  goal-backlog.md
   experience-log.md
   experience-issues/
 ```
@@ -47,7 +49,11 @@ docs/ai-review-loop/
   "terminal_goal_scope": "project_total",
   "completion_guard_policy": "project_total_only",
   "gpt_courtesy_footer": "谢谢你的工作，GPT朋友。",
-  "courtesy_footer_policy": "after_first_external_review_in_continuous_loop"
+  "courtesy_footer_policy": "after_first_external_review_in_continuous_loop",
+  "pro_review_mode": "optional",
+  "pro_tab_close_policy": "target_conversation",
+  "local_council_mode": "enabled",
+  "local_council_policy": "brainstorm_then_post_evaluation"
 }
 ```
 
@@ -99,6 +105,15 @@ docs/ai-review-loop/
 - `goal_context_sources`: project files used to build the latest goal context.
 - `goal_achieved_is_terminal`: true only when a `GOAL_ACHIEVED` decision is allowed to stop the loop.
 - `gpt_courtesy_footer_sent_count`: count of GPT-facing prompts that included the configured courtesy footer.
+- `pro_review_mode`: `optional`, `required`, or `disabled`.
+- `pro_tab_close_policy`: default `target_conversation`.
+- `pro_tab_close_status`: `closed`, `blocked_no_target_tab`, `blocked_review_still_needed`, or null.
+- `pro_tab_closed_at`: timestamp when the target tab close was recorded as complete.
+- `local_council_mode`: default `enabled`.
+- `latest_local_council_review`: latest review event with `reviewer=local-expert-council`.
+- `progress_artifacts`: progress update artifacts that should trigger local council planning.
+- `goal_backlog`: candidate goals proposed by post-evaluation.
+- `active_generated_goal_id`: promoted generated goal id, if any.
 
 ## URL Confirmation
 
@@ -118,14 +133,16 @@ Review material files should use project-relative paths and avoid local absolute
 - `assessments/`: local-practice and combined-next-decision assessments.
 - `loop-runs/`: small JSON records emitted by `NextDecision` and `runtime-brief.json` snapshots for low-quota reuse.
 - `project-goal-plan.md`: compact local plan generated from `project_blocker_queue`.
+- `local-council.md`: pointer and summary for the latest local expert council meeting.
+- `goal-backlog.md`: Markdown rendering of candidate generated goals.
 
 ## Review Capture
 
-GPT Pro cannot write local files. Codex captures visible ChatGPT replies and stores them under `reviews/` with metadata. Codex efficiency review uses the same format:
+GPT Pro cannot write local files. Codex captures visible ChatGPT replies and stores them under `reviews/` with metadata. Codex efficiency review and the local expert council use the same format:
 
 ```markdown
-- reviewer: gpt-pro | codex-efficiency-auditor
-- phase: initial | recheck | process-audit | goal-audit
+- reviewer: gpt-pro | codex-efficiency-auditor | local-expert-council
+- phase: initial | recheck | process-audit | goal-audit | brainstorm | post-evaluation
 - round:
 - iteration:
 - status: captured
@@ -162,6 +179,24 @@ Economy mode is the default. It keeps full files under `docs/ai-review-loop/` bu
 - visual evidence: send path/hash by default; attach the image only when a visual gate needs it and the same hash has not already been sent.
 
 `NextDecision` sets `should_send_to_gpt`. If it is false, the outer Codex agent should continue `local_only_next_action` and avoid an empty GPT prompt. If it is true, the agent can send the latest compact prompt because there is a new external-review question, new evidence, a requested recheck, or an explicit force flag.
+
+## Pro Review Modes
+
+- `optional`: default. Codex uses local judgment and the local expert council first. GPT Pro is sent only for a new external judgment, explicit recheck, forced review, or Pro-required next action.
+- `required`: project-total terminal completion requires a captured `gpt-pro` review event unless blockers already prevent completion.
+- `disabled`: no ChatGPT URL is required, no GPT prompt is generated, and no Pro tab is opened or closed.
+
+## Local Expert Council
+
+`RunLocalCouncil` records `reviewer=local-expert-council` under `reviews/`. It is a brainstorming meeting, not a risk-only audit.
+
+The `Brainstorm` section must record unjudged ideas first and follow the seven rules: free ideas, suspend judgment, quantity first, build on others, record all ideas, evaluate later, and maintain an open inclusive meeting.
+
+Only the later `Post-Evaluation` section classifies ideas into immediately local, needs evidence, needs external Pro, needs human decision, or future scope. Candidate goals are written to `goal_backlog` and rendered in `goal-backlog.md`; they do not expand implementation scope automatically. Human Gate, core-system, publish, push, remote authorization, or protected-scope goals are marked `needs_human_decision`.
+
+## Pro Tab Close
+
+`CloseProTab` records a close decision for the configured target conversation. It does not inspect browser cookies, storage, login state, or account data. The outer `edge-browser-control` flow performs the actual tab close.
 
 ## Project Goal Guard
 

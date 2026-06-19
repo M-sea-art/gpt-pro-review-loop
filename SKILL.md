@@ -13,11 +13,15 @@ This skill turns a local Codex project into review material that GPT Pro can rea
 
 The loop is useful when the user wants an outside GPT Pro review without granting direct local project access.
 
+v1.5 makes GPT Pro optional. The default is `pro_review_mode=optional`: Codex runs the project-total guard and local expert council first, then sends GPT Pro only for a new external judgment, a recheck request, a forced review, or a required-mode completion gate. `pro_review_mode=disabled` never generates GPT prompts or opens ChatGPT.
+
 Default quota mode is `economy`: keep full evidence in the project ledger, but send GPT Pro compact Markdown summaries and deltas unless the user or GPT explicitly needs a broader baseline.
 
 Default terminal goal scope is `project_total`. A task, milestone, or test-line can be achieved without ending the continuous loop; Codex must continue upward until the project-total completion guard passes, the user stops the session, or a hard blocker appears.
 
 When project-total blockers remain, the skill normalizes them into a queue and chooses a concrete `local_only_next_action`. `should_send_to_gpt=false` means execute that local action; it is not a completion signal.
+
+Every continuous loop can also run a local expert council review. The council is a brainstorming meeting, not a risk-only audit: it records unjudged ideas first, then performs post-evaluation and writes candidate new goals into a backlog without expanding implementation scope.
 
 The mental model is:
 
@@ -29,17 +33,18 @@ review package -> external/internal review -> local assessment -> next decision
 
 Use this skill only after an explicit user request such as "use GPT Pro to review this project", "start the review loop", "$gpt-pro-review-loop", or "Pro 审阅循环".
 
-This v2 skill is offline by design:
+This skill is offline by design:
 
 - Send review material as Markdown through ChatGPT.
 - Use ChatGPT conversation memory as the long-running review context.
 - Keep all local reads, writes, tests, and implementation inside Codex.
 - Do not give GPT Pro direct local file access.
 - Do not assume GPT Pro can write local files.
+- Treat GPT Pro as optional external review unless the project config says `pro_review_mode=required`.
 
 Codex owns all local reads, writes, tests, and final execution decisions. GPT Pro reviews only the Markdown material and conversation context that Codex sends through ChatGPT.
 
-GPT Pro and Codex efficiency review are both `reviewer` values in the same event stream. Do not create separate subsystems, directories, or bespoke actions for rechecks, process audits, goal audits, or combined verdicts when the generic review and assessment fields can express the same thing.
+GPT Pro, Codex efficiency review, and the local expert council are `reviewer` values in the same event stream. Do not create separate subsystems, directories, or bespoke actions for rechecks, process audits, goal audits, local brainstorming, or combined verdicts when the generic review and assessment fields can express the same thing.
 
 ## Workflow
 
@@ -52,6 +57,14 @@ GPT Pro and Codex efficiency review are both `reviewer` values in the same event
 
    If the project has no configured URL, ask the user once for the ChatGPT project/conversation URL before preparing or sending review material. After the user confirms it, store it with `Init -TargetChatGptUrl`; do not ask again in later loop iterations unless the URL changes, is invalid, or the browser is clearly on a different ChatGPT conversation.
 
+   If the user wants a fully local loop, initialize or update with:
+
+   ```powershell
+   & "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action Init -Root "<project-root>" -ProReviewMode disabled
+   ```
+
+   `-ProReviewMode optional|required|disabled` controls whether GPT Pro is a supplement, a required completion reviewer, or completely disabled.
+
 3. Prepare the offline review package:
 
    ```powershell
@@ -61,6 +74,8 @@ GPT Pro and Codex efficiency review are both `reviewer` values in the same event
    This writes under `docs/ai-review-loop/`, runs the sensitive-data scan, creates a project dossier, creates a code map, creates a round request, assembles a compact ChatGPT prompt, and writes a runtime brief. Use `-ForceBaseline` when the ChatGPT conversation lost context or the user explicitly wants a full baseline resend. Use `-QuotaMode balanced` or `-QuotaMode deep` only when the compact prompt is insufficient.
 
    Use `-GoalScope task|milestone|test_line|project_total` to label the current review target. Keep `project_total` as the terminal scope unless the user explicitly changes the project governance model. Compact prompts include `Goal Context` so GPT Pro and Codex efficiency review can distinguish a subgoal from total project completion.
+
+   If `pro_review_mode=disabled`, this step still creates local dossier/code-map/request material but does not create a GPT prompt.
 
    Useful quota parameters:
 
@@ -157,7 +172,25 @@ GPT Pro and Codex efficiency review are both `reviewer` values in the same event
 
    Execute `local_only_next_action` before sending GPT another prompt. If only Human Gate, protected scope, or explicit authorization blockers remain, pause for the user.
 
-10. Record project-local experience when the round produced a reusable lesson:
+10. Run the local expert council after a progress update or when the loop needs a fresh local plan:
+
+   ```powershell
+   & "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action RecordProgress -Root "<project-root>" -ProgressArtifact "<path>"
+   & "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action RunLocalCouncil -Root "<project-root>"
+   & "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action PromoteGoal -Root "<project-root>"
+   ```
+
+   The council writes `reviews/*local-expert-council*`, `local-council.md`, and `goal-backlog.md`. Brainstorm ideas are recorded before any judgment. Post-evaluation then classifies ideas as immediately local, evidence-needed, Pro-needed, human decision, or future scope. Generated goals stay in backlog until promoted, and human-gated goals remain marked `needs_human_decision`.
+
+11. Close the Pro tab after the target conversation no longer needs a response:
+
+   ```powershell
+   & "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action CloseProTab -Root "<project-root>"
+   ```
+
+   The script records `pro_tab_close_status`. The outer `edge-browser-control` flow performs the actual tab close for the matching configured ChatGPT conversation. Do not read cookies, storage, or account state.
+
+12. Record project-local experience when the round produced a reusable lesson:
 
    ```powershell
    & "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action RecordExperience -Root "<project-root>" -ExperienceOutcome "success|blocked|needs-improvement" -ExperienceLesson "<short reusable lesson>" -ExperienceNotes "<sanitized notes>"
@@ -181,7 +214,7 @@ When the user explicitly starts continuous review, use:
 & "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action RunLoop -Root "<project-root>" -PreflightBrowser
 ```
 
-`RunLoop` is the compact loop entry for the outer Codex agent. The PowerShell script prepares local ledger material, writes a runtime brief, and prints the browser handoff; it does not control Edge or wait for ChatGPT by itself. After explicit authorization, Codex must continue ordinary next rounds without confirmation until `NextDecision` reports terminal project-total completion, `NEEDS_HUMAN_DECISION`, `BLOCKED`, or the user stops the session. A `running` loop status with `continuation_required=true` is an instruction to keep working, not a final-answer point. Safety blockers, human gates, external account/login/CAPTCHA, publish/push, destructive file operations, and permission changes still pause.
+`RunLoop` is the compact loop entry for the outer Codex agent. In optional mode it starts local-first: if the current next action does not require GPT Pro, it records runtime state and runs the local expert council instead of generating an empty GPT handoff. The PowerShell script prepares local ledger material and writes a runtime brief; it does not control Edge or wait for ChatGPT by itself. After explicit authorization, Codex must continue ordinary next rounds without confirmation until `NextDecision` reports terminal project-total completion, `NEEDS_HUMAN_DECISION`, `BLOCKED`, or the user stops the session. A `running` loop status with `continuation_required=true` is an instruction to keep working, not a final-answer point. Safety blockers, human gates, external account/login/CAPTCHA, publish/push, destructive file operations, and permission changes still pause.
 
 For subgoal reviews:
 

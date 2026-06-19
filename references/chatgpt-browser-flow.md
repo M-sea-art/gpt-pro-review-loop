@@ -71,6 +71,18 @@ If generation exceeds a practical wait window, keep checking at low frequency an
 3. Use `edge-browser-control` to send that assessment to the same ChatGPT conversation.
 4. Run `SendAssessment -Send` after the browser submission succeeds.
 
+## Close Target Pro Tab
+
+When GPT Pro has answered, the local assessment has been returned if needed, and `review-state.json` says `should_send_to_gpt=false` or the loop is terminal/paused, close only the ChatGPT tab matching the configured target conversation.
+
+Record the ledger state first or after the close attempt:
+
+```powershell
+& "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action CloseProTab -Root "<project-root>"
+```
+
+If no target tab id or target conversation URL is known, record `blocked_no_target_tab` and do not repeatedly retry. If the loop still needs GPT Pro, record `blocked_review_still_needed` and leave the tab open. The close operation must not inspect cookies, local storage, saved passwords, browser history, or account/session files.
+
 ## Browser Safety
 
 - Use the existing logged-in Edge state exposed by the official Codex extension backend.
