@@ -1,23 +1,28 @@
 [CmdletBinding()]
 param(
-  [ValidateSet("Init", "Prepare", "StartSession", "PreflightConnector", "SendPrompt", "WaitFeedback", "RecordExperience", "StopSession", "Status", "Run")]
+  [ValidateSet("Init", "Prepare", "SendPrompt", "CaptureFeedback", "WaitFeedback", "AssessFeedback", "SendAssessment", "RecordExperience", "Status", "Run", "StartSession", "PreflightConnector", "StopSession")]
   [string]$Action = "Run",
   [string]$Root,
   [string]$TargetChatGptUrl,
-  [int]$Port = 7676,
   [switch]$AllowSensitive,
   [switch]$Send,
-  [int]$FeedbackTimeoutSeconds = 900,
-  [int]$ConnectorTimeoutSeconds = 300,
-  [int]$StartupTimeoutSeconds = 90,
-  [int]$TunnelTimeoutSeconds = 90,
+  [string]$FeedbackText,
+  [string]$FeedbackFile,
+  [string]$AssessmentText,
+  [string]$AssessmentFile,
   [string]$ExperienceOutcome = "unspecified",
   [string]$ExperienceLesson,
-  [string]$ExperienceNotes,
-  [switch]$StopDevSpace
+  [string]$ExperienceNotes
 )
 
 $ErrorActionPreference = "Stop"
+
+$SkipDirectories = @(
+  ".git", ".hg", ".svn", ".codegraph",
+  "node_modules", ".venv", "venv", "__pycache__",
+  "dist", "build", "target", ".next", ".cache",
+  ".pytest_cache", ".mypy_cache", ".ruff_cache"
+)
 
 function Resolve-ProjectRoot {
   param([string]$Candidate)
@@ -32,20 +37,11 @@ function Resolve-ProjectRoot {
       return (Resolve-Path -LiteralPath $gitRoot.Trim()).Path
     }
   } catch {
+  } finally {
+    $global:LASTEXITCODE = 0
   }
 
   return (Resolve-Path -LiteralPath (Get-Location).Path).Path
-}
-
-function Get-ProjectId {
-  param([string]$ProjectRoot)
-
-  $sha = [System.Security.Cryptography.SHA256]::Create()
-  $bytes = [System.Text.Encoding]::UTF8.GetBytes($ProjectRoot.ToLowerInvariant())
-  $hash = [System.BitConverter]::ToString($sha.ComputeHash($bytes)).Replace("-", "").Substring(0, 12).ToLowerInvariant()
-  $name = Split-Path -Leaf $ProjectRoot
-  $safeName = ($name -replace "[^A-Za-z0-9_.-]", "_")
-  return "$safeName-$hash"
 }
 
 function ConvertTo-JsonFile {
@@ -62,7 +58,7 @@ function ConvertTo-JsonFile {
 }
 
 function Read-JsonFile {
-  param([string]$Path)
+  param([Parameter(Mandatory = $true)][string]$Path)
   return Get-Content -Raw -LiteralPath $Path | ConvertFrom-Json
 }
 
@@ -80,130 +76,136 @@ function Set-ObjectProperty {
   }
 }
 
-function Test-ChatGptConversationUrl {
-  param([string]$Url)
+function Get-ReviewPaths {
+  param([Parameter(Mandatory = $true)][string]$ProjectRoot)
 
+  $base = Join-Path $ProjectRoot "docs\ai-review-loop"
+  return [pscustomobject]@{
+    Base = $base
+    Config = Join-Path $base "project-config.json"
+    State = Join-Path $base "review-state.json"
+    Decisions = Join-Path $base "decisions.md"
+    Dossiers = Join-Path $base "dossiers"
+    CodeMaps = Join-Path $base "code-maps"
+    RoundRequests = Join-Path $base "round-requests"
+    Prompts = Join-Path $base "prompts"
+    Feedback = Join-Path $base "gpt-feedback"
+    Assessments = Join-Path $base "codex-assessments"
+    SecurityScans = Join-Path $base "security-scans"
+    ExperienceLog = Join-Path $base "experience-log.md"
+    ExperienceIssues = Join-Path $base "experience-issues"
+  }
+}
+
+function Test-ChatGptUrl {
+  param([string]$Url)
   if (-not $Url) {
     return $false
   }
-  return ($Url.Trim() -match "^https://chatgpt\.com/(?:.+/)?c/[0-9A-Fa-f-]+")
+  return ($Url.Trim() -match "^https://chatgpt\.com/")
 }
 
-function ConvertTo-ChatGptProjectUrl {
+function ConvertTo-ChatGptTargetUrl {
   param([string]$Url)
-
   if (-not $Url) {
     return $null
   }
-
-  $trimmed = $Url.Trim()
-  if ($trimmed -match "^(https://chatgpt\.com/.+?)/c/[0-9A-Fa-f-]+(?:[/?#].*)?$") {
-    return $matches[1].TrimEnd("/")
-  }
-
-  return $trimmed
+  return $Url.Trim()
 }
 
-function Get-BridgePaths {
-  param([string]$ProjectRoot)
-
-  $bridge = Join-Path $ProjectRoot "docs\ai-bridge"
-  return [pscustomobject]@{
-    Bridge = $bridge
-    Config = Join-Path $bridge "project-config.json"
-    State = Join-Path $bridge "bridge-state.json"
-    Decisions = Join-Path $bridge "decisions.md"
-    Inbox = Join-Path $bridge "inbox"
-    Reports = Join-Path $bridge "codex-reports"
-    Feedback = Join-Path $bridge "gpt-pro-feedback"
-    Scans = Join-Path $bridge "security-scans"
-    ExperienceLog = Join-Path $bridge "experience-log.md"
-    ExperienceIssues = Join-Path $bridge "experience-issues"
-  }
-}
-
-function Get-RuntimePaths {
-  param([string]$ProjectRoot)
-
-  $base = Join-Path $env:LOCALAPPDATA ("gpt-pro-review-loop\" + (Get-ProjectId $ProjectRoot))
-  return [pscustomobject]@{
-    Base = $base
-    Logs = Join-Path $base "logs"
-    Session = Join-Path $base "session.json"
-    Baseline = Join-Path $base "baseline-files.json"
-    OwnerToken = Join-Path $base "owner-token.txt"
-    DevspaceConfig = Join-Path $base "devspace-config"
-    DevspaceState = Join-Path $base "devspace-state"
-    Worktrees = Join-Path $base "worktrees"
-  }
-}
-
-function Ensure-Bridge {
+function Get-RelativePath {
   param(
-    [string]$ProjectRoot,
+    [Parameter(Mandatory = $true)][string]$Root,
+    [Parameter(Mandatory = $true)][string]$Path
+  )
+  return ([System.IO.Path]::GetRelativePath($Root, $Path) -replace "\\", "/")
+}
+
+function Ensure-ReviewLoop {
+  param(
+    [Parameter(Mandatory = $true)][string]$ProjectRoot,
     [string]$ChatUrl
   )
 
-  $paths = Get-BridgePaths $ProjectRoot
-  foreach ($dir in @($paths.Bridge, $paths.Inbox, $paths.Reports, $paths.Feedback, $paths.Scans, $paths.ExperienceIssues)) {
+  $paths = Get-ReviewPaths $ProjectRoot
+  foreach ($dir in @($paths.Base, $paths.Dossiers, $paths.CodeMaps, $paths.RoundRequests, $paths.Prompts, $paths.Feedback, $paths.Assessments, $paths.SecurityScans, $paths.ExperienceIssues)) {
     if (-not (Test-Path -LiteralPath $dir)) {
       New-Item -ItemType Directory -Path $dir -Force | Out-Null
     }
   }
 
   if (-not (Test-Path -LiteralPath $paths.Decisions)) {
-    Set-Content -LiteralPath $paths.Decisions -Encoding UTF8 -Value "# AI Bridge Decisions`n"
+    Set-Content -LiteralPath $paths.Decisions -Encoding UTF8 -Value "# GPT Pro Review Loop Decisions`n"
   }
-
   if (-not (Test-Path -LiteralPath $paths.ExperienceLog)) {
     Set-Content -LiteralPath $paths.ExperienceLog -Encoding UTF8 -Value "# GPT Pro Review Loop Experience Log`n"
   }
 
+  $targetUrl = ConvertTo-ChatGptTargetUrl $ChatUrl
   if (Test-Path -LiteralPath $paths.Config) {
     $config = Read-JsonFile $paths.Config
-    if ($ChatUrl) {
-      $projectUrl = ConvertTo-ChatGptProjectUrl $ChatUrl
-      Set-ObjectProperty $config "target_chatgpt_project_url" $projectUrl
-      Set-ObjectProperty $config "target_chatgpt_url" $projectUrl
-      if ($projectUrl -ne $ChatUrl.Trim()) {
-        Set-ObjectProperty $config "legacy_target_chatgpt_url" $ChatUrl.Trim()
-      }
-    } elseif (-not $config.target_chatgpt_project_url -and $config.target_chatgpt_url) {
-      $legacyUrl = $config.target_chatgpt_url
-      $projectUrl = ConvertTo-ChatGptProjectUrl $legacyUrl
-      Set-ObjectProperty $config "target_chatgpt_project_url" $projectUrl
-      Set-ObjectProperty $config "target_chatgpt_url" $projectUrl
-      if ($projectUrl -ne $legacyUrl) {
-        Set-ObjectProperty $config "legacy_target_chatgpt_url" $legacyUrl
-      }
+    if ($targetUrl) {
+      Set-ObjectProperty $config "target_chatgpt_conversation_url" $targetUrl
+      Set-ObjectProperty $config "target_chatgpt_url" $targetUrl
     }
   } else {
-    $projectUrl = ConvertTo-ChatGptProjectUrl $ChatUrl
     $config = [ordered]@{
-      target_chatgpt_project_url = $projectUrl
-      target_chatgpt_url = $projectUrl
-      legacy_target_chatgpt_url = if ($ChatUrl -and $projectUrl -ne $ChatUrl.Trim()) { $ChatUrl.Trim() } else { $null }
-      allowed_root = $ProjectRoot
+      target_chatgpt_conversation_url = $targetUrl
+      target_chatgpt_url = $targetUrl
+      transport = "browser_dossier"
       run_mode = "semi_auto"
-      review_scope = "whole_project"
-      gpt_write_policy = "feedback_only"
-      tunnel_policy = "quick_tunnel_per_session"
-      conversation_policy = "new_chat_per_review_round"
-      connector_preflight_required = $true
+      review_memory = "chatgpt_project_conversation"
+      baseline_policy = "first_round_full_then_delta"
+      sensitive_scan_policy = "block_unless_allow_sensitive"
+      code_map_policy = "filesystem_map_with_optional_codegraph_context"
+      codex_assessment_required = $true
+      feedback_return_policy = "send_local_assessment_to_same_chat"
+      local_project_name = (Split-Path -Leaf $ProjectRoot)
     }
   }
-  Set-ObjectProperty $config "allowed_root" $ProjectRoot
-  Set-ObjectProperty $config "conversation_policy" "new_chat_per_review_round"
-  Set-ObjectProperty $config "connector_preflight_required" $true
+
+  Set-ObjectProperty $config "transport" "browser_dossier"
+  Set-ObjectProperty $config "run_mode" "semi_auto"
+  Set-ObjectProperty $config "review_memory" "chatgpt_project_conversation"
+  Set-ObjectProperty $config "baseline_policy" "first_round_full_then_delta"
+  Set-ObjectProperty $config "codex_assessment_required" $true
+  Set-ObjectProperty $config "feedback_return_policy" "send_local_assessment_to_same_chat"
+  Set-ObjectProperty $config "local_project_name" (Split-Path -Leaf $ProjectRoot)
   ConvertTo-JsonFile $config $paths.Config
 
   if (-not (Test-Path -LiteralPath $paths.State)) {
     $state = [ordered]@{
-      version = 1
+      version = 2
       updated_at = (Get-Date).ToString("o")
+      baseline_sent = $false
+      baseline_hash = $null
+      round_counter = 0
       pending_for_gpt = @()
       pending_for_codex = @()
-      active_session = $null
+      pending_assessments_for_gpt = @()
+      latest_prompt = $null
+      latest_feedback = $null
+      latest_assessment = $null
+      target_chatgpt_conversation_url = $targetUrl
+    }
+    ConvertTo-JsonFile $state $paths.State
+  } else {
+    $state = Read-JsonFile $paths.State
+    Set-ObjectProperty $state "version" 2
+    Set-ObjectProperty $state "target_chatgpt_conversation_url" $config.target_chatgpt_conversation_url
+    Set-ObjectProperty $state "updated_at" (Get-Date).ToString("o")
+    foreach ($field in @("pending_for_gpt", "pending_for_codex", "pending_assessments_for_gpt")) {
+      if (-not ($state.PSObject.Properties.Name -contains $field) -or $null -eq $state.$field) {
+        Set-ObjectProperty $state $field @()
+      }
+    }
+    foreach ($field in @("baseline_sent", "baseline_hash", "round_counter", "latest_prompt", "latest_feedback", "latest_assessment")) {
+      if (-not ($state.PSObject.Properties.Name -contains $field)) {
+        $default = $null
+        if ($field -eq "baseline_sent") { $default = $false }
+        if ($field -eq "round_counter") { $default = 0 }
+        Set-ObjectProperty $state $field $default
+      }
     }
     ConvertTo-JsonFile $state $paths.State
   }
@@ -212,295 +214,235 @@ function Ensure-Bridge {
 }
 
 function Get-Config {
-  param([string]$ProjectRoot)
-
-  $paths = Get-BridgePaths $ProjectRoot
+  param([Parameter(Mandatory = $true)][string]$ProjectRoot)
+  $paths = Get-ReviewPaths $ProjectRoot
   if (-not (Test-Path -LiteralPath $paths.Config)) {
-    throw "Missing project config. Run -Action Init -TargetChatGptUrl <chatgpt-project-url> first."
+    throw "Missing project config. Run -Action Init -TargetChatGptUrl <chatgpt-url> first."
   }
   return Read-JsonFile $paths.Config
 }
 
+function Get-State {
+  param([Parameter(Mandatory = $true)][string]$ProjectRoot)
+  $paths = Get-ReviewPaths $ProjectRoot
+  if (-not (Test-Path -LiteralPath $paths.State)) {
+    throw "Missing review state. Run -Action Init first."
+  }
+  return Read-JsonFile $paths.State
+}
+
+function Save-State {
+  param(
+    [Parameter(Mandatory = $true)][string]$ProjectRoot,
+    [Parameter(Mandatory = $true)]$State
+  )
+  $paths = Get-ReviewPaths $ProjectRoot
+  Set-ObjectProperty $State "updated_at" (Get-Date).ToString("o")
+  ConvertTo-JsonFile $State $paths.State
+}
+
 function Add-StateItem {
   param(
-    [string]$ProjectRoot,
-    [string]$Field,
-    [string]$Value
+    [Parameter(Mandatory = $true)][string]$ProjectRoot,
+    [Parameter(Mandatory = $true)][string]$Field,
+    [Parameter(Mandatory = $true)][string]$Value
   )
 
-  $paths = Get-BridgePaths $ProjectRoot
-  $state = Read-JsonFile $paths.State
-  if ($null -eq $state.$Field) {
-    $state | Add-Member -NotePropertyName $Field -NotePropertyValue @()
+  $state = Get-State -ProjectRoot $ProjectRoot
+  if (-not ($state.PSObject.Properties.Name -contains $Field) -or $null -eq $state.$Field) {
+    Set-ObjectProperty $state $Field @()
   }
   $items = @($state.$Field)
   if ($items -notcontains $Value) {
-    $state.$Field = @($items + $Value)
+    Set-ObjectProperty $state $Field @($items + $Value)
   }
-  $state.updated_at = (Get-Date).ToString("o")
-  ConvertTo-JsonFile $state $paths.State
+  Save-State $ProjectRoot $state
 }
 
-function Set-ActiveSession {
+function Get-GitText {
   param(
-    [string]$ProjectRoot,
-    $Session
+    [Parameter(Mandatory = $true)][string]$ProjectRoot,
+    [Parameter(Mandatory = $true)][string[]]$Args
   )
-
-  $paths = Get-BridgePaths $ProjectRoot
-  $state = Read-JsonFile $paths.State
-  $state.active_session = $Session
-  $state.updated_at = (Get-Date).ToString("o")
-  ConvertTo-JsonFile $state $paths.State
-}
-
-function Get-RunningSession {
-  param([string]$ProjectRoot)
-
-  $runtime = Get-RuntimePaths $ProjectRoot
-  if (-not (Test-Path -LiteralPath $runtime.Session)) {
-    throw "No active session file found. Run -Action StartSession first."
-  }
-  $session = Read-JsonFile $runtime.Session
-  if ($session.PSObject.Properties.Name -contains "stopped_at" -and $session.stopped_at) {
-    throw "Review session is stopped. Run -Action StartSession or -Action PreflightConnector to create a fresh tunnel."
-  }
-  return $session
-}
-
-function Save-Session {
-  param(
-    [string]$ProjectRoot,
-    $Session
-  )
-
-  $runtime = Get-RuntimePaths $ProjectRoot
-  ConvertTo-JsonFile $Session $runtime.Session
-  Set-ActiveSession $ProjectRoot $Session
-}
-
-function Set-ConnectorPreflight {
-  param(
-    [string]$ProjectRoot,
-    $Session,
-    [string]$Status,
-    [string]$Reason,
-    $Details
-  )
-
-  $payload = [ordered]@{
-    status = $Status
-    reason = $Reason
-    checked_at = (Get-Date).ToString("o")
-  }
-  if ($Details) {
-    foreach ($property in $Details.PSObject.Properties) {
-      $payload[$property.Name] = $property.Value
-    }
-  }
-  Set-ObjectProperty $Session "connector_preflight" $payload
-  Save-Session $ProjectRoot $Session
-}
-
-function Get-DevSpaceHttpRequests {
-  param(
-    [string]$LogPath,
-    [datetime]$Since
-  )
-
-  if (-not (Test-Path -LiteralPath $LogPath)) {
-    return @()
-  }
-
-  $sinceUtc = $Since.ToUniversalTime()
-  $requests = New-Object System.Collections.Generic.List[object]
-  foreach ($line in Get-Content -LiteralPath $LogPath -ErrorAction SilentlyContinue) {
-    $trimmed = $line.Trim()
-    if (-not $trimmed.StartsWith("{")) {
-      continue
-    }
-    try {
-      $entry = $trimmed | ConvertFrom-Json
-    } catch {
-      continue
-    }
-    if ($entry.event -ne "http_request" -or -not $entry.ts) {
-      continue
-    }
-    try {
-      $ts = ([datetime]::Parse($entry.ts)).ToUniversalTime()
-    } catch {
-      continue
-    }
-    if ($ts -lt $sinceUtc) {
-      continue
-    }
-    $requests.Add([pscustomobject]@{
-      ts = $entry.ts
-      method = $entry.method
-      path = $entry.path
-      status = $entry.status
-      host = $entry.host
-      userAgent = $entry.userAgent
-      requestId = $entry.requestId
-    }) | Out-Null
-  }
-  return @($requests.ToArray())
-}
-
-function Test-ConnectorCandidateRequest {
-  param($Request)
-
-  if (-not $Request) {
-    return $false
-  }
-  if ($Request.path -eq "/healthz") {
-    return $false
-  }
-  if ($Request.userAgent -and $Request.userAgent -match "PowerShell|Invoke-WebRequest") {
-    return $false
-  }
-  return $true
-}
-
-function Test-OAuthFailureRequest {
-  param($Request)
-
-  if (-not (Test-ConnectorCandidateRequest $Request)) {
-    return $false
-  }
-  $path = [string]$Request.path
-  $status = [int]$Request.status
-  $isOAuthPath = $path -match "^/(authorize|token|register|revoke|\.well-known/)"
-  return ($isOAuthPath -and $status -ge 400)
-}
-
-function Format-ObservedRequest {
-  param($Request)
-
-  if (-not $Request) {
-    return $null
-  }
-  return [ordered]@{
-    ts = $Request.ts
-    method = $Request.method
-    path = $Request.path
-    status = $Request.status
-    host = $Request.host
-    userAgent = $Request.userAgent
-    requestId = $Request.requestId
-  }
-}
-
-function Invoke-OAuthDiscoveryCheck {
-  param(
-    [string]$TunnelUrl,
-    [string]$McpUrl,
-    [int]$TimeoutSeconds = 20
-  )
-
-  $resourceUrl = "$TunnelUrl/.well-known/oauth-protected-resource/mcp"
-  $authUrl = "$TunnelUrl/.well-known/oauth-authorization-server"
-  $result = [ordered]@{
-    resource_metadata_url = $resourceUrl
-    authorization_server_metadata_url = $authUrl
-    checked_at = (Get-Date).ToString("o")
-    ok = $false
-  }
 
   try {
-    $resourceResponse = Invoke-WebRequest -Uri $resourceUrl -Method Get -TimeoutSec $TimeoutSeconds -SkipHttpErrorCheck
-    $authResponse = Invoke-WebRequest -Uri $authUrl -Method Get -TimeoutSec $TimeoutSeconds -SkipHttpErrorCheck
-    $result.resource_status = [int]$resourceResponse.StatusCode
-    $result.authorization_server_status = [int]$authResponse.StatusCode
-
-    if ([int]$resourceResponse.StatusCode -ne 200) {
-      $result.error = "OAuth protected resource metadata returned HTTP $([int]$resourceResponse.StatusCode)."
-      return [pscustomobject]$result
+    $output = & git -C $ProjectRoot @Args 2>$null
+    if ($LASTEXITCODE -eq 0) {
+      return ($output -join "`n").Trim()
     }
-    if ([int]$authResponse.StatusCode -ne 200) {
-      $result.error = "OAuth authorization server metadata returned HTTP $([int]$authResponse.StatusCode)."
-      return [pscustomobject]$result
-    }
-
-    $resourceMetadata = $resourceResponse.Content | ConvertFrom-Json
-    $authMetadata = $authResponse.Content | ConvertFrom-Json
-    $result.resource = $resourceMetadata.resource
-    $result.authorization_servers = @($resourceMetadata.authorization_servers)
-    $result.issuer = $authMetadata.issuer
-    $result.authorization_endpoint = $authMetadata.authorization_endpoint
-    $result.token_endpoint = $authMetadata.token_endpoint
-    $result.registration_endpoint = $authMetadata.registration_endpoint
-    $result.scopes_supported = @($authMetadata.scopes_supported)
-
-    if ($resourceMetadata.resource -ne $McpUrl) {
-      $result.error = "OAuth resource metadata does not match the current MCP URL."
-      return [pscustomobject]$result
-    }
-    if (-not $authMetadata.authorization_endpoint -or -not $authMetadata.token_endpoint -or -not $authMetadata.registration_endpoint) {
-      $result.error = "OAuth authorization metadata is missing required endpoints."
-      return [pscustomobject]$result
-    }
-    if (@($resourceMetadata.authorization_servers) -notcontains $authMetadata.issuer) {
-      $result.error = "OAuth resource metadata does not list the authorization server issuer."
-      return [pscustomobject]$result
-    }
-
-    $result.ok = $true
-    return [pscustomobject]$result
   } catch {
-    $result.error = $_.Exception.Message
-    return [pscustomobject]$result
+  } finally {
+    $global:LASTEXITCODE = 0
+  }
+  return ""
+}
+
+function Test-SkippedPath {
+  param(
+    [Parameter(Mandatory = $true)][string]$RelativePath
+  )
+  $parts = $RelativePath -split "[\\/]"
+  foreach ($part in $parts) {
+    if ($SkipDirectories -contains $part) {
+      return $true
+    }
+  }
+  return $false
+}
+
+function Get-ProjectFiles {
+  param(
+    [Parameter(Mandatory = $true)][string]$ProjectRoot,
+    [int]$Limit = 500
+  )
+
+  $files = @(Get-ChildItem -LiteralPath $ProjectRoot -Recurse -File -Force -ErrorAction SilentlyContinue |
+    ForEach-Object {
+      $relative = Get-RelativePath $ProjectRoot $_.FullName
+      if (-not (Test-SkippedPath $relative)) {
+        [pscustomobject]@{
+          path = $relative
+          length = $_.Length
+          extension = $_.Extension.ToLowerInvariant()
+          last_write_time = $_.LastWriteTime.ToString("o")
+        }
+      }
+    } |
+    Sort-Object path |
+    Select-Object -First $Limit)
+
+  return $files
+}
+
+function Get-ProjectTreeText {
+  param([Parameter(Mandatory = $true)][string]$ProjectRoot)
+
+  $items = @(Get-ChildItem -LiteralPath $ProjectRoot -Force -ErrorAction SilentlyContinue |
+    Where-Object { -not ($SkipDirectories -contains $_.Name) } |
+    Sort-Object @{ Expression = { -not $_.PSIsContainer } }, Name |
+    Select-Object -First 100)
+  if ($items.Count -eq 0) {
+    return "(empty project root)"
+  }
+  return ($items | ForEach-Object {
+    if ($_.PSIsContainer) { "[dir]  " + $_.Name } else { "[file] " + $_.Name }
+  }) -join "`n"
+}
+
+function Get-KeyFiles {
+  param([Parameter(Mandatory = $true)][string]$ProjectRoot)
+
+  $patterns = @(
+    "AGENTS.md", "README.md", "package.json", "pnpm-lock.yaml", "yarn.lock", "package-lock.json",
+    "pyproject.toml", "requirements.txt", "Cargo.toml", "go.mod", "deno.json", "tsconfig.json",
+    "vite.config.*", "next.config.*", "godot.project", "project.godot", "*.sln", "*.csproj"
+  )
+  $found = New-Object System.Collections.Generic.List[string]
+  foreach ($pattern in $patterns) {
+    $matches = @(Get-ChildItem -LiteralPath $ProjectRoot -Recurse -File -Force -Filter $pattern -ErrorAction SilentlyContinue |
+      Where-Object {
+        $relative = Get-RelativePath $ProjectRoot $_.FullName
+        -not (Test-SkippedPath $relative)
+      } |
+      Select-Object -First 20)
+    foreach ($item in $matches) {
+      $found.Add((Get-RelativePath $ProjectRoot $item.FullName)) | Out-Null
+    }
+  }
+  return @($found.ToArray() | Sort-Object -Unique)
+}
+
+function Get-TestHints {
+  param([Parameter(Mandatory = $true)][string]$ProjectRoot)
+
+  $hints = New-Object System.Collections.Generic.List[string]
+  $packagePath = Join-Path $ProjectRoot "package.json"
+  if (Test-Path -LiteralPath $packagePath) {
+    try {
+      $pkg = Get-Content -Raw -LiteralPath $packagePath | ConvertFrom-Json
+      if ($pkg.scripts) {
+        foreach ($script in $pkg.scripts.PSObject.Properties) {
+          if ($script.Name -match "test|lint|check|build") {
+            $hints.Add(("npm script `{0}`: {1}" -f $script.Name, $script.Value)) | Out-Null
+          }
+        }
+      }
+    } catch {
+    }
+  }
+  foreach ($candidate in @("pytest.ini", "pyproject.toml", "tox.ini", "Cargo.toml", "go.mod", "Makefile")) {
+    if (Test-Path -LiteralPath (Join-Path $ProjectRoot $candidate)) {
+      $hints.Add("Detected $candidate") | Out-Null
+    }
+  }
+  if ($hints.Count -eq 0) {
+    $hints.Add("(no obvious test command discovered)") | Out-Null
+  }
+  return @($hints.ToArray())
+}
+
+function Get-ContentExcerpt {
+  param(
+    [Parameter(Mandatory = $true)][string]$Path,
+    [int]$MaxChars = 6000
+  )
+
+  try {
+    $fileInfo = Get-Item -LiteralPath $Path -ErrorAction Stop
+    if ($fileInfo.Length -gt 524288) {
+      return "(skipped: file larger than 512 KiB)"
+    }
+    $text = Get-Content -Raw -LiteralPath $Path -ErrorAction Stop
+    if ($text.Length -gt $MaxChars) {
+      return $text.Substring(0, $MaxChars) + "`n...(truncated)"
+    }
+    return $text
+  } catch {
+    return "(unreadable: $($_.Exception.Message))"
   }
 }
 
 function Invoke-SensitiveScan {
   param(
-    [string]$ProjectRoot,
+    [Parameter(Mandatory = $true)][string]$ProjectRoot,
     [switch]$Allow
   )
 
-  $paths = Get-BridgePaths $ProjectRoot
+  $paths = Get-ReviewPaths $ProjectRoot
   $stamp = Get-Date -Format "yyyyMMdd-HHmmss"
-  $scanPath = Join-Path $paths.Scans "$stamp-sensitive-scan.json"
-  $skipDirs = @(".git", "node_modules", ".venv", "venv", "__pycache__", "dist", "build", "target", ".next", ".cache", ".codegraph")
-  $riskyNames = @("^\.env($|\.)", "\.pem$", "\.key$", "id_rsa$", "id_dsa$", "cookies?\.txt$", "auth\.json$")
+  $scanPath = Join-Path $paths.SecurityScans "$stamp-sensitive-scan.json"
+  $riskyNames = @("^\.env($|\.)", "\.pem$", "\.key$", "id_rsa$", "id_dsa$", "cookies?\.txt$", "auth\.json$", "credentials?\.json$")
   $patterns = @(
     @{ name = "OpenAI-style API key"; pattern = "sk-[A-Za-z0-9_-]{20,}" },
     @{ name = "Private key header"; pattern = "-----BEGIN [A-Z ]*PRIVATE KEY-----" },
     @{ name = "Token/password assignment"; pattern = "(?i)(api[_-]?key|access[_-]?token|refresh[_-]?token|session[_-]?token|cookie|password)\s*[:=]\s*['""]?[^'""\s]{12,}" }
   )
   $issues = New-Object System.Collections.Generic.List[object]
-
-  $files = Get-ChildItem -LiteralPath $ProjectRoot -Recurse -File -Force -ErrorAction SilentlyContinue |
-    Where-Object {
-      $relative = [System.IO.Path]::GetRelativePath($ProjectRoot, $_.FullName)
-      $parts = $relative -split "[\\/]"
-      -not ($parts | Where-Object { $skipDirs -contains $_ })
-    }
+  $files = Get-ProjectFiles $ProjectRoot 20000
 
   foreach ($file in $files) {
-    $relative = [System.IO.Path]::GetRelativePath($ProjectRoot, $file.FullName)
+    $name = Split-Path -Leaf $file.path
     foreach ($rule in $riskyNames) {
-      if ($file.Name -match $rule) {
-        $issues.Add([pscustomobject]@{ path = $relative; type = "risky_filename"; rule = $rule }) | Out-Null
+      if ($name -match $rule) {
+        $issues.Add([pscustomobject]@{ path = $file.path; type = "risky_filename"; rule = $rule }) | Out-Null
         break
       }
     }
 
-    if ($file.Length -gt 1048576) {
+    if ($file.length -gt 1048576) {
       continue
     }
 
+    $fullPath = Join-Path $ProjectRoot ($file.path -replace "/", "\")
     try {
-      $text = Get-Content -Raw -LiteralPath $file.FullName -ErrorAction Stop
+      $text = Get-Content -Raw -LiteralPath $fullPath -ErrorAction Stop
     } catch {
       continue
     }
 
     foreach ($rule in $patterns) {
       if ($text -match $rule.pattern) {
-        $issues.Add([pscustomobject]@{ path = $relative; type = "content_pattern"; rule = $rule.name }) | Out-Null
+        $issues.Add([pscustomobject]@{ path = $file.path; type = "content_pattern"; rule = $rule.name }) | Out-Null
       }
     }
 
@@ -511,10 +453,11 @@ function Invoke-SensitiveScan {
 
   $result = [ordered]@{
     created_at = (Get-Date).ToString("o")
-    project_root = $ProjectRoot
+    project_name = (Split-Path -Leaf $ProjectRoot)
+    transport = "browser_dossier"
     issue_count = $issues.Count
     allowed = [bool]$Allow
-    issues = $issues.ToArray()
+    issues = @($issues.ToArray())
   }
   ConvertTo-JsonFile $result $scanPath
 
@@ -531,83 +474,68 @@ function Invoke-SensitiveScan {
   return $scanPath
 }
 
-function Get-GitText {
+function New-ProjectDossier {
   param(
-    [string]$ProjectRoot,
-    [string[]]$Args
+    [Parameter(Mandatory = $true, Position = 0)][string]$ProjectRoot,
+    [Parameter(Mandatory = $true, Position = 1)][string]$ScanPath,
+    [Parameter(Mandatory = $true, Position = 2)][string]$RoundId
   )
 
-  try {
-    $output = & git -C $ProjectRoot @Args 2>$null
-    if ($LASTEXITCODE -eq 0) {
-      return ($output -join "`n")
-    }
-  } catch {
+  $dossierDir = [System.IO.Path]::Combine($ProjectRoot, "docs", "ai-review-loop", "dossiers")
+  if (-not (Test-Path -LiteralPath $dossierDir)) {
+    New-Item -ItemType Directory -Path $dossierDir -Force | Out-Null
   }
-  return ""
-}
-
-function Get-ProjectTree {
-  param([string]$ProjectRoot)
-
-  $skipDirs = @(".git", "node_modules", ".venv", "venv", "__pycache__", "dist", "build", "target", ".next", ".cache", ".codegraph")
-  $items = Get-ChildItem -LiteralPath $ProjectRoot -Force -ErrorAction SilentlyContinue |
-    Where-Object { -not ($skipDirs -contains $_.Name) } |
-    Select-Object -First 80
-  return ($items | ForEach-Object {
-    if ($_.PSIsContainer) { "[dir]  " + $_.Name } else { "[file] " + $_.Name }
-  }) -join "`n"
-}
-
-function New-ReviewReport {
-  param(
-    [string]$ProjectRoot,
-    [string]$ScanPath
-  )
-
-  $paths = Get-BridgePaths $ProjectRoot
-  $stamp = Get-Date -Format "yyyy-MM-dd-HHmmss"
-  $id = "codex-review-$stamp"
-  $reportPath = Join-Path $paths.Reports "$stamp-review-request.md"
-  $relativeReport = [System.IO.Path]::GetRelativePath($ProjectRoot, $reportPath)
+  $dossierPath = [System.IO.Path]::Combine($dossierDir, "$RoundId-project-dossier.md")
+  $projectName = Split-Path -Leaf $ProjectRoot
+  $branch = Get-GitText $ProjectRoot @("branch", "--show-current")
+  if (-not $branch) { $branch = "(not a git repo or detached)" }
   $gitStatus = Get-GitText $ProjectRoot @("status", "--short")
-  if (-not $gitStatus) { $gitStatus = "(not a git repo or no git status available)" }
-  $recentCommits = Get-GitText $ProjectRoot @("log", "--oneline", "-5")
+  if (-not $gitStatus) { $gitStatus = "(clean, not a git repo, or unavailable)" }
+  $recentCommits = Get-GitText $ProjectRoot @("log", "--oneline", "-8")
   if (-not $recentCommits) { $recentCommits = "(not available)" }
-  $tree = Get-ProjectTree $ProjectRoot
-  $existingReports = Get-ChildItem -LiteralPath $paths.Reports -File -Filter "*.md" -ErrorAction SilentlyContinue |
-    Where-Object { $_.FullName -ne $reportPath } |
-    Sort-Object LastWriteTime -Descending |
-    Select-Object -First 10 |
-    ForEach-Object { [System.IO.Path]::GetRelativePath($ProjectRoot, $_.FullName) }
+  $tree = Get-ProjectTreeText $ProjectRoot
+  $keyFiles = Get-KeyFiles $ProjectRoot
+  if ($keyFiles.Count -eq 0) { $keyFiles = @("(none discovered)") }
+  $tests = Get-TestHints $ProjectRoot
+  $scanRel = Get-RelativePath $ProjectRoot $ScanPath
 
   $body = @"
-# Codex Report: GPT Pro Review Request
+# Project Dossier
 
-- id: $id
+- id: $RoundId-dossier
 - created_at: $(Get-Date -Format o)
 - source: codex
 - target: gpt-pro
-- status: ready_for_review
-- related_files:
-  - $relativeReport
+- transport: browser_dossier
+- status: baseline_material
+- project_name: $projectName
 
-## Requested Feedback
+## Use
 
-Review the current project state through DevSpace. Focus on correctness, missing risks, test gaps, privacy/security concerns, and whether Codex should proceed with the next implementation round.
+This dossier is a local, sanitized project baseline for GPT Pro review. It replaces direct file access. Treat paths as project-relative. Do not assume access to local files beyond the material Codex sends in this ChatGPT conversation.
 
-Write feedback only under `docs/ai-bridge/gpt-pro-feedback/`.
+## Project Snapshot
 
-## Project Root
+- branch: $branch
+- security_scan: $scanRel
+- code_access_policy: summaries, code map, diffs, and necessary excerpts only
 
-```text
-$ProjectRoot
-```
-
-## Current Top-Level Files
+## Top-Level Layout
 
 ```text
 $tree
+```
+
+## Key Files And Manifests
+
+```text
+$($keyFiles -join "`n")
+```
+
+## Test And Verification Hints
+
+```text
+$($tests -join "`n")
 ```
 
 ## Git Status
@@ -622,683 +550,532 @@ $gitStatus
 $recentCommits
 ```
 
-## Existing Codex Reports
+## Reviewer Instructions
 
-```text
-$($existingReports -join "`n")
-```
-
-## Security Scan
-
-```text
-$ScanPath
-```
-
-## Notes For GPT Pro
-
-- You may inspect project files through DevSpace because the user selected `whole_project` review scope.
-- Do not edit source, config, tests, docs outside `docs/ai-bridge/gpt-pro-feedback/`.
-- Return a clear verdict, concerns, recommendations, and accepted/rejected actions for Codex.
+- Review the material Codex provides in this conversation.
+- Ask Codex for missing snippets instead of assuming direct repository access.
+- Give concrete concerns, expected tests, and recommended actions.
+- Codex will locally assess each recommendation before execution and report back.
 "@
 
-  Set-Content -LiteralPath $reportPath -Encoding UTF8 -Value $body
-  Add-StateItem $ProjectRoot "pending_for_gpt" ([System.IO.Path]::GetRelativePath($ProjectRoot, $reportPath))
-  Write-Host "Review report created: $reportPath" -ForegroundColor Green
-  return $reportPath
+  Set-Content -LiteralPath $dossierPath -Encoding UTF8 -Value $body
+  return $dossierPath
 }
 
-function Get-FileSnapshot {
-  param([string]$ProjectRoot)
+function New-CodeMap {
+  param(
+    [Parameter(Mandatory = $true, Position = 0)][string]$ProjectRoot,
+    [Parameter(Mandatory = $true, Position = 1)][string]$RoundId
+  )
 
-  $skipDirs = @(".git", "node_modules", ".venv", "venv", "__pycache__", "dist", "build", "target", ".next", ".cache", ".codegraph")
-  $files = Get-ChildItem -LiteralPath $ProjectRoot -Recurse -File -Force -ErrorAction SilentlyContinue |
-    Where-Object {
-      $relative = [System.IO.Path]::GetRelativePath($ProjectRoot, $_.FullName)
-      $parts = $relative -split "[\\/]"
-      -not ($parts | Where-Object { $skipDirs -contains $_ })
-    } |
+  $codeMapDir = [System.IO.Path]::Combine($ProjectRoot, "docs", "ai-review-loop", "code-maps")
+  if (-not (Test-Path -LiteralPath $codeMapDir)) {
+    New-Item -ItemType Directory -Path $codeMapDir -Force | Out-Null
+  }
+  $codeMapPath = [System.IO.Path]::Combine($codeMapDir, "$RoundId-code-map.md")
+  $files = @(Get-ProjectFiles -ProjectRoot $ProjectRoot -Limit 1200)
+  $byExt = @($files |
+    Group-Object extension |
+    Sort-Object Count -Descending |
+    Select-Object -First 20 |
     ForEach-Object {
-      [pscustomobject]@{
-        path = [System.IO.Path]::GetRelativePath($ProjectRoot, $_.FullName)
-        length = $_.Length
-        last_write_utc_ticks = $_.LastWriteTimeUtc.Ticks
-      }
-    }
-  return @($files)
-}
-
-function Compare-Snapshots {
-  param(
-    $Before,
-    $After
-  )
-
-  $beforeMap = @{}
-  foreach ($item in $Before) { $beforeMap[$item.path] = $item }
-  $changes = New-Object System.Collections.Generic.List[object]
-
-  foreach ($item in $After) {
-    if (-not $beforeMap.ContainsKey($item.path)) {
-      $changes.Add([pscustomobject]@{ path = $item.path; change = "added" }) | Out-Null
-      continue
-    }
-    $old = $beforeMap[$item.path]
-    $oldWrite = if ($null -ne $old.last_write_utc_ticks) { [int64]$old.last_write_utc_ticks } else { [string]$old.last_write_utc }
-    $newWrite = if ($null -ne $item.last_write_utc_ticks) { [int64]$item.last_write_utc_ticks } else { [string]$item.last_write_utc }
-    if ($old.length -ne $item.length -or $oldWrite -ne $newWrite) {
-      $changes.Add([pscustomobject]@{ path = $item.path; change = "modified" }) | Out-Null
-    }
-    $beforeMap.Remove($item.path)
-  }
-
-  foreach ($key in $beforeMap.Keys) {
-    $changes.Add([pscustomobject]@{ path = $key; change = "deleted" }) | Out-Null
-  }
-  return $changes.ToArray()
-}
-
-function Get-OwnerToken {
-  param($Runtime)
-
-  if (Test-Path -LiteralPath $Runtime.OwnerToken) {
-    return (Get-Content -Raw -LiteralPath $Runtime.OwnerToken).Trim()
-  }
-
-  New-Item -ItemType Directory -Path (Split-Path -Parent $Runtime.OwnerToken) -Force | Out-Null
-  $bytes = New-Object byte[] 32
-  [System.Security.Cryptography.RandomNumberGenerator]::Fill($bytes)
-  $token = [Convert]::ToBase64String($bytes)
-  Set-Content -LiteralPath $Runtime.OwnerToken -Encoding ASCII -Value $token
-  return $token
-}
-
-function Start-LoggedProcess {
-  param(
-    [string]$Name,
-    [string]$FilePath,
-    [string[]]$ArgumentList,
-    [string]$LogDir
-  )
-
-  New-Item -ItemType Directory -Path $LogDir -Force | Out-Null
-  $out = Join-Path $LogDir "$Name.out.log"
-  $err = Join-Path $LogDir "$Name.err.log"
-  Remove-Item -LiteralPath $out, $err -Force -ErrorAction SilentlyContinue
-  return Start-Process -FilePath $FilePath -ArgumentList $ArgumentList -RedirectStandardOutput $out -RedirectStandardError $err -WindowStyle Hidden -PassThru
-}
-
-function Get-NpxPath {
-  $cmd = Get-Command "npx.cmd" -ErrorAction SilentlyContinue
-  if ($cmd) { return $cmd.Source }
-  $cmd = Get-Command "npx" -ErrorAction SilentlyContinue
-  if ($cmd) { return $cmd.Source }
-  throw "npx was not found. Install Node/npm first."
-}
-
-function Wait-ForTunnelUrl {
-  param(
-    [string]$LogDir,
-    [int]$TimeoutSeconds
-  )
-
-  $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
-  $pattern = "https://[A-Za-z0-9-]+\.trycloudflare\.com"
-  while ((Get-Date) -lt $deadline) {
-    foreach ($file in Get-ChildItem -LiteralPath $LogDir -Filter "cloudflared.*.log" -ErrorAction SilentlyContinue) {
-      $text = Get-Content -Raw -LiteralPath $file.FullName -ErrorAction SilentlyContinue
-      if (-not $text) {
-        continue
-      }
-      $match = [regex]::Match($text, $pattern)
-      if ($match.Success) {
-        return $match.Value
-      }
-    }
-    Start-Sleep -Seconds 2
-  }
-  throw "Timed out waiting for Cloudflare quick tunnel URL. Check logs in $LogDir."
-}
-
-function Wait-ForHttpStatus {
-  param(
-    [string]$Uri,
-    [int]$Expected,
-    [int]$TimeoutSeconds,
-    [string]$Method = "Get"
-  )
-
-  $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
-  while ((Get-Date) -lt $deadline) {
-    try {
-      $response = Invoke-WebRequest -UseBasicParsing -Uri $Uri -Method $Method -TimeoutSec 8
-      $code = [int]$response.StatusCode
-    } catch {
-      if ($_.Exception.Response) {
-        $code = [int]$_.Exception.Response.StatusCode
-      } else {
-        $code = $null
-      }
-    }
-
-    if ($code -eq $Expected) {
-      return $true
-    }
-    Start-Sleep -Seconds 2
-  }
-  throw "Timed out waiting for $Uri to return HTTP $Expected."
-}
-
-function Stop-ProcessTree {
-  param([int]$ProcessId)
-
-  $children = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object { $_.ParentProcessId -eq $ProcessId })
-  foreach ($child in $children) {
-    Stop-ProcessTree ([int]$child.ProcessId)
-  }
-  Stop-Process -Id $ProcessId -Force -ErrorAction SilentlyContinue
-}
-
-function Stop-ProcessesByCommandPattern {
-  param([string]$Pattern)
-
-  $matches = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
-    $_.CommandLine -and $_.CommandLine -match $Pattern
-  })
-  foreach ($proc in $matches) {
-    Stop-ProcessTree ([int]$proc.ProcessId)
-  }
-}
-
-function Stop-Session {
-  param(
-    [string]$ProjectRoot,
-    [switch]$IncludeDevSpace
-  )
-
-  $runtime = Get-RuntimePaths $ProjectRoot
-  if (-not (Test-Path -LiteralPath $runtime.Session)) {
-    Write-Host "No session file found: $($runtime.Session)"
-    return
-  }
-  $session = Read-JsonFile $runtime.Session
-  $pids = @($session.cloudflared_pid)
-  if ($IncludeDevSpace) {
-    $pids += @($session.devspace_pid)
-  }
-  foreach ($pidValue in $pids) {
-    if ($pidValue) {
-      Stop-ProcessTree ([int]$pidValue)
-    }
-  }
-  if ($session.local_port) {
-    Stop-ProcessesByCommandPattern ("127\.0\.0\.1:" + [regex]::Escape([string]$session.local_port))
-  }
-  if ($session.PSObject.Properties.Name -contains "stopped_at") {
-    $session.stopped_at = (Get-Date).ToString("o")
-  } else {
-    $session | Add-Member -NotePropertyName "stopped_at" -NotePropertyValue (Get-Date).ToString("o")
-  }
-  ConvertTo-JsonFile $session $runtime.Session
-  Set-ActiveSession $ProjectRoot $null
-  Write-Host "Stopped review-loop session. Tunnel process stopped. DevSpace stopped: $([bool]$IncludeDevSpace)" -ForegroundColor Green
-}
-
-function Start-Session {
-  param(
-    [string]$ProjectRoot,
-    [int]$LocalPort
-  )
-
-  Write-Host "Starting GPT Pro review session for: $ProjectRoot"
-  $runtime = Get-RuntimePaths $ProjectRoot
-  $paths = Get-BridgePaths $ProjectRoot
-  $config = Get-Config $ProjectRoot
-  $targetChatGptProjectUrl = $config.target_chatgpt_project_url
-  if (-not $targetChatGptProjectUrl -and $config.target_chatgpt_url) {
-    $targetChatGptProjectUrl = ConvertTo-ChatGptProjectUrl $config.target_chatgpt_url
-  }
-  if (-not $targetChatGptProjectUrl -or $targetChatGptProjectUrl -notmatch "^https://chatgpt\.com/") {
-    throw "project-config.json must contain a ChatGPT project or new-chat URL in target_chatgpt_project_url."
-  }
-  if (Test-ChatGptConversationUrl $targetChatGptProjectUrl) {
-    throw "Refusing to send to an existing ChatGPT /c/ conversation URL because DevSpace apps may not attach there. Re-run Init with a ChatGPT project or new-chat URL."
-  }
-
-  foreach ($dir in @($runtime.Base, $runtime.Logs, $runtime.DevspaceConfig, $runtime.DevspaceState, $runtime.Worktrees)) {
-    New-Item -ItemType Directory -Path $dir -Force | Out-Null
-  }
-
-  $npx = Get-NpxPath
-  $cloudflared = $null
-  $devspace = $null
-  $startedOk = $false
-  Write-Host "Starting Cloudflare quick tunnel on local port $LocalPort..."
-  $cloudflared = Start-LoggedProcess -Name "cloudflared" -FilePath $npx -ArgumentList @("--yes", "cloudflared", "tunnel", "--url", "http://127.0.0.1:$LocalPort", "--no-autoupdate") -LogDir $runtime.Logs
-  try {
-    $tunnelUrl = Wait-ForTunnelUrl $runtime.Logs $TunnelTimeoutSeconds
-    $mcpUrl = "$tunnelUrl/mcp"
-    Write-Host "Quick tunnel URL: $tunnelUrl"
-
-    $ownerToken = Get-OwnerToken $runtime
-    $oldEnv = @{
-      PORT = $env:PORT
-      DEVSPACE_ALLOWED_ROOTS = $env:DEVSPACE_ALLOWED_ROOTS
-      DEVSPACE_PUBLIC_BASE_URL = $env:DEVSPACE_PUBLIC_BASE_URL
-      DEVSPACE_OAUTH_OWNER_TOKEN = $env:DEVSPACE_OAUTH_OWNER_TOKEN
-      DEVSPACE_CONFIG_DIR = $env:DEVSPACE_CONFIG_DIR
-      DEVSPACE_STATE_DIR = $env:DEVSPACE_STATE_DIR
-      DEVSPACE_WORKTREE_ROOT = $env:DEVSPACE_WORKTREE_ROOT
-      DEVSPACE_TOOL_MODE = $env:DEVSPACE_TOOL_MODE
-      DEVSPACE_LOG_SHELL_COMMANDS = $env:DEVSPACE_LOG_SHELL_COMMANDS
-    }
-
-    try {
-      $env:PORT = [string]$LocalPort
-      $env:DEVSPACE_ALLOWED_ROOTS = $ProjectRoot
-      $env:DEVSPACE_PUBLIC_BASE_URL = $tunnelUrl
-      $env:DEVSPACE_OAUTH_OWNER_TOKEN = $ownerToken
-      $env:DEVSPACE_CONFIG_DIR = $runtime.DevspaceConfig
-      $env:DEVSPACE_STATE_DIR = $runtime.DevspaceState
-      $env:DEVSPACE_WORKTREE_ROOT = $runtime.Worktrees
-      $env:DEVSPACE_TOOL_MODE = "full"
-      $env:DEVSPACE_LOG_SHELL_COMMANDS = "0"
-
-      Write-Host "Starting DevSpace MCP server..."
-      $devspace = Start-LoggedProcess -Name "devspace" -FilePath $npx -ArgumentList @("--yes", "@waishnav/devspace", "serve") -LogDir $runtime.Logs
-    } finally {
-      foreach ($key in $oldEnv.Keys) {
-        if ($null -eq $oldEnv[$key]) {
-          Remove-Item -Path "Env:$key" -ErrorAction SilentlyContinue
-        } else {
-          Set-Item -Path "Env:$key" -Value $oldEnv[$key] -ErrorAction SilentlyContinue
-        }
-      }
-    }
-
-    Write-Host "Checking local and public health endpoints..."
-    Wait-ForHttpStatus "http://127.0.0.1:$LocalPort/healthz" 200 $StartupTimeoutSeconds | Out-Null
-    Wait-ForHttpStatus "$tunnelUrl/healthz" 200 $StartupTimeoutSeconds | Out-Null
-    Wait-ForHttpStatus $mcpUrl 401 $StartupTimeoutSeconds "Post" | Out-Null
-    $oauthDiscovery = Invoke-OAuthDiscoveryCheck $tunnelUrl $mcpUrl 20
-    if (-not $oauthDiscovery.ok) {
-      throw "OAuth discovery check failed: $($oauthDiscovery.error)"
-    }
-
-    $latestReport = Get-ChildItem -LiteralPath $paths.Reports -File -Filter "*-review-request.md" |
-      Sort-Object LastWriteTime -Descending |
-      Select-Object -First 1
-    if (-not $latestReport) {
-      throw "No review report found. Run -Action Prepare first."
-    }
-
-    $feedbackName = ($latestReport.BaseName -replace "-review-request$", "") + "-gpt-pro-feedback.md"
-    $feedbackRelative = "docs/ai-bridge/gpt-pro-feedback/$feedbackName"
-    $promptPath = Join-Path $paths.Inbox ((Get-Date -Format "yyyy-MM-dd-HHmmss") + "-chatgpt-review-prompt.md")
-    $reportRelative = [System.IO.Path]::GetRelativePath($ProjectRoot, $latestReport.FullName)
-
-    $prompt = @"
-Use DevSpace AI Bridge to review this Codex project.
-
-Current MCP URL: $mcpUrl
-Project root to open in DevSpace: $ProjectRoot
-Review report to read first: $reportRelative
-Write your feedback file exactly here: $feedbackRelative
-
-Connector preflight is mandatory before review:
-1. Confirm the DevSpace AI Bridge app/tool is available in this new ChatGPT chat.
-2. Confirm the active DevSpace connector points to the current MCP URL above.
-3. Open the project root above and read the review report above.
-4. If any preflight step fails, write a BLOCKED feedback file if possible. If you cannot write the file, reply BLOCKED in chat and do not invent review findings.
-5. Continue to source review only after the preflight succeeds.
-
-Review scope:
-- You may inspect files in the opened project because the user selected whole_project scope.
-- Do not edit source code, tests, configs, or docs outside docs/ai-bridge/gpt-pro-feedback/.
-- If the connector is not available or does not point to the current MCP URL, say that clearly and do not invent review results.
-
-Feedback format:
-- Verdict
-- Blocking concerns
-- Non-blocking concerns
-- Recommended Codex actions
-- Tests or verification you expect Codex to run
-- Anything that should be rejected or deferred
-"@
-    Set-Content -LiteralPath $promptPath -Encoding UTF8 -Value $prompt
-
-    $session = [ordered]@{
-      started_at = (Get-Date).ToString("o")
-      project_root = $ProjectRoot
-      local_port = $LocalPort
-      tunnel_url = $tunnelUrl
-      mcp_url = $mcpUrl
-      target_chatgpt_project_url = $targetChatGptProjectUrl
-      target_chatgpt_url = $targetChatGptProjectUrl
-      conversation_policy = "new_chat_per_review_round"
-      connector_preflight_required = $true
-      oauth_discovery = $oauthDiscovery
-      connector_preflight = [ordered]@{
-        status = "not_started"
-        reason = $null
-        checked_at = $null
-      }
-      owner_token_path = $runtime.OwnerToken
-      prompt_path = $promptPath
-      report_path = $latestReport.FullName
-      expected_feedback_path = Join-Path $ProjectRoot $feedbackRelative
-      cloudflared_pid = $cloudflared.Id
-      devspace_pid = $devspace.Id
-      logs = $runtime.Logs
-    }
-    ConvertTo-JsonFile $session $runtime.Session
-    Set-ActiveSession $ProjectRoot $session
-    $baseline = Get-FileSnapshot $ProjectRoot
-    ConvertTo-JsonFile $baseline $runtime.Baseline
-    $startedOk = $true
-
-    Write-Host "Review session started." -ForegroundColor Green
-    Write-Host "MCP URL: $mcpUrl"
-    Write-Host "OAuth discovery: OK"
-    Write-Host "Owner token path: $($runtime.OwnerToken)"
-    Write-Host "Prompt file: $promptPath"
-    Write-Host "Expected feedback: $($session.expected_feedback_path)"
-    return $session
-  } finally {
-    if (-not $startedOk) {
-      if ($devspace) {
-        Stop-ProcessTree $devspace.Id
-      }
-      if ($cloudflared) {
-        Stop-ProcessTree $cloudflared.Id
-      }
-      Stop-ProcessesByCommandPattern ("127\.0\.0\.1:" + [regex]::Escape([string]$LocalPort))
-    }
-  }
-}
-
-function Wait-ConnectorPreflight {
-  param(
-    [string]$ProjectRoot,
-    [int]$TimeoutSeconds
-  )
-
-  $session = Get-RunningSession $ProjectRoot
-  $logPath = Join-Path $session.logs "devspace.out.log"
-
-  try {
-    Wait-ForHttpStatus ("http://127.0.0.1:{0}/healthz" -f $session.local_port) 200 10 | Out-Null
-    Wait-ForHttpStatus ("{0}/healthz" -f $session.tunnel_url) 200 20 | Out-Null
-    $oauthDiscovery = Invoke-OAuthDiscoveryCheck $session.tunnel_url $session.mcp_url 20
-    if (-not $oauthDiscovery.ok) {
-      throw "OAuth discovery failed: $($oauthDiscovery.error)"
-    }
-    Set-ObjectProperty $session "oauth_discovery" $oauthDiscovery
-    Save-Session $ProjectRoot $session
-  } catch {
-    $reason = if ($_.Exception.Message -match "OAuth discovery") { "oauth_metadata_unreachable" } else { "devspace_or_tunnel_unreachable" }
-    Set-ConnectorPreflight $ProjectRoot $session "blocked" $reason ([pscustomobject][ordered]@{
-      mcp_url = $session.mcp_url
-      local_port = $session.local_port
-      tunnel_url = $session.tunnel_url
-      next_action = "Start a fresh review session. Confirm /healthz and OAuth .well-known metadata are reachable before reconnecting ChatGPT."
-      error = $_.Exception.Message
+      $name = if ($_.Name) { $_.Name } else { "(no extension)" }
+      "{0}: {1}" -f $name, $_.Count
     })
-    throw "Connector preflight cannot start because the DevSpace public endpoint is not fully reachable: $($_.Exception.Message)"
+  if ($byExt.Count -eq 0) { $byExt = @("(no files)") }
+
+  $important = @($files | Where-Object {
+    $_.path -match "(^|/)(src|app|lib|server|client|tests?|spec|docs|scripts|tools)/" -or
+    $_.path -match "(AGENTS|README|package|pyproject|Cargo|go\.mod|tsconfig|vite|next|godot|project)\."
+  } | Select-Object -First 300)
+  if ($important.Count -eq 0) {
+    $important = @($files | Select-Object -First 120)
   }
 
-  $startedAt = Get-Date
-  Set-ConnectorPreflight $ProjectRoot $session "waiting" "waiting_for_chatgpt_request" ([pscustomobject][ordered]@{
-    started_at = $startedAt.ToString("o")
-    timeout_seconds = $TimeoutSeconds
-    mcp_url = $session.mcp_url
-    devspace_log = $logPath
-    owner_token_path = $session.owner_token_path
-    next_action = "In ChatGPT, disconnect or recreate the DevSpace app with this MCP URL, scan tools/connect, and enter the local Owner password from owner_token_path only in the DevSpace approval page."
+  $fileLines = @($important | ForEach-Object {
+    "- {0} ({1} bytes)" -f $_.path, $_.length
   })
+  if ($fileLines.Count -eq 0) { $fileLines = @("- (no project files discovered)") }
 
-  Write-Host "Connector preflight waiting for ChatGPT to reach DevSpace." -ForegroundColor Yellow
-  Write-Host "MCP URL: $($session.mcp_url)"
-  Write-Host "Target ChatGPT project/new-chat URL: $($session.target_chatgpt_project_url)"
-  Write-Host "Owner token path: $($session.owner_token_path)"
-  Write-Host "Manual steps while this waits:"
-  Write-Host "  1. In ChatGPT settings, disconnect or recreate the DevSpace app."
-  Write-Host "  2. Set the app endpoint to the MCP URL above, then scan tools/connect."
-  Write-Host "  3. If an Owner password page opens, paste the password from owner token path there only."
-  Write-Host "  4. Open a new chat in the configured ChatGPT project."
-  Write-Host "This check passes only after DevSpace logs a non-healthcheck request from ChatGPT."
+  $diffSummary = Get-GitText -ProjectRoot $ProjectRoot -Args @("diff", "--stat")
+  if (-not $diffSummary) { $diffSummary = "(no unstaged diff stat or unavailable)" }
+  $stagedDiffSummary = Get-GitText -ProjectRoot $ProjectRoot -Args @("diff", "--cached", "--stat")
+  if (-not $stagedDiffSummary) { $stagedDiffSummary = "(no staged diff stat or unavailable)" }
 
-  $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
-  while ((Get-Date) -lt $deadline) {
-    $requests = @(Get-DevSpaceHttpRequests $logPath $startedAt)
-    $candidates = @($requests | Where-Object { Test-ConnectorCandidateRequest $_ })
-    if ($candidates.Count -gt 0) {
-      $last = $candidates[-1]
-      $session = Get-RunningSession $ProjectRoot
-      $oauthFailures = @($candidates | Where-Object { Test-OAuthFailureRequest $_ })
-      if ($oauthFailures.Count -gt 0) {
-        $failure = $oauthFailures[-1]
-        Set-ConnectorPreflight $ProjectRoot $session "blocked" "oauth_request_rejected" ([pscustomobject][ordered]@{
-          started_at = $startedAt.ToString("o")
-          completed_at = (Get-Date).ToString("o")
-          timeout_seconds = $TimeoutSeconds
-          mcp_url = $session.mcp_url
-          devspace_log = $logPath
-          observed_request_count = $candidates.Count
-          observed_request = (Format-ObservedRequest $failure)
-          next_action = "ChatGPT reached DevSpace, but an OAuth/connection request returned an error. Reconnect the app with the current MCP URL and complete Owner password approval."
-        })
-        throw "Connector preflight saw a ChatGPT-side OAuth request, but it was rejected: $($failure.method) $($failure.path) -> $($failure.status)"
-      }
-      Set-ConnectorPreflight $ProjectRoot $session "passed" "chatgpt_request_seen" ([pscustomobject][ordered]@{
-        started_at = $startedAt.ToString("o")
-        completed_at = (Get-Date).ToString("o")
-        timeout_seconds = $TimeoutSeconds
-        mcp_url = $session.mcp_url
-        devspace_log = $logPath
-        observed_request_count = $candidates.Count
-        observed_request = (Format-ObservedRequest $last)
-      })
-      Write-Host "Connector preflight passed. DevSpace saw a ChatGPT-side request: $($last.method) $($last.path) -> $($last.status)" -ForegroundColor Green
-      return
-    }
-    Start-Sleep -Seconds 3
-  }
-
-  $allRequests = @(Get-DevSpaceHttpRequests $logPath $startedAt)
-  $healthOnlyRequests = @($allRequests | Where-Object { $_.path -eq "/healthz" })
-  $session = Get-RunningSession $ProjectRoot
-  Set-ConnectorPreflight $ProjectRoot $session "blocked" "no_chatgpt_request_seen" ([pscustomobject][ordered]@{
-    started_at = $startedAt.ToString("o")
-    completed_at = (Get-Date).ToString("o")
-    timeout_seconds = $TimeoutSeconds
-    mcp_url = $session.mcp_url
-    devspace_log = $logPath
-    total_http_requests_seen = $allRequests.Count
-    healthcheck_requests_seen = $healthOnlyRequests.Count
-    owner_token_path = $session.owner_token_path
-    oauth_discovery_ok = [bool]($session.oauth_discovery -and $session.oauth_discovery.ok)
-    next_action = "ChatGPT did not reach this DevSpace instance. Disconnect/recreate the app with the current MCP URL, scan tools/connect while the tunnel is running, and complete Owner password approval from owner_token_path."
-  })
-  throw "Connector preflight timed out. DevSpace did not see a ChatGPT-side request for the current MCP URL."
-}
-
-function Invoke-ConnectorPreflight {
-  param(
-    [string]$ProjectRoot,
-    [int]$LocalPort,
-    [int]$TimeoutSeconds
+  $bodyLines = @(
+    "# Code Map",
+    "",
+    "- id: $RoundId-code-map",
+    "- created_at: $(Get-Date -Format o)",
+    "- source: codex",
+    "- target: gpt-pro",
+    "- transport: browser_dossier",
+    "- status: code_map",
+    "",
+    "## CodeGraph Note",
+    "",
+    "If Codex has CodeGraph MCP available in the active project, Codex should add structural summaries from CodeGraph to the review prompt. This script provides a deterministic filesystem fallback and does not require CodeGraph.",
+    "",
+    "## File Type Summary",
+    "",
+    '```text',
+    ($byExt -join "`n"),
+    '```',
+    "",
+    "## Important Project Files",
+    "",
+    ($fileLines -join "`n"),
+    "",
+    "## Working Tree Diff Stat",
+    "",
+    '```text',
+    $diffSummary,
+    '```',
+    "",
+    "## Staged Diff Stat",
+    "",
+    '```text',
+    $stagedDiffSummary,
+    '```'
   )
 
-  $runtime = Get-RuntimePaths $ProjectRoot
-  $shouldStart = $true
-  if (Test-Path -LiteralPath $runtime.Session) {
-    $existing = Read-JsonFile $runtime.Session
-    $shouldStart = ($existing.PSObject.Properties.Name -contains "stopped_at" -and $existing.stopped_at)
-  }
-  if ($shouldStart) {
-    Start-Session $ProjectRoot $LocalPort | Out-Null
-  }
-  try {
-    Wait-ConnectorPreflight $ProjectRoot $TimeoutSeconds
-  } catch {
-    Stop-Session $ProjectRoot -IncludeDevSpace:$true
-    throw
-  }
+  Set-Content -LiteralPath $codeMapPath -Encoding UTF8 -Value ($bodyLines -join [Environment]::NewLine)
+  return $codeMapPath
 }
 
-function Send-Prompt {
+function New-RoundRequest {
   param(
-    [string]$ProjectRoot,
-    [switch]$Submit
+    [Parameter(Mandatory = $true, Position = 0)][string]$ProjectRoot,
+    [Parameter(Mandatory = $true, Position = 1)][string]$RoundId,
+    [Parameter(Mandatory = $true, Position = 2)][string]$ScanPath
   )
 
-  $session = Get-RunningSession $ProjectRoot
-  if (-not $session.connector_preflight -or $session.connector_preflight.status -ne "passed") {
-    throw "Connector preflight has not passed. Run -Action PreflightConnector and reconnect the DevSpace app before SendPrompt."
+  if ([string]::IsNullOrWhiteSpace($ProjectRoot)) {
+    throw "New-RoundRequest received an empty ProjectRoot."
   }
-  $chatUrl = $session.target_chatgpt_project_url
-  if (-not $chatUrl) {
-    $chatUrl = $session.target_chatgpt_url
+  $requestDir = [System.IO.Path]::Combine($ProjectRoot, "docs", "ai-review-loop", "round-requests")
+  if (-not (Test-Path -LiteralPath $requestDir)) {
+    New-Item -ItemType Directory -Path $requestDir -Force | Out-Null
   }
-  if (Test-ChatGptConversationUrl $chatUrl) {
-    throw "Refusing to open an existing ChatGPT /c/ conversation URL. Start from the project or new-chat URL so DevSpace can attach to the new chat."
-  }
-  $helper = Join-Path $PSScriptRoot "edge_send_review_prompt.py"
-  $python = Join-Path $env:USERPROFILE ".agents\skills\browser-use\scripts\.venv\Scripts\python.exe"
-  if (-not (Test-Path -LiteralPath $python)) {
-    $python = (Get-Command python -ErrorAction Stop).Source
-  }
+  $requestPath = [System.IO.Path]::Combine($requestDir, "$RoundId-round-request.md")
+  $gitStatus = Get-GitText -ProjectRoot $ProjectRoot -Args @("status", "--short")
+  if (-not $gitStatus) { $gitStatus = "(clean, not a git repo, or unavailable)" }
+  $diffStat = Get-GitText -ProjectRoot $ProjectRoot -Args @("diff", "--stat")
+  if (-not $diffStat) { $diffStat = "(no unstaged diff stat or unavailable)" }
+  $cachedDiffStat = Get-GitText -ProjectRoot $ProjectRoot -Args @("diff", "--cached", "--stat")
+  if (-not $cachedDiffStat) { $cachedDiffStat = "(no staged diff stat or unavailable)" }
+  $scanRel = Get-RelativePath -Root $ProjectRoot -Path $ScanPath
 
-  $args = @($helper, "--chat-url", $chatUrl, "--prompt-file", $session.prompt_path, "--require-new-chat")
-  if ($Submit) {
-    $args += "--send"
-  }
-
-  & $python @args
-  if ($LASTEXITCODE -ne 0) {
-    throw "Browser prompt helper failed with exit code $LASTEXITCODE."
-  }
-}
-
-function Wait-Feedback {
-  param(
-    [string]$ProjectRoot,
-    [int]$TimeoutSeconds
+  $bodyLines = @(
+    "# GPT Pro Review Request",
+    "",
+    "- id: $RoundId-request",
+    "- created_at: $(Get-Date -Format o)",
+    "- source: codex",
+    "- target: gpt-pro",
+    "- transport: browser_dossier",
+    "- status: ready_for_review",
+    "- security_scan: $scanRel",
+    "",
+    "## Requested Review",
+    "",
+    "Review this round using the baseline already present in this ChatGPT conversation plus the material below. Focus on correctness, risks, missing tests, privacy/security concerns, and whether Codex should proceed.",
+    "",
+    "## Local Changes Since Last Review",
+    "",
+    '```text',
+    $gitStatus,
+    '```',
+    "",
+    "## Unstaged Diff Stat",
+    "",
+    '```text',
+    $diffStat,
+    '```',
+    "",
+    "## Staged Diff Stat",
+    "",
+    '```text',
+    $cachedDiffStat,
+    '```',
+    "",
+    "## Feedback Format",
+    "",
+    "Return:",
+    "",
+    "1. Verdict: APPROVE, NEEDS_CHANGES, BLOCKED, or NEEDS_MORE_CONTEXT.",
+    "2. Findings ordered by severity.",
+    "3. Recommended Codex actions.",
+    "4. Tests or verification expected from Codex.",
+    "5. Anything to reject or defer.",
+    "",
+    "Codex will locally assess each recommendation before acting and will send you a practice-based response."
   )
 
-  $runtime = Get-RuntimePaths $ProjectRoot
-  $paths = Get-BridgePaths $ProjectRoot
-  $session = Get-RunningSession $ProjectRoot
-  $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
-  $feedbackFile = $null
-
-  while ((Get-Date) -lt $deadline) {
-    $candidates = Get-ChildItem -LiteralPath $paths.Feedback -File -Filter "*.md" -ErrorAction SilentlyContinue |
-      Where-Object { $_.LastWriteTime -gt ([datetime]$session.started_at) } |
-      Sort-Object LastWriteTime -Descending
-    if ($candidates) {
-      $feedbackFile = $candidates[0]
-      break
-    }
-    Start-Sleep -Seconds 5
-  }
-
-  if (-not $feedbackFile) {
-    throw "Timed out waiting for GPT Pro feedback in $($paths.Feedback)."
-  }
-
-  $before = @()
-  if (Test-Path -LiteralPath $runtime.Baseline) {
-    $before = @(Read-JsonFile $runtime.Baseline)
-  }
-  $after = Get-FileSnapshot $ProjectRoot
-  $changes = Compare-Snapshots $before $after
-  $allowedPrefix = "docs\ai-bridge\gpt-pro-feedback\"
-  $outOfBounds = @($changes | Where-Object {
-    $path = $_.path -replace "/", "\"
-    -not $path.StartsWith($allowedPrefix, [System.StringComparison]::OrdinalIgnoreCase)
-  })
-
-  $summary = [ordered]@{
-    feedback_path = $feedbackFile.FullName
-    changed_files = [object[]]$changes
-    out_of_bounds_writes = [object[]]$outOfBounds
-    checked_at = (Get-Date).ToString("o")
-  }
-  $summaryPath = Join-Path $runtime.Base "last-feedback-summary.json"
-  ConvertTo-JsonFile $summary $summaryPath
-
-  Write-Host "Feedback detected: $($feedbackFile.FullName)" -ForegroundColor Green
-  if ($outOfBounds.Count -gt 0) {
-    Write-Host "Out-of-bounds writes detected:" -ForegroundColor Red
-    foreach ($item in $outOfBounds) {
-      Write-Host (" - {0} ({1})" -f $item.path, $item.change) -ForegroundColor Red
-    }
-    throw "GPT changed files outside the feedback directory. Pause before acting."
-  }
-
-  Add-StateItem $ProjectRoot "pending_for_codex" ([System.IO.Path]::GetRelativePath($ProjectRoot, $feedbackFile.FullName))
-  Write-Host "No out-of-bounds writes detected." -ForegroundColor Green
-  Write-Host "Summary: $summaryPath"
-  return $feedbackFile.FullName
+  Set-Content -LiteralPath $requestPath -Encoding UTF8 -Value ($bodyLines -join [Environment]::NewLine)
+  return $requestPath
 }
 
-function Get-LatestBridgeFile {
+function Get-FileHashText {
+  param([string[]]$Paths)
+
+  $sha = [System.Security.Cryptography.SHA256]::Create()
+  $builder = New-Object System.Text.StringBuilder
+  foreach ($path in $Paths) {
+    if (Test-Path -LiteralPath $path) {
+      [void]$builder.AppendLine((Get-Content -Raw -LiteralPath $path))
+    }
+  }
+  $bytes = [System.Text.Encoding]::UTF8.GetBytes($builder.ToString())
+  return [System.BitConverter]::ToString($sha.ComputeHash($bytes)).Replace("-", "").ToLowerInvariant()
+}
+
+function New-ReviewPrompt {
   param(
-    [string]$Directory,
+    [Parameter(Mandatory = $true, Position = 0)][string]$ProjectRoot,
+    [Parameter(Mandatory = $true, Position = 1)][string]$RoundId,
+    [Parameter(Mandatory = $true, Position = 2)][string]$DossierPath,
+    [Parameter(Mandatory = $true, Position = 3)][string]$CodeMapPath,
+    [Parameter(Mandatory = $true, Position = 4)][string]$RequestPath
+  )
+
+  $paths = Get-ReviewPaths $ProjectRoot
+  $state = Get-State $ProjectRoot
+  $promptPath = Join-Path $paths.Prompts "$RoundId-review-prompt.md"
+  $includeBaseline = -not [bool]$state.baseline_sent
+
+  $dossier = if ($includeBaseline) { Get-ContentExcerpt $DossierPath 18000 } else { "(baseline already sent in this ChatGPT conversation; ask Codex if you need it repeated)" }
+  $codeMap = if ($includeBaseline) { Get-ContentExcerpt $CodeMapPath 22000 } else { "(baseline code map already sent; this round is delta-only)" }
+  $request = Get-ContentExcerpt $RequestPath 18000
+
+  $prompt = @"
+You are GPT Pro reviewing a Codex project through an offline review loop.
+
+There is no DevSpace, no MCP connector, no tunnel, and no direct file access. Use only the project baseline and round material in this ChatGPT conversation. If you need more context, ask Codex for a specific snippet or command result.
+
+Codex must locally assess your recommendations before acting and will report back with accept/modify/reject/needs-more-info decisions based on real project constraints.
+
+## Round
+
+$RoundId
+
+## Baseline Dossier
+
+$dossier
+
+## Code Map
+
+$codeMap
+
+## Round Request
+
+$request
+"@
+
+  Set-Content -LiteralPath $promptPath -Encoding UTF8 -Value $prompt
+  Set-ObjectProperty $state "latest_prompt" (Get-RelativePath $ProjectRoot $promptPath)
+  Add-StateItem $ProjectRoot "pending_for_gpt" (Get-RelativePath $ProjectRoot $promptPath)
+  return $promptPath
+}
+
+function New-ReviewPackage {
+  param(
+    [Parameter(Mandatory = $true, Position = 0)][string]$ProjectRoot,
+    [Parameter(Mandatory = $true, Position = 1)][string]$ScanPath
+  )
+
+  $state = Get-State $ProjectRoot
+  $roundNumber = [int]$state.round_counter + 1
+  $roundId = "round-{0:000}-{1}" -f $roundNumber, (Get-Date -Format "yyyyMMdd-HHmmss")
+
+  $dossierPath = New-ProjectDossier -ProjectRoot $ProjectRoot -ScanPath $ScanPath -RoundId $roundId
+  $codeMapPath = New-CodeMap -ProjectRoot $ProjectRoot -RoundId $roundId
+  $requestPath = New-RoundRequest -ProjectRoot $ProjectRoot -RoundId $roundId -ScanPath $ScanPath
+  $promptPath = New-ReviewPrompt -ProjectRoot $ProjectRoot -RoundId $roundId -DossierPath $dossierPath -CodeMapPath $codeMapPath -RequestPath $requestPath
+  $baselineHash = Get-FileHashText @($dossierPath, $codeMapPath)
+
+  $state = Get-State -ProjectRoot $ProjectRoot
+  Set-ObjectProperty -Object $state -Name "round_counter" -Value $roundNumber
+  Set-ObjectProperty -Object $state -Name "baseline_hash" -Value $baselineHash
+  Set-ObjectProperty -Object $state -Name "latest_dossier" -Value (Get-RelativePath -Root $ProjectRoot -Path $dossierPath)
+  Set-ObjectProperty -Object $state -Name "latest_code_map" -Value (Get-RelativePath -Root $ProjectRoot -Path $codeMapPath)
+  Set-ObjectProperty -Object $state -Name "latest_round_request" -Value (Get-RelativePath -Root $ProjectRoot -Path $requestPath)
+  Set-ObjectProperty -Object $state -Name "latest_prompt" -Value (Get-RelativePath -Root $ProjectRoot -Path $promptPath)
+  Save-State -ProjectRoot $ProjectRoot -State $state
+
+  Write-Host "Review package created:" -ForegroundColor Green
+  Write-Host "  Dossier: $dossierPath"
+  Write-Host "  Code map: $codeMapPath"
+  Write-Host "  Round request: $requestPath"
+  Write-Host "  Prompt: $promptPath"
+  return $promptPath
+}
+
+function Complete-PromptSend {
+  param(
+    [Parameter(Mandatory = $true)][string]$ProjectRoot,
+    [Parameter(Mandatory = $true)][string]$PromptPath
+  )
+
+  $state = Get-State $ProjectRoot
+  Set-ObjectProperty $state "baseline_sent" $true
+  Set-ObjectProperty $state "latest_prompt" (Get-RelativePath $ProjectRoot $PromptPath)
+  Set-ObjectProperty $state "latest_prompt_sent_at" (Get-Date).ToString("o")
+  Save-State $ProjectRoot $state
+}
+
+function Show-PromptHandoff {
+  param(
+    [Parameter(Mandatory = $true)][string]$ProjectRoot,
+    [switch]$MarkSent
+  )
+
+  $paths = Get-ReviewPaths $ProjectRoot
+  $config = Get-Config $ProjectRoot
+  $state = Get-State $ProjectRoot
+  $promptRel = $state.latest_prompt
+  if (-not $promptRel) {
+    throw "No prompt is prepared. Run -Action Prepare first."
+  }
+  $promptPath = Join-Path $ProjectRoot ($promptRel -replace "/", "\")
+  if (-not (Test-Path -LiteralPath $promptPath)) {
+    throw "Prepared prompt does not exist: $promptPath"
+  }
+  $target = $config.target_chatgpt_conversation_url
+  if (-not $target) { $target = $config.target_chatgpt_url }
+  if (-not (Test-ChatGptUrl $target)) {
+    throw "project-config.json needs target_chatgpt_conversation_url set to a https://chatgpt.com/... URL."
+  }
+
+  Write-Host "Open this ChatGPT target with the edge-browser-control skill:" -ForegroundColor Cyan
+  Write-Host $target
+  Write-Host "Paste or send this prompt file:" -ForegroundColor Cyan
+  Write-Host $promptPath
+  Write-Host "No MCP, DevSpace, tunnel, owner token, or connector is used." -ForegroundColor Green
+
+  if ($MarkSent) {
+    Complete-PromptSend $ProjectRoot $promptPath
+    Write-Host "Marked prompt as sent. Baseline is now recorded as sent for delta-only future rounds." -ForegroundColor Green
+  } else {
+    Write-Host "After Edge successfully submits it, rerun SendPrompt with -Send to mark it as sent." -ForegroundColor Yellow
+  }
+}
+
+function Get-LatestFile {
+  param(
+    [Parameter(Mandatory = $true)][string]$Directory,
     [string]$Filter = "*.md"
   )
-
   if (-not (Test-Path -LiteralPath $Directory)) {
     return $null
   }
-
   return Get-ChildItem -LiteralPath $Directory -File -Filter $Filter -ErrorAction SilentlyContinue |
-    Where-Object { $_.Name -ne "README.md" } |
     Sort-Object LastWriteTime -Descending |
     Select-Object -First 1
 }
 
+function Save-GptFeedback {
+  param(
+    [Parameter(Mandatory = $true)][string]$ProjectRoot,
+    [string]$Text,
+    [string]$File
+  )
+
+  $paths = Get-ReviewPaths $ProjectRoot
+  if ($File) {
+    $feedbackText = Get-Content -Raw -LiteralPath $File
+  } elseif ($Text) {
+    $feedbackText = $Text
+  } else {
+    throw "CaptureFeedback requires -FeedbackText or -FeedbackFile."
+  }
+
+  $state = Get-State $ProjectRoot
+  $round = if ($state.round_counter) { "round-{0:000}" -f [int]$state.round_counter } else { "round-000" }
+  $feedbackPath = Join-Path $paths.Feedback ("{0}-{1}-gpt-feedback.md" -f $round, (Get-Date -Format "yyyyMMdd-HHmmss"))
+  $relatedPrompt = if ($state.latest_prompt) { $state.latest_prompt } else { "(unknown)" }
+
+  $body = @"
+# GPT Pro Feedback
+
+- id: $round-gpt-feedback
+- created_at: $(Get-Date -Format o)
+- source: gpt-pro
+- target: codex
+- transport: browser_dossier
+- status: ready_for_codex_local_assessment
+- related_prompt: $relatedPrompt
+
+## Feedback
+
+$feedbackText
+"@
+
+  Set-Content -LiteralPath $feedbackPath -Encoding UTF8 -Value $body
+  $feedbackRel = Get-RelativePath $ProjectRoot $feedbackPath
+  Add-StateItem $ProjectRoot "pending_for_codex" $feedbackRel
+  $state = Get-State $ProjectRoot
+  Set-ObjectProperty $state "latest_feedback" $feedbackRel
+  Save-State $ProjectRoot $state
+  Write-Host "GPT feedback saved: $feedbackPath" -ForegroundColor Green
+  return $feedbackPath
+}
+
+function New-LocalAssessment {
+  param(
+    [Parameter(Mandatory = $true)][string]$ProjectRoot,
+    [string]$Text,
+    [string]$File
+  )
+
+  $paths = Get-ReviewPaths $ProjectRoot
+  $state = Get-State $ProjectRoot
+  $latestFeedback = if ($state.latest_feedback) { Join-Path $ProjectRoot ($state.latest_feedback -replace "/", "\") } else { $null }
+  if (-not $latestFeedback -or -not (Test-Path -LiteralPath $latestFeedback)) {
+    $candidate = Get-LatestFile $paths.Feedback
+    if ($candidate) { $latestFeedback = $candidate.FullName }
+  }
+  if (-not $latestFeedback -or -not (Test-Path -LiteralPath $latestFeedback)) {
+    throw "No GPT feedback found. Run -Action CaptureFeedback first."
+  }
+
+  if ($File) {
+    $assessmentText = Get-Content -Raw -LiteralPath $File
+  } elseif ($Text) {
+    $assessmentText = $Text
+  } else {
+    $feedbackExcerpt = Get-ContentExcerpt $latestFeedback 12000
+    $gitStatus = Get-GitText $ProjectRoot @("status", "--short")
+    if (-not $gitStatus) { $gitStatus = "(clean, not a git repo, or unavailable)" }
+    $assessmentText = @"
+## Codex Local Judgment Required
+
+Codex must replace this draft with local practice-based judgments before implementation. Classify each GPT recommendation as `accept`, `modify`, `reject`, or `needs-more-info`.
+
+## Local Evidence Snapshot
+
+```text
+$gitStatus
+```
+
+## GPT Feedback To Assess
+
+$feedbackExcerpt
+
+## Assessment Table
+
+| GPT recommendation | Codex decision | Local evidence | Action |
+|---|---|---|---|
+| (fill from GPT feedback) | needs-more-info | (cite local code/test/constraint) | (ask GPT or user) |
+"@
+  }
+
+  $round = if ($state.round_counter) { "round-{0:000}" -f [int]$state.round_counter } else { "round-000" }
+  $assessmentPath = Join-Path $paths.Assessments ("{0}-{1}-codex-local-assessment.md" -f $round, (Get-Date -Format "yyyyMMdd-HHmmss"))
+  $feedbackRel = Get-RelativePath $ProjectRoot $latestFeedback
+
+  $body = @"
+# Codex Local Assessment
+
+- id: $round-codex-local-assessment
+- created_at: $(Get-Date -Format o)
+- source: codex
+- target: gpt-pro
+- transport: browser_dossier
+- status: ready_to_return_to_gpt
+- related_feedback: $feedbackRel
+
+$assessmentText
+"@
+
+  Set-Content -LiteralPath $assessmentPath -Encoding UTF8 -Value $body
+  $assessmentRel = Get-RelativePath $ProjectRoot $assessmentPath
+  Add-StateItem $ProjectRoot "pending_assessments_for_gpt" $assessmentRel
+  $state = Get-State $ProjectRoot
+  Set-ObjectProperty $state "latest_assessment" $assessmentRel
+  Save-State $ProjectRoot $state
+  Write-Host "Codex local assessment saved: $assessmentPath" -ForegroundColor Green
+  return $assessmentPath
+}
+
+function New-AssessmentPrompt {
+  param([Parameter(Mandatory = $true)][string]$ProjectRoot)
+
+  $paths = Get-ReviewPaths $ProjectRoot
+  $config = Get-Config $ProjectRoot
+  $state = Get-State $ProjectRoot
+  $assessmentRel = $state.latest_assessment
+  if (-not $assessmentRel) {
+    throw "No local assessment found. Run -Action AssessFeedback first."
+  }
+  $assessmentPath = Join-Path $ProjectRoot ($assessmentRel -replace "/", "\")
+  if (-not (Test-Path -LiteralPath $assessmentPath)) {
+    throw "Assessment file does not exist: $assessmentPath"
+  }
+
+  $target = $config.target_chatgpt_conversation_url
+  if (-not $target) { $target = $config.target_chatgpt_url }
+  if (-not (Test-ChatGptUrl $target)) {
+    throw "project-config.json needs target_chatgpt_conversation_url set to a https://chatgpt.com/... URL."
+  }
+
+  $round = if ($state.round_counter) { "round-{0:000}" -f [int]$state.round_counter } else { "round-000" }
+  $promptPath = Join-Path $paths.Prompts ("{0}-{1}-codex-assessment-return-prompt.md" -f $round, (Get-Date -Format "yyyyMMdd-HHmmss"))
+  $assessment = Get-ContentExcerpt $assessmentPath 22000
+  $prompt = @"
+Codex has locally assessed your GPT Pro feedback against the real project state.
+
+Please review this practice-based response, correct any recommendation that no longer fits, and identify the next narrow review question if another round is useful.
+
+## Codex Local Assessment
+
+$assessment
+"@
+
+  Set-Content -LiteralPath $promptPath -Encoding UTF8 -Value $prompt
+  Set-ObjectProperty $state "latest_assessment_prompt" (Get-RelativePath $ProjectRoot $promptPath)
+  Save-State $ProjectRoot $state
+
+  Write-Host "Open this ChatGPT target with the edge-browser-control skill:" -ForegroundColor Cyan
+  Write-Host $target
+  Write-Host "Send this assessment-return prompt:" -ForegroundColor Cyan
+  Write-Host $promptPath
+  if ($Send) {
+    Set-ObjectProperty $state "latest_assessment_sent_at" (Get-Date).ToString("o")
+    Save-State $ProjectRoot $state
+    Write-Host "Marked local assessment as sent to GPT." -ForegroundColor Green
+  } else {
+    Write-Host "After Edge successfully submits it, rerun SendAssessment with -Send to mark it as sent." -ForegroundColor Yellow
+  }
+}
+
 function New-ExperienceRecord {
   param(
-    [string]$ProjectRoot,
+    [Parameter(Mandatory = $true)][string]$ProjectRoot,
     [string]$Outcome,
     [string]$Lesson,
     [string]$Notes
   )
 
-  Ensure-Bridge $ProjectRoot $null | Out-Null
-  $paths = Get-BridgePaths $ProjectRoot
-  [string]$experienceLogPath = if ($paths.ExperienceLog) { [string]$paths.ExperienceLog } else { [System.IO.Path]::Combine([string]$paths.Bridge, "experience-log.md") }
-  [string]$experienceIssuesPath = if ($paths.ExperienceIssues) { [string]$paths.ExperienceIssues } else { [System.IO.Path]::Combine([string]$paths.Bridge, "experience-issues") }
-  if ([string]::IsNullOrWhiteSpace($experienceLogPath) -or [string]::IsNullOrWhiteSpace($experienceIssuesPath)) {
-    throw "Experience paths did not resolve for project root: $ProjectRoot"
-  }
-  if (-not (Test-Path -LiteralPath $experienceIssuesPath)) {
-    New-Item -ItemType Directory -Path $experienceIssuesPath -Force | Out-Null
-  }
-  if (-not (Test-Path -LiteralPath $experienceLogPath)) {
-    Set-Content -LiteralPath $experienceLogPath -Encoding UTF8 -Value "# GPT Pro Review Loop Experience Log`n"
-  }
+  Ensure-ReviewLoop $ProjectRoot $null | Out-Null
+  $paths = Get-ReviewPaths $ProjectRoot
+  $state = Get-State $ProjectRoot
   $stamp = Get-Date -Format "yyyy-MM-dd-HHmmss"
-  $projectName = Split-Path -Leaf $ProjectRoot
-  $latestReport = Get-LatestBridgeFile $paths.Reports
-  $latestFeedback = Get-LatestBridgeFile $paths.Feedback
-  $reportRel = if ($latestReport) { [System.IO.Path]::GetRelativePath($ProjectRoot, $latestReport.FullName) } else { "(none)" }
-  $feedbackRel = if ($latestFeedback) { [System.IO.Path]::GetRelativePath($ProjectRoot, $latestFeedback.FullName) } else { "(none)" }
+  $safeOutcome = if ($Outcome) { $Outcome } else { "unspecified" }
   $safeLesson = if ($Lesson) { $Lesson } else { "(fill in the reusable lesson)" }
   $safeNotes = if ($Notes) { $Notes } else { "(fill in what happened, without secrets or private data)" }
-  $safeOutcome = if ($Outcome) { $Outcome } else { "unspecified" }
-  $gitStatus = Get-GitText $ProjectRoot @("status", "--short")
-  if (-not $gitStatus) { $gitStatus = "(not available)" }
+  $latestPrompt = if ($state.latest_prompt) { $state.latest_prompt } else { "(none)" }
+  $latestFeedback = if ($state.latest_feedback) { $state.latest_feedback } else { "(none)" }
+  $latestAssessment = if ($state.latest_assessment) { $state.latest_assessment } else { "(none)" }
 
-  $entryLines = @(
+  $entry = @(
     "",
     "## $stamp",
     "",
     "- outcome: $safeOutcome",
-    "- latest_report: $reportRel",
-    "- latest_feedback: $feedbackRel",
+    "- latest_prompt: $latestPrompt",
+    "- latest_feedback: $latestFeedback",
+    "- latest_assessment: $latestAssessment",
     "",
     "### Notes",
     "",
@@ -1306,128 +1083,125 @@ function New-ExperienceRecord {
     "",
     "### Reusable Lesson",
     "",
-    $safeLesson,
-    "",
-    "### Local Git Status At Capture",
-    "",
-    '```text',
-    $gitStatus,
-    '```'
-  )
-  Add-Content -LiteralPath $experienceLogPath -Encoding UTF8 -Value ($entryLines -join [Environment]::NewLine)
+    $safeLesson
+  ) -join [Environment]::NewLine
+  Add-Content -LiteralPath $paths.ExperienceLog -Encoding UTF8 -Value $entry
 
-  [string]$issueFileName = "{0}-github-issue-draft.md" -f $stamp
-  [string]$issuePath = "$experienceIssuesPath\$issueFileName"
-  if ([string]::IsNullOrWhiteSpace($issuePath)) {
-    throw "Experience issue draft path did not resolve."
-  }
-  $issueLines = @(
-    "# [experience] $projectName - $safeOutcome",
-    "",
-    "## Scenario",
-    "",
-    'Project-local use of `gpt-pro-review-loop`.',
-    "",
-    "## Observed behavior",
-    "",
-    $safeNotes,
-    "",
-    "## Reusable lesson",
-    "",
-    $safeLesson,
-    "",
-    "## Local evidence",
-    "",
-    "- Latest Codex report: $reportRel",
-    "- Latest GPT Pro feedback: $feedbackRel",
-    "",
-    "## Privacy check",
-    "",
-    "This draft should contain only process-level experience. Do not paste API keys, cookies, OAuth tokens, owner tokens, private account data, proprietary source snippets, or private business data into the public GitHub issue."
-  )
-  [System.IO.File]::WriteAllLines($issuePath, [string[]]$issueLines, [System.Text.Encoding]::UTF8)
+  $issuePath = Join-Path $paths.ExperienceIssues ("{0}-github-issue-draft.md" -f $stamp)
+  $issue = @"
+# [experience] browser dossier review loop - $safeOutcome
 
-  Write-Host "Experience recorded: $experienceLogPath" -ForegroundColor Green
+## Scenario
+
+Project-local use of `gpt-pro-review-loop` v2 browser dossier transport.
+
+## Observed behavior
+
+$safeNotes
+
+## Reusable lesson
+
+$safeLesson
+
+## Local evidence
+
+- Latest prompt: $latestPrompt
+- Latest GPT feedback: $latestFeedback
+- Latest Codex assessment: $latestAssessment
+
+## Privacy check
+
+This draft should contain only process-level experience. Do not paste API keys, cookies, OAuth tokens, private account data, proprietary source snippets, or private business data into the public GitHub issue.
+"@
+  Set-Content -LiteralPath $issuePath -Encoding UTF8 -Value $issue
+
+  Write-Host "Experience recorded: $($paths.ExperienceLog)" -ForegroundColor Green
   Write-Host "GitHub issue draft created: $issuePath" -ForegroundColor Green
-  return $issuePath
 }
 
 function Show-Status {
-  param([string]$ProjectRoot)
+  param([Parameter(Mandatory = $true)][string]$ProjectRoot)
 
-  $runtime = Get-RuntimePaths $ProjectRoot
-  $paths = Get-BridgePaths $ProjectRoot
-  $session = $null
-  if (Test-Path -LiteralPath $runtime.Session) {
-    $session = Read-JsonFile $runtime.Session
-  }
-  $sessionActive = ($null -ne $session -and -not ($session.PSObject.Properties.Name -contains "stopped_at" -and $session.stopped_at))
+  $paths = Get-ReviewPaths $ProjectRoot
+  $config = if (Test-Path -LiteralPath $paths.Config) { Read-JsonFile $paths.Config } else { $null }
+  $state = if (Test-Path -LiteralPath $paths.State) { Read-JsonFile $paths.State } else { $null }
   [pscustomobject]@{
-    project_root = $ProjectRoot
-    bridge_exists = (Test-Path -LiteralPath $paths.Bridge)
+    project_name = (Split-Path -Leaf $ProjectRoot)
+    review_loop_exists = (Test-Path -LiteralPath $paths.Base)
     config_path = $paths.Config
-    session_path = $runtime.Session
-    session_active = $sessionActive
-    logs = $runtime.Logs
+    state_path = $paths.State
+    transport = if ($config) { $config.transport } else { $null }
+    target_chatgpt_conversation_url = if ($config) { $config.target_chatgpt_conversation_url } else { $null }
+    baseline_sent = if ($state) { $state.baseline_sent } else { $false }
+    round_counter = if ($state) { $state.round_counter } else { 0 }
+    latest_prompt = if ($state) { $state.latest_prompt } else { $null }
+    latest_feedback = if ($state) { $state.latest_feedback } else { $null }
+    latest_assessment = if ($state) { $state.latest_assessment } else { $null }
   } | Format-List
+}
 
-  if ($session) {
-    $session | Format-List
-  }
+function Invoke-LegacyRemovedAction {
+  param([string]$Name)
+  throw "$Name was removed in gpt-pro-review-loop v2. This skill no longer uses DevSpace, MCP connectors, Cloudflare tunnels, OAuth owner tokens, or public endpoints. Use Init, Prepare, SendPrompt, CaptureFeedback, AssessFeedback, and SendAssessment."
 }
 
 $ProjectRoot = Resolve-ProjectRoot $Root
 
 switch ($Action) {
   "Init" {
-    Ensure-Bridge $ProjectRoot $TargetChatGptUrl | Out-Null
-    Write-Host "AI bridge initialized for: $ProjectRoot" -ForegroundColor Green
+    Ensure-ReviewLoop $ProjectRoot $TargetChatGptUrl | Out-Null
+    Write-Host "GPT Pro review loop v2 initialized for project: $(Split-Path -Leaf $ProjectRoot)" -ForegroundColor Green
   }
   "Prepare" {
-    Ensure-Bridge $ProjectRoot $TargetChatGptUrl | Out-Null
+    Ensure-ReviewLoop $ProjectRoot $TargetChatGptUrl | Out-Null
     $scan = Invoke-SensitiveScan $ProjectRoot -Allow:$AllowSensitive
-    New-ReviewReport $ProjectRoot $scan | Out-Null
-  }
-  "StartSession" {
-    Ensure-Bridge $ProjectRoot $TargetChatGptUrl | Out-Null
-    Start-Session $ProjectRoot $Port | Out-Null
-  }
-  "PreflightConnector" {
-    Ensure-Bridge $ProjectRoot $TargetChatGptUrl | Out-Null
-    Invoke-ConnectorPreflight $ProjectRoot $Port $ConnectorTimeoutSeconds
+    New-ReviewPackage $ProjectRoot $scan | Out-Null
   }
   "SendPrompt" {
-    Send-Prompt $ProjectRoot -Submit:$Send
+    Ensure-ReviewLoop $ProjectRoot $TargetChatGptUrl | Out-Null
+    Show-PromptHandoff $ProjectRoot -MarkSent:$Send
+  }
+  "CaptureFeedback" {
+    Ensure-ReviewLoop $ProjectRoot $TargetChatGptUrl | Out-Null
+    Save-GptFeedback $ProjectRoot $FeedbackText $FeedbackFile | Out-Null
   }
   "WaitFeedback" {
-    Wait-Feedback $ProjectRoot $FeedbackTimeoutSeconds | Out-Null
+    Ensure-ReviewLoop $ProjectRoot $TargetChatGptUrl | Out-Null
+    $paths = Get-ReviewPaths $ProjectRoot
+    $latest = Get-LatestFile $paths.Feedback
+    if (-not $latest) {
+      throw "No GPT feedback has been captured yet. Use -Action CaptureFeedback after reading the ChatGPT reply through Edge."
+    }
+    Write-Host "Latest captured GPT feedback: $($latest.FullName)" -ForegroundColor Green
+  }
+  "AssessFeedback" {
+    Ensure-ReviewLoop $ProjectRoot $TargetChatGptUrl | Out-Null
+    New-LocalAssessment $ProjectRoot $AssessmentText $AssessmentFile | Out-Null
+  }
+  "SendAssessment" {
+    Ensure-ReviewLoop $ProjectRoot $TargetChatGptUrl | Out-Null
+    New-AssessmentPrompt $ProjectRoot
   }
   "RecordExperience" {
-    New-ExperienceRecord $ProjectRoot $ExperienceOutcome $ExperienceLesson $ExperienceNotes | Out-Null
-  }
-  "StopSession" {
-    Stop-Session $ProjectRoot -IncludeDevSpace:$StopDevSpace
+    New-ExperienceRecord $ProjectRoot $ExperienceOutcome $ExperienceLesson $ExperienceNotes
   }
   "Status" {
     Show-Status $ProjectRoot
   }
   "Run" {
-    Ensure-Bridge $ProjectRoot $TargetChatGptUrl | Out-Null
+    Ensure-ReviewLoop $ProjectRoot $TargetChatGptUrl | Out-Null
     $scan = Invoke-SensitiveScan $ProjectRoot -Allow:$AllowSensitive
-    New-ReviewReport $ProjectRoot $scan | Out-Null
-    $sessionStarted = $false
-    try {
-      Start-Session $ProjectRoot $Port | Out-Null
-      $sessionStarted = $true
-      Wait-ConnectorPreflight $ProjectRoot $ConnectorTimeoutSeconds
-      Send-Prompt $ProjectRoot -Submit:$Send
-      Wait-Feedback $ProjectRoot $FeedbackTimeoutSeconds | Out-Null
-    } catch {
-      if ($sessionStarted) {
-        Stop-Session $ProjectRoot -IncludeDevSpace:$true
-      }
-      throw
-    }
+    New-ReviewPackage $ProjectRoot $scan | Out-Null
+    Show-PromptHandoff $ProjectRoot -MarkSent:$Send
+  }
+  "StartSession" {
+    Invoke-LegacyRemovedAction $Action
+  }
+  "PreflightConnector" {
+    Invoke-LegacyRemovedAction $Action
+  }
+  "StopSession" {
+    Invoke-LegacyRemovedAction $Action
   }
 }
 

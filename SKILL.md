@@ -1,6 +1,6 @@
 ---
 name: gpt-pro-review-loop
-description: Run a semi-automatic review loop between Codex and GPT Pro through DevSpace MCP and ChatGPT. Use when the user explicitly asks to send a project, Codex execution report, milestone status, implementation plan, or verification results to GPT Pro for review, then bring GPT Pro feedback back into the local project for Codex to act on. Also use for the Chinese request "Pro 审阅循环". This skill starts only after explicit user authorization because it can expose the current project through a short-lived public tunnel.
+description: Run a semi-automatic offline review loop between Codex and GPT Pro without MCP, DevSpace, tunnels, or direct GPT file access. Use when the user explicitly asks to send a project, Codex report, milestone status, implementation plan, verification result, or local practice assessment to GPT Pro for review through ChatGPT, then bring GPT Pro feedback back into Codex. Also use for the Chinese request "Pro 审阅循环".
 ---
 
 # GPT Pro Review Loop
@@ -9,105 +9,116 @@ Chinese alias: `Pro 审阅循环`.
 
 ## Core Rule
 
-Use this skill only after an explicit user request such as "use GPT Pro to review this project", "start the review loop", "$gpt-pro-review-loop", or "Pro 审阅循环". Do not start DevSpace, Cloudflare Tunnel, or browser automation implicitly.
+Use this skill only after an explicit user request such as "use GPT Pro to review this project", "start the review loop", "$gpt-pro-review-loop", or "Pro 审阅循环".
 
-Default v1 policy:
+This v2 skill is offline by design:
 
-- Run mode: semi-automatic, one review round at a time.
-- Review scope: GPT Pro may read the current project root through DevSpace.
-- GPT write policy: GPT Pro writes feedback only under `docs/ai-bridge/gpt-pro-feedback/`.
-- Tunnel policy: open a Cloudflare quick tunnel for the review round, then close it.
-- Execution policy: Codex implements changes after reading feedback; GPT Pro should not directly edit source code.
-- Conversation policy: each review round must use a new ChatGPT chat inside the target project. Do not send review prompts into an existing `/c/` conversation URL because DevSpace apps may not attach to old chats.
-- Connector preflight: Codex must verify ChatGPT reached the current DevSpace endpoint before sending the review prompt. The prompt still requires GPT Pro to confirm DevSpace is available, points at the current MCP URL, and can read the report before doing source review.
+- Do not start DevSpace.
+- Do not start Cloudflare Tunnel.
+- Do not use MCP connectors or OAuth preflight.
+- Do not give GPT Pro direct local file access.
+- Do not assume GPT Pro can write local files.
+
+Codex owns all local reads, writes, tests, and final execution decisions. GPT Pro reviews only the Markdown material and conversation context that Codex sends through ChatGPT.
 
 ## Workflow
 
-1. Resolve the current project root. Prefer an explicit user path; otherwise use the current working directory or the Git top-level directory if that is clearly the project.
-2. Ensure the project has a target ChatGPT project or new-chat URL. Do not use an existing `/c/` conversation URL as the send target. If the user provides a project-scoped old chat URL such as `https://chatgpt.com/.../c/<id>`, initialize from it only to derive and store the project URL.
-3. Initialize bridge files:
+1. Resolve the current project root. Prefer an explicit user path; otherwise use the current working directory or Git top-level directory.
+2. Ensure the project has a target ChatGPT project or conversation URL:
 
    ```powershell
-   & "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action Init -Root "<project-root>" -TargetChatGptUrl "<chatgpt-project-url>"
+   & "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action Init -Root "<project-root>" -TargetChatGptUrl "https://chatgpt.com/..."
    ```
 
-4. Prepare the review package and run the sensitive-data scan:
+3. Prepare the offline review package:
 
    ```powershell
    & "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action Prepare -Root "<project-root>"
    ```
 
-   If the scan fails, stop and report the findings. Continue only if the user explicitly authorizes `-AllowSensitive`.
+   This writes under `docs/ai-review-loop/`, runs the sensitive-data scan, creates a project dossier, creates a code map, creates a round request, and assembles a ChatGPT prompt.
 
-5. Start the short-lived DevSpace session only after the user has authorized the review round:
+4. Send the prompt through Edge using `edge-browser-control`.
 
-   ```powershell
-   & "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action StartSession -Root "<project-root>"
-   ```
-
-6. Confirm the ChatGPT DevSpace app/connector points at the `mcp_url` printed by the script. If the quick tunnel URL changed since the connector was created, update or recreate the ChatGPT MCP app before asking GPT Pro to review.
-7. Run the connector preflight before sending the review prompt:
+   First print the target URL and prompt path:
 
    ```powershell
-   & "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action PreflightConnector -Root "<project-root>" -ConnectorTimeoutSeconds 300
+   & "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action SendPrompt -Root "<project-root>"
    ```
 
-   This starts a fresh session if none is running, checks local/public health and DevSpace OAuth discovery metadata, prints the current MCP URL and local Owner token path, waits for the user to reconnect or approve the DevSpace app in ChatGPT, and passes only when DevSpace logs a non-healthcheck request from ChatGPT. If it times out, sees OAuth rejection, or cannot reach DevSpace/tunnel/OAuth metadata, it marks the round blocked and closes the public exposure.
-
-8. Send the generated review prompt to a new ChatGPT chat in the configured project. The script refuses existing `/c/` conversation URLs and refuses to send until connector preflight has passed:
+   Then use `edge-browser-control` to open the target ChatGPT URL, paste the prompt file, and submit it. After the message is actually submitted, mark the prompt sent:
 
    ```powershell
    & "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action SendPrompt -Root "<project-root>" -Send
    ```
 
-   Omit `-Send` if you want the prompt inserted into the composer for manual review before submission.
-
-9. GPT Pro must still perform its own connector confirmation before reviewing: DevSpace app available, connector points at the current MCP URL, and the review report can be read through DevSpace. If GPT-side confirmation fails, the round is `BLOCKED`, not a review verdict.
-10. Wait for GPT Pro feedback:
+5. When GPT Pro replies in ChatGPT, read the visible reply through Edge and save it locally:
 
    ```powershell
-   & "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action WaitFeedback -Root "<project-root>" -FeedbackTimeoutSeconds 900
+   & "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action CaptureFeedback -Root "<project-root>" -FeedbackText "<GPT reply>"
    ```
 
-11. Read the new feedback file, summarize the actionable items, and pause. Do not start the next loop until the user confirms the next round.
-12. Record project-local experience when the round produced a reusable lesson:
+   For long replies, save the reply to a temporary file and pass `-FeedbackFile`.
+
+6. Assess GPT Pro feedback against local reality before acting:
+
+   ```powershell
+   & "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action AssessFeedback -Root "<project-root>" -AssessmentText "<Codex local assessment>"
+   ```
+
+   Each GPT recommendation must be classified as `accept`, `modify`, `reject`, or `needs-more-info` using local evidence such as code, tests, project goals, user constraints, cost, and risk. Do not treat GPT Pro feedback as a final verdict by itself.
+
+7. Return the local practice assessment to GPT Pro:
+
+   ```powershell
+   & "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action SendAssessment -Root "<project-root>"
+   ```
+
+   Send the generated prompt through Edge, then mark it sent:
+
+   ```powershell
+   & "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action SendAssessment -Root "<project-root>" -Send
+   ```
+
+8. Pause before implementing changes or starting another formal review round unless the user explicitly confirms continuation.
+
+9. Record project-local experience when the round produced a reusable lesson:
 
    ```powershell
    & "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action RecordExperience -Root "<project-root>" -ExperienceOutcome "success|blocked|needs-improvement" -ExperienceLesson "<short reusable lesson>" -ExperienceNotes "<sanitized notes>"
    ```
 
-   This appends to `docs/ai-bridge/experience-log.md` and creates a sanitized GitHub issue draft under `docs/ai-bridge/experience-issues/`.
+## One-Command Prepare
 
-13. Stop the public exposure:
-
-   ```powershell
-   & "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action StopSession -Root "<project-root>"
-   ```
-
-## One-Command Round
-
-When the target ChatGPT URL is already configured and the user explicitly asks for a round, run:
+When the target ChatGPT URL is already configured and the user explicitly asks for a round:
 
 ```powershell
-& "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action Run -Root "<project-root>" -Send
+& "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action Run -Root "<project-root>"
 ```
 
-This prepares the report, starts DevSpace and the quick tunnel, waits for connector preflight to prove ChatGPT reached the current DevSpace endpoint, opens a new ChatGPT chat in the configured project, sends a review prompt with mandatory GPT-side connector confirmation, waits for feedback, checks for out-of-bounds writes, and leaves the round paused for Codex to summarize. It still requires the user to confirm any next round.
+`Run` prepares the review package and prints the Edge handoff. It does not submit to ChatGPT unless the user or Codex explicitly performs the browser step.
+
+## Local Practice Assessment Rules
+
+- `accept`: GPT advice fits local code, tests, project goals, user scope, and risk budget.
+- `modify`: GPT advice is directionally useful but must be narrowed or adapted.
+- `reject`: GPT advice conflicts with local facts, user constraints, acceptance gates, or practical cost.
+- `needs-more-info`: local evidence is insufficient; ask GPT or the user for a narrower question.
+
+Always cite local evidence. Evidence can be a file path, command result, test failure, acceptance gate, project decision, or explicit user boundary.
 
 ## Safety Checks
 
-- Treat `DEVSPACE_ALLOWED_ROOTS` as the hard project boundary. Never widen it automatically.
 - If `.env`, private keys, cookies, tokens, or password-like assignments are detected, stop unless the user explicitly authorizes `-AllowSensitive`.
-- If GPT changes files outside `docs/ai-bridge/gpt-pro-feedback/`, stop and report the changed paths before doing anything else.
-- Close the quick tunnel at the end of each round or when the user pauses.
-- If connector preflight fails, close the quick tunnel and DevSpace immediately. Do not send the review prompt.
-- Refuse existing ChatGPT `/c/` conversation URLs as send targets. Use a project or new-chat URL so DevSpace can attach to the new chat.
-- Do not paste owner tokens, OAuth callbacks, cookies, or browser session data into ChatGPT. The Owner password may be entered only into the DevSpace approval page opened by the OAuth flow.
-- Keep experience records process-level. Do not copy secrets, account details, proprietary source snippets, or private business data into public issue drafts.
+- Do not send full source trees by default. Send summaries, code maps, diffs, verification output, and necessary excerpts.
+- Use project-relative paths in review material. Avoid exposing local absolute paths.
+- Keep browser automation limited to normal ChatGPT prompt submission and reply reading.
+- Do not inspect cookies, passwords, browser storage, or session files.
+- Do not enter account credentials, OAuth approvals, purchases, or permission changes through browser automation.
+- If the ChatGPT conversation changes or GPT says context is missing, resend a compressed baseline before asking for another verdict.
 
 ## References
 
-- Read `references/bridge-protocol.md` when inspecting or modifying the project bridge files.
-- Read `references/experience-collection.md` when deciding what to record locally and what to promote to a GitHub issue.
-- Read `references/devspace-session.md` when troubleshooting DevSpace, tunnel, OAuth, or connector setup.
-- Read `references/chatgpt-browser-flow.md` when browser automation fails or ChatGPT UI changes.
+- Read `references/bridge-protocol.md` when inspecting or modifying `docs/ai-review-loop/` files.
+- Read `references/chatgpt-browser-flow.md` when using Edge to send prompts or capture GPT replies.
+- Read `references/experience-collection.md` when deciding what to record locally and what to promote to a GitHub issue draft.

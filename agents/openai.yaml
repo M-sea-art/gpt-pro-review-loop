@@ -1,4 +1,4 @@
 interface:
   display_name: "Pro 审阅循环"
-  short_description: "Codex 报告送 GPT Pro 复核"
-  default_prompt: "Use $gpt-pro-review-loop to start Pro 审阅循环 for this project and bring the feedback back into Codex."
+  short_description: "离线材料送 GPT Pro 复核"
+  default_prompt: "Use $gpt-pro-review-loop to prepare an offline GPT Pro review package for this project, capture the feedback, assess it against local facts, and return Codex's local assessment to GPT."

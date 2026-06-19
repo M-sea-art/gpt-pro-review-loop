@@ -1,93 +1,96 @@
-# Bridge Protocol
+# Offline Review Loop Protocol
 
-The skill creates project-local coordination files under `docs/ai-bridge/`.
+The skill creates project-local coordination files under `docs/ai-review-loop/`.
 
 Required layout:
 
 ```text
-docs/ai-bridge/
+docs/ai-review-loop/
   project-config.json
-  bridge-state.json
+  review-state.json
   decisions.md
-  inbox/
-  codex-reports/
-  gpt-pro-feedback/
+  dossiers/
+  code-maps/
+  round-requests/
+  prompts/
+  gpt-feedback/
+  codex-assessments/
   security-scans/
   experience-log.md
   experience-issues/
 ```
 
-`project-config.json` records the target ChatGPT project/new-chat entry point and fixed policy defaults:
+`project-config.json` records the ChatGPT target and fixed v2 policy:
 
 ```json
 {
-  "target_chatgpt_project_url": "https://chatgpt.com/...",
+  "target_chatgpt_conversation_url": "https://chatgpt.com/...",
   "target_chatgpt_url": "https://chatgpt.com/...",
-  "legacy_target_chatgpt_url": null,
-  "allowed_root": "<project root>",
+  "transport": "browser_dossier",
   "run_mode": "semi_auto",
-  "review_scope": "whole_project",
-  "gpt_write_policy": "feedback_only",
-  "tunnel_policy": "quick_tunnel_per_session",
-  "conversation_policy": "new_chat_per_review_round",
-  "connector_preflight_required": true
+  "review_memory": "chatgpt_project_conversation",
+  "baseline_policy": "first_round_full_then_delta",
+  "sensitive_scan_policy": "block_unless_allow_sensitive",
+  "code_map_policy": "filesystem_map_with_optional_codegraph_context",
+  "codex_assessment_required": true,
+  "feedback_return_policy": "send_local_assessment_to_same_chat"
 }
 ```
 
-`target_chatgpt_project_url` is the primary send target. Existing ChatGPT `/c/` conversation URLs are not valid send targets because apps/connectors may not attach to old chats. When a project-scoped old chat URL is provided, the script derives the project URL, stores the original in `legacy_target_chatgpt_url`, and sends future rounds to the project/new-chat entry point.
+`review-state.json` tracks local loop state:
 
-`bridge-state.json` tracks the current loop:
+- `baseline_sent`: whether the full dossier and code map have been submitted to the configured ChatGPT conversation.
+- `baseline_hash`: hash of the latest dossier and code map.
+- `round_counter`: monotonically increasing local round number.
+- `latest_prompt`: prompt waiting for GPT Pro or already sent.
+- `latest_feedback`: GPT Pro feedback captured by Codex from ChatGPT.
+- `latest_assessment`: Codex's local practice assessment.
+- `pending_for_gpt`: prompt files that need GPT Pro review.
+- `pending_for_codex`: GPT feedback files waiting for Codex assessment.
+- `pending_assessments_for_gpt`: Codex assessments that should be returned to GPT Pro.
 
-- `pending_for_gpt`: review reports waiting for GPT Pro.
-- `pending_for_codex`: GPT feedback waiting for Codex.
-- `active_session`: runtime metadata for the current short-lived tunnel.
-- `active_session.target_chatgpt_project_url`: the project/new-chat URL used by browser automation.
-- `active_session.conversation_policy`: normally `new_chat_per_review_round`.
-- `active_session.connector_preflight_required`: must be true for v1 rounds.
-- `active_session.oauth_discovery`: local record of DevSpace OAuth `.well-known` metadata checks.
-- `active_session.connector_preflight`: connection gate state before prompt sending.
+Review material files should use project-relative paths and avoid local absolute paths.
 
-Connector preflight states:
+## Material Types
 
-- `not_started`: session exists, but ChatGPT reachability has not been checked.
-- `waiting`: Codex verified health/OAuth metadata and is waiting for ChatGPT to reconnect or approve the app and call the current DevSpace endpoint.
-- `passed`: DevSpace logged a non-healthcheck, non-error request after preflight started; `SendPrompt` may continue.
-- `blocked`: DevSpace/tunnel was unreachable or no ChatGPT request reached DevSpace before timeout.
+- `dossiers/`: baseline project summary. First round only unless context is lost.
+- `code-maps/`: filesystem and optional CodeGraph-derived structure summary.
+- `round-requests/`: per-round delta, git status, diff stat, verification notes, and questions.
+- `prompts/`: assembled ChatGPT messages for review requests or Codex assessment returns.
+- `gpt-feedback/`: replies copied from ChatGPT by Codex.
+- `codex-assessments/`: local practice assessment of GPT recommendations.
 
-Common blocked reasons:
+## Feedback Capture
 
-- `devspace_or_tunnel_unreachable`: local `/healthz` or public `/healthz` failed.
-- `oauth_metadata_unreachable`: DevSpace OAuth discovery metadata did not return valid metadata for the current MCP URL.
-- `oauth_request_rejected`: ChatGPT reached DevSpace, but an OAuth/connection request returned an error.
-- `no_chatgpt_request_seen`: the tunnel was healthy, but DevSpace saw no ChatGPT-side request; usually stale MCP URL or OAuth failure before reaching DevSpace.
-
-Codex reports must include metadata fields:
+GPT Pro cannot write local files. Codex captures visible ChatGPT replies and stores them under `gpt-feedback/` with metadata:
 
 ```markdown
-- id:
-- created_at:
-- source: codex
-- target: gpt-pro
-- status: ready_for_review
-```
-
-GPT feedback should be written only under `docs/ai-bridge/gpt-pro-feedback/` and should include:
-
-```markdown
-- id:
-- created_at:
 - source: gpt-pro
 - target: codex
-- status: ready_for_action
-- related_report:
+- transport: browser_dossier
+- status: ready_for_codex_local_assessment
+- related_prompt:
 ```
 
-If GPT Pro writes elsewhere, treat that as an out-of-bounds write and pause.
+## Local Assessment
 
-If Codex connector preflight fails or GPT Pro cannot access DevSpace in the new chat, treat the round as `BLOCKED`. Do not infer any project approval from a blocked connector preflight.
+Codex must assess every actionable GPT recommendation before implementation:
 
-Experience records are project-local by default:
+```markdown
+| GPT recommendation | Codex decision | Local evidence | Action |
+|---|---|---|---|
+| ... | accept|modify|reject|needs-more-info | ... | ... |
+```
 
-- `experience-log.md` is the running local log of review-loop lessons.
-- `experience-issues/` contains sanitized GitHub issue drafts for lessons that should improve the reusable skill.
-- Public issue drafts should describe process behavior, not private project data.
+Decisions must be grounded in local facts such as code, tests, acceptance gates, project goals, user boundaries, cost, or risk.
+
+## Removed v1 Concepts
+
+These are not part of v2:
+
+- DevSpace local server.
+- Cloudflare quick tunnel.
+- MCP connector setup.
+- OAuth owner token.
+- GPT-side local file reads or writes.
+- Out-of-bounds write detection, because GPT no longer has local write access.

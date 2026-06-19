@@ -1,6 +1,6 @@
 # Experience Collection
 
-Use `RecordExperience` after a review round when the result teaches something reusable about the skill, DevSpace connection, ChatGPT connector, browser automation, sensitive-data scanning, feedback quality, or out-of-bounds write detection.
+Use `RecordExperience` after a review round when the result teaches something reusable about the offline review loop, browser handoff, prompt quality, sensitive-data scanning, GPT feedback quality, or Codex local assessment quality.
 
 Command:
 
@@ -10,20 +10,21 @@ Command:
 
 Local outputs:
 
-- `docs/ai-bridge/experience-log.md`: private project-local history.
-- `docs/ai-bridge/experience-issues/<timestamp>-github-issue-draft.md`: sanitized public issue draft.
+- `docs/ai-review-loop/experience-log.md`: private project-local history.
+- `docs/ai-review-loop/experience-issues/<timestamp>-github-issue-draft.md`: sanitized public issue draft.
 
 Record:
 
 - What task or round was being reviewed.
 - Whether the loop succeeded, blocked, or needs improvement.
-- What failed or surprised the user.
+- Whether GPT had enough baseline context.
+- Whether Codex accepted, modified, rejected, or asked for more context on GPT recommendations.
 - What should change in the skill, scripts, prompts, safety checks, or docs.
-- Which local report and GPT feedback file provide evidence.
+- Which prompt, GPT feedback file, and Codex assessment file provide evidence.
 
 Do not record:
 
-- API keys, owner tokens, OAuth callbacks, cookies, browser session data, passwords, private account data.
+- API keys, OAuth callbacks, cookies, browser session data, passwords, private account data.
 - Large source snippets or proprietary business data.
 - Full ChatGPT conversations when a short behavior summary is enough.
 
