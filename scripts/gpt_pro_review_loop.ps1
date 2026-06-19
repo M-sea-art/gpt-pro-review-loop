@@ -1,6 +1,6 @@
 [CmdletBinding()]
 param(
-  [ValidateSet("Init", "Prepare", "StartSession", "SendPrompt", "WaitFeedback", "RecordExperience", "StopSession", "Status", "Run")]
+  [ValidateSet("Init", "Prepare", "StartSession", "PreflightConnector", "SendPrompt", "WaitFeedback", "RecordExperience", "StopSession", "Status", "Run")]
   [string]$Action = "Run",
   [string]$Root,
   [string]$TargetChatGptUrl,
@@ -8,6 +8,7 @@ param(
   [switch]$AllowSensitive,
   [switch]$Send,
   [int]$FeedbackTimeoutSeconds = 900,
+  [int]$ConnectorTimeoutSeconds = 300,
   [int]$StartupTimeoutSeconds = 90,
   [int]$TunnelTimeoutSeconds = 90,
   [string]$ExperienceOutcome = "unspecified",
@@ -251,6 +252,115 @@ function Set-ActiveSession {
   $state.active_session = $Session
   $state.updated_at = (Get-Date).ToString("o")
   ConvertTo-JsonFile $state $paths.State
+}
+
+function Get-RunningSession {
+  param([string]$ProjectRoot)
+
+  $runtime = Get-RuntimePaths $ProjectRoot
+  if (-not (Test-Path -LiteralPath $runtime.Session)) {
+    throw "No active session file found. Run -Action StartSession first."
+  }
+  $session = Read-JsonFile $runtime.Session
+  if ($session.PSObject.Properties.Name -contains "stopped_at" -and $session.stopped_at) {
+    throw "Review session is stopped. Run -Action StartSession or -Action PreflightConnector to create a fresh tunnel."
+  }
+  return $session
+}
+
+function Save-Session {
+  param(
+    [string]$ProjectRoot,
+    $Session
+  )
+
+  $runtime = Get-RuntimePaths $ProjectRoot
+  ConvertTo-JsonFile $Session $runtime.Session
+  Set-ActiveSession $ProjectRoot $Session
+}
+
+function Set-ConnectorPreflight {
+  param(
+    [string]$ProjectRoot,
+    $Session,
+    [string]$Status,
+    [string]$Reason,
+    $Details
+  )
+
+  $payload = [ordered]@{
+    status = $Status
+    reason = $Reason
+    checked_at = (Get-Date).ToString("o")
+  }
+  if ($Details) {
+    foreach ($property in $Details.PSObject.Properties) {
+      $payload[$property.Name] = $property.Value
+    }
+  }
+  Set-ObjectProperty $Session "connector_preflight" $payload
+  Save-Session $ProjectRoot $Session
+}
+
+function Get-DevSpaceHttpRequests {
+  param(
+    [string]$LogPath,
+    [datetime]$Since
+  )
+
+  if (-not (Test-Path -LiteralPath $LogPath)) {
+    return @()
+  }
+
+  $sinceUtc = $Since.ToUniversalTime()
+  $requests = New-Object System.Collections.Generic.List[object]
+  foreach ($line in Get-Content -LiteralPath $LogPath -ErrorAction SilentlyContinue) {
+    $trimmed = $line.Trim()
+    if (-not $trimmed.StartsWith("{")) {
+      continue
+    }
+    try {
+      $entry = $trimmed | ConvertFrom-Json
+    } catch {
+      continue
+    }
+    if ($entry.event -ne "http_request" -or -not $entry.ts) {
+      continue
+    }
+    try {
+      $ts = ([datetime]::Parse($entry.ts)).ToUniversalTime()
+    } catch {
+      continue
+    }
+    if ($ts -lt $sinceUtc) {
+      continue
+    }
+    $requests.Add([pscustomobject]@{
+      ts = $entry.ts
+      method = $entry.method
+      path = $entry.path
+      status = $entry.status
+      host = $entry.host
+      userAgent = $entry.userAgent
+      requestId = $entry.requestId
+    }) | Out-Null
+  }
+  return @($requests)
+}
+
+function Test-ConnectorCandidateRequest {
+  param($Request)
+
+  if (-not $Request) {
+    return $false
+  }
+  if ($Request.path -eq "/healthz") {
+    return $false
+  }
+  if ($Request.userAgent -and $Request.userAgent -match "PowerShell|Invoke-WebRequest") {
+    return $false
+  }
+  return $true
 }
 
 function Invoke-SensitiveScan {
@@ -771,6 +881,11 @@ Feedback format:
       target_chatgpt_url = $targetChatGptProjectUrl
       conversation_policy = "new_chat_per_review_round"
       connector_preflight_required = $true
+      connector_preflight = [ordered]@{
+        status = "not_started"
+        reason = $null
+        checked_at = $null
+      }
       owner_token_path = $runtime.OwnerToken
       prompt_path = $promptPath
       report_path = $latestReport.FullName
@@ -804,17 +919,121 @@ Feedback format:
   }
 }
 
+function Wait-ConnectorPreflight {
+  param(
+    [string]$ProjectRoot,
+    [int]$TimeoutSeconds
+  )
+
+  $session = Get-RunningSession $ProjectRoot
+  $logPath = Join-Path $session.logs "devspace.out.log"
+
+  try {
+    Wait-ForHttpStatus ("http://127.0.0.1:{0}/healthz" -f $session.local_port) 200 10 | Out-Null
+    Wait-ForHttpStatus ("{0}/healthz" -f $session.tunnel_url) 200 20 | Out-Null
+  } catch {
+    Set-ConnectorPreflight $ProjectRoot $session "blocked" "devspace_or_tunnel_unreachable" ([pscustomobject][ordered]@{
+      mcp_url = $session.mcp_url
+      local_port = $session.local_port
+      tunnel_url = $session.tunnel_url
+      next_action = "Start a fresh review session and reconnect the ChatGPT DevSpace app to the new MCP URL."
+      error = $_.Exception.Message
+    })
+    throw "Connector preflight cannot start because DevSpace or the public tunnel is unreachable: $($_.Exception.Message)"
+  }
+
+  $startedAt = Get-Date
+  Set-ConnectorPreflight $ProjectRoot $session "waiting" "waiting_for_chatgpt_request" ([pscustomobject][ordered]@{
+    started_at = $startedAt.ToString("o")
+    timeout_seconds = $TimeoutSeconds
+    mcp_url = $session.mcp_url
+    devspace_log = $logPath
+    next_action = "In ChatGPT, disconnect/reconnect the DevSpace app with this MCP URL while this command is waiting."
+  })
+
+  Write-Host "Connector preflight waiting for ChatGPT to reach DevSpace." -ForegroundColor Yellow
+  Write-Host "MCP URL: $($session.mcp_url)"
+  Write-Host "Target ChatGPT project/new-chat URL: $($session.target_chatgpt_project_url)"
+  Write-Host "Reconnect or approve the DevSpace app in ChatGPT now. This check passes only after DevSpace logs a non-healthcheck request from ChatGPT."
+
+  $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+  while ((Get-Date) -lt $deadline) {
+    $requests = @(Get-DevSpaceHttpRequests $logPath $startedAt)
+    $candidates = @($requests | Where-Object { Test-ConnectorCandidateRequest $_ })
+    if ($candidates.Count -gt 0) {
+      $last = $candidates[-1]
+      $session = Get-RunningSession $ProjectRoot
+      Set-ConnectorPreflight $ProjectRoot $session "passed" "chatgpt_request_seen" ([pscustomobject][ordered]@{
+        started_at = $startedAt.ToString("o")
+        completed_at = (Get-Date).ToString("o")
+        timeout_seconds = $TimeoutSeconds
+        mcp_url = $session.mcp_url
+        devspace_log = $logPath
+        observed_request_count = $candidates.Count
+        observed_request = [ordered]@{
+          ts = $last.ts
+          method = $last.method
+          path = $last.path
+          status = $last.status
+          host = $last.host
+          userAgent = $last.userAgent
+          requestId = $last.requestId
+        }
+      })
+      Write-Host "Connector preflight passed. DevSpace saw a ChatGPT-side request: $($last.method) $($last.path) -> $($last.status)" -ForegroundColor Green
+      return
+    }
+    Start-Sleep -Seconds 3
+  }
+
+  $allRequests = @(Get-DevSpaceHttpRequests $logPath $startedAt)
+  $session = Get-RunningSession $ProjectRoot
+  Set-ConnectorPreflight $ProjectRoot $session "blocked" "no_chatgpt_request_seen" ([pscustomobject][ordered]@{
+    started_at = $startedAt.ToString("o")
+    completed_at = (Get-Date).ToString("o")
+    timeout_seconds = $TimeoutSeconds
+    mcp_url = $session.mcp_url
+    devspace_log = $logPath
+    total_http_requests_seen = $allRequests.Count
+    next_action = "ChatGPT likely points to an old MCP URL or OAuth failed before reaching DevSpace. Recreate or reconnect the app with the current MCP URL while the tunnel is running."
+  })
+  throw "Connector preflight timed out. DevSpace did not see a ChatGPT-side request for the current MCP URL."
+}
+
+function Invoke-ConnectorPreflight {
+  param(
+    [string]$ProjectRoot,
+    [int]$LocalPort,
+    [int]$TimeoutSeconds
+  )
+
+  $runtime = Get-RuntimePaths $ProjectRoot
+  $shouldStart = $true
+  if (Test-Path -LiteralPath $runtime.Session) {
+    $existing = Read-JsonFile $runtime.Session
+    $shouldStart = ($existing.PSObject.Properties.Name -contains "stopped_at" -and $existing.stopped_at)
+  }
+  if ($shouldStart) {
+    Start-Session $ProjectRoot $LocalPort | Out-Null
+  }
+  try {
+    Wait-ConnectorPreflight $ProjectRoot $TimeoutSeconds
+  } catch {
+    Stop-Session $ProjectRoot -IncludeDevSpace:$true
+    throw
+  }
+}
+
 function Send-Prompt {
   param(
     [string]$ProjectRoot,
     [switch]$Submit
   )
 
-  $runtime = Get-RuntimePaths $ProjectRoot
-  if (-not (Test-Path -LiteralPath $runtime.Session)) {
-    throw "No active session file found. Run -Action StartSession first."
+  $session = Get-RunningSession $ProjectRoot
+  if (-not $session.connector_preflight -or $session.connector_preflight.status -ne "passed") {
+    throw "Connector preflight has not passed. Run -Action PreflightConnector and reconnect the DevSpace app before SendPrompt."
   }
-  $session = Read-JsonFile $runtime.Session
   $chatUrl = $session.target_chatgpt_project_url
   if (-not $chatUrl) {
     $chatUrl = $session.target_chatgpt_url
@@ -847,10 +1066,7 @@ function Wait-Feedback {
 
   $runtime = Get-RuntimePaths $ProjectRoot
   $paths = Get-BridgePaths $ProjectRoot
-  if (-not (Test-Path -LiteralPath $runtime.Session)) {
-    throw "No active session file found. Run -Action StartSession first."
-  }
-  $session = Read-JsonFile $runtime.Session
+  $session = Get-RunningSession $ProjectRoot
   $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
   $feedbackFile = $null
 
@@ -1019,17 +1235,22 @@ function Show-Status {
 
   $runtime = Get-RuntimePaths $ProjectRoot
   $paths = Get-BridgePaths $ProjectRoot
+  $session = $null
+  if (Test-Path -LiteralPath $runtime.Session) {
+    $session = Read-JsonFile $runtime.Session
+  }
+  $sessionActive = ($null -ne $session -and -not ($session.PSObject.Properties.Name -contains "stopped_at" -and $session.stopped_at))
   [pscustomobject]@{
     project_root = $ProjectRoot
     bridge_exists = (Test-Path -LiteralPath $paths.Bridge)
     config_path = $paths.Config
     session_path = $runtime.Session
-    session_active = (Test-Path -LiteralPath $runtime.Session)
+    session_active = $sessionActive
     logs = $runtime.Logs
   } | Format-List
 
-  if (Test-Path -LiteralPath $runtime.Session) {
-    Read-JsonFile $runtime.Session | Format-List
+  if ($session) {
+    $session | Format-List
   }
 }
 
@@ -1048,6 +1269,10 @@ switch ($Action) {
   "StartSession" {
     Ensure-Bridge $ProjectRoot $TargetChatGptUrl | Out-Null
     Start-Session $ProjectRoot $Port | Out-Null
+  }
+  "PreflightConnector" {
+    Ensure-Bridge $ProjectRoot $TargetChatGptUrl | Out-Null
+    Invoke-ConnectorPreflight $ProjectRoot $Port $ConnectorTimeoutSeconds
   }
   "SendPrompt" {
     Send-Prompt $ProjectRoot -Submit:$Send
@@ -1068,8 +1293,18 @@ switch ($Action) {
     Ensure-Bridge $ProjectRoot $TargetChatGptUrl | Out-Null
     $scan = Invoke-SensitiveScan $ProjectRoot -Allow:$AllowSensitive
     New-ReviewReport $ProjectRoot $scan | Out-Null
-    Start-Session $ProjectRoot $Port | Out-Null
-    Send-Prompt $ProjectRoot -Submit:$Send
-    Wait-Feedback $ProjectRoot $FeedbackTimeoutSeconds | Out-Null
+    $sessionStarted = $false
+    try {
+      Start-Session $ProjectRoot $Port | Out-Null
+      $sessionStarted = $true
+      Wait-ConnectorPreflight $ProjectRoot $ConnectorTimeoutSeconds
+      Send-Prompt $ProjectRoot -Submit:$Send
+      Wait-Feedback $ProjectRoot $FeedbackTimeoutSeconds | Out-Null
+    } catch {
+      if ($sessionStarted) {
+        Stop-Session $ProjectRoot -IncludeDevSpace:$true
+      }
+      throw
+    }
   }
 }

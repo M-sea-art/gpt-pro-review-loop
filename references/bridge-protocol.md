@@ -44,6 +44,19 @@ docs/ai-bridge/
 - `active_session.target_chatgpt_project_url`: the project/new-chat URL used by browser automation.
 - `active_session.conversation_policy`: normally `new_chat_per_review_round`.
 - `active_session.connector_preflight_required`: must be true for v1 rounds.
+- `active_session.connector_preflight`: connection gate state before prompt sending.
+
+Connector preflight states:
+
+- `not_started`: session exists, but ChatGPT reachability has not been checked.
+- `waiting`: Codex is waiting for ChatGPT to reconnect or approve the app and call the current DevSpace endpoint.
+- `passed`: DevSpace logged a non-healthcheck request after preflight started; `SendPrompt` may continue.
+- `blocked`: DevSpace/tunnel was unreachable or no ChatGPT request reached DevSpace before timeout.
+
+Common blocked reasons:
+
+- `devspace_or_tunnel_unreachable`: local `/healthz` or public `/healthz` failed.
+- `no_chatgpt_request_seen`: the tunnel was healthy, but DevSpace saw no ChatGPT-side request; usually stale MCP URL or OAuth failure before reaching DevSpace.
 
 Codex reports must include metadata fields:
 
@@ -68,7 +81,7 @@ GPT feedback should be written only under `docs/ai-bridge/gpt-pro-feedback/` and
 
 If GPT Pro writes elsewhere, treat that as an out-of-bounds write and pause.
 
-If GPT Pro cannot access DevSpace in the new chat, treat the round as `BLOCKED`. Do not infer any project approval from a blocked connector preflight.
+If Codex connector preflight fails or GPT Pro cannot access DevSpace in the new chat, treat the round as `BLOCKED`. Do not infer any project approval from a blocked connector preflight.
 
 Experience records are project-local by default:
 
