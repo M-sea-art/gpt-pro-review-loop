@@ -59,6 +59,7 @@ docs/ai-review-loop/
 - `goal_verdict`: `GOAL_ACHIEVED`, `CONTINUE`, `NEEDS_EVIDENCE`, `NEEDS_PROCESS_FIX`, `NEEDS_HUMAN_DECISION`, or `BLOCKED`.
 - `next_action`: compact machine-readable next step.
 - `stop_reason`: null unless the loop has stopped or paused.
+- `continuation_required`: true when `NextDecision` leaves `loop_status` as `running`; the outer Codex agent must continue with `next_action` instead of giving a final answer.
 
 Review material files should use project-relative paths and avoid local absolute paths.
 
@@ -103,7 +104,7 @@ Codex must assess every actionable review recommendation before implementation:
 | ... | accept|modify|reject|needs-more-info | ... | ... |
 ```
 
-Decisions must be grounded in local facts such as code, tests, acceptance gates, project goals, user boundaries, cost, or risk. The assessment also includes the overall goal verdict so the loop can continue, gather evidence, fix process, stop, or pause for the user.
+Decisions must be grounded in local facts such as code, tests, acceptance gates, project goals, user boundaries, cost, or risk. The assessment also includes the overall goal verdict so the loop can continue, gather evidence, fix process, stop, or pause for the user. `CONTINUE`, `NEEDS_EVIDENCE`, and `NEEDS_PROCESS_FIX` are running states inside an explicitly started loop; they require the next iteration unless the user stops the session or a hard blocker appears.
 
 The assessment is the handoff contract between "GPT suggested it" and "Codex should act." A recommendation without local evidence remains advisory.
 

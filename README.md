@@ -58,7 +58,7 @@ Start a continuous loop after explicit authorization:
 & "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action RunLoop -Root "<project-root>"
 ```
 
-`RunLoop` marks the start of the outer Codex loop and prepares the current review package. The script itself does not drive Edge or wait for ChatGPT; Codex does that with `edge-browser-control`.
+`RunLoop` marks the start of the outer Codex loop and prepares the current review package. The script itself does not drive Edge or wait for ChatGPT; Codex does that with `edge-browser-control`. Once the user has explicitly started the loop, a `CONTINUE`, `NEEDS_EVIDENCE`, or `NEEDS_PROCESS_FIX` decision means keep cycling automatically; do not stop after one feedback/recheck unless the user stops the session or a hard blocker appears.
 
 The script prints the ChatGPT target and prompt file. Send that prompt through Edge, then mark it sent:
 
@@ -168,10 +168,12 @@ Generated review-loop files are excluded from later code maps and sensitive scan
 
 - `GOAL_ACHIEVED`: stop; prepare final report.
 - `CONTINUE`: keep going without ordinary per-round confirmation inside an explicitly started loop.
-- `NEEDS_EVIDENCE`: collect local evidence and send it back.
-- `NEEDS_PROCESS_FIX`: fix process or evidence quality before continuing.
+- `NEEDS_EVIDENCE`: collect local evidence and send it back, then continue the loop.
+- `NEEDS_PROCESS_FIX`: fix process or evidence quality, then continue the loop.
 - `NEEDS_HUMAN_DECISION`: pause for user choice or human gate.
 - `BLOCKED`: pause until an external blocker changes.
+
+If `NextDecision` reports `loop_status: running` or `continuation_required: true`, the operator must not treat the round as complete. Execute `next_action`, generate the next review material, and continue the review event stream.
 
 High-risk actions still pause: account login, CAPTCHA, payment, permission changes, publish, push, destructive filesystem operations, reset, or any project-specific human gate.
 

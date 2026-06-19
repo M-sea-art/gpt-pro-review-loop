@@ -153,6 +153,24 @@ Describe "gpt-pro-review-loop state machine" {
     $state = Read-State $project
     $state.loop_status | Should -Be "complete"
     $state.stop_reason | Should -Be "goal_achieved"
+    $state.continuation_required | Should -BeFalse
+  }
+
+  It "requires continuation when next decision is still running" {
+    $project = New-TestProject "continue-decision"
+    & $script:Skill -Action Init -Root $project -TargetChatGptUrl "https://chatgpt.com/g/test-project"
+    & $script:Skill -Action Prepare -Root $project
+    & $script:Skill -Action CaptureReview -Root $project -Reviewer codex-efficiency-auditor -Phase goal-audit -ReviewText "continue"
+    & $script:Skill -Action AssessFeedback -Root $project -GoalVerdict CONTINUE -NextAction "polish_pass"
+    & $script:Skill -Action NextDecision -Root $project
+
+    $state = Read-State $project
+    $state.loop_status | Should -Be "running"
+    $state.stop_reason | Should -Be $null
+    $state.continuation_required | Should -BeTrue
+    $run = Get-ChildItem -LiteralPath (Join-Path $project "docs/ai-review-loop/loop-runs") -Filter "*.json" | Select-Object -First 1
+    $runState = Get-Content -Raw -LiteralPath $run.FullName | ConvertFrom-Json
+    $runState.continuation_required | Should -BeTrue
   }
 
   It "blocks sensitive files but ignores generated loop ledger files" {

@@ -112,7 +112,7 @@ GPT Pro and Codex efficiency review are both `reviewer` values in the same event
    & "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action NextDecision -Root "<project-root>"
    ```
 
-   `GOAL_ACHIEVED` stops with a final report requirement. `CONTINUE`, `NEEDS_EVIDENCE`, and `NEEDS_PROCESS_FIX` can continue automatically inside an explicitly started loop. `NEEDS_HUMAN_DECISION` and `BLOCKED` pause.
+   `GOAL_ACHIEVED` stops with a final report requirement. `CONTINUE`, `NEEDS_EVIDENCE`, and `NEEDS_PROCESS_FIX` are not completion states inside an explicitly started loop; they require Codex to execute `next_action`, prepare the next review event, and keep cycling unless the user stops the session or a hard blocker appears. `NEEDS_HUMAN_DECISION` and `BLOCKED` pause.
 
 10. Record project-local experience when the round produced a reusable lesson:
 
@@ -138,7 +138,7 @@ When the user explicitly starts continuous review, use:
 & "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action RunLoop -Root "<project-root>"
 ```
 
-`RunLoop` is the compact loop entry for the outer Codex agent. The PowerShell script prepares local ledger material and prints the browser handoff; it does not control Edge or wait for ChatGPT by itself. After explicit authorization, Codex may continue ordinary next rounds without confirmation until `NextDecision` reports `GOAL_ACHIEVED`, `NEEDS_HUMAN_DECISION`, `BLOCKED`, or the user stops the session. Safety blockers, human gates, external account/login/CAPTCHA, publish/push, destructive file operations, and permission changes still pause.
+`RunLoop` is the compact loop entry for the outer Codex agent. The PowerShell script prepares local ledger material and prints the browser handoff; it does not control Edge or wait for ChatGPT by itself. After explicit authorization, Codex must continue ordinary next rounds without confirmation until `NextDecision` reports `GOAL_ACHIEVED`, `NEEDS_HUMAN_DECISION`, `BLOCKED`, or the user stops the session. A `running` loop status with `continuation_required=true` is an instruction to keep working, not a final-answer point. Safety blockers, human gates, external account/login/CAPTCHA, publish/push, destructive file operations, and permission changes still pause.
 
 ## Local Practice Assessment Rules
 

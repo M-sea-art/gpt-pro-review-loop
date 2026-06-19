@@ -250,10 +250,11 @@ function Ensure-ReviewLoop {
       latest_prompt_opened_tab_url = $null
       latest_assessment_target_url = $null
       latest_assessment_opened_tab_url = $null
+      continuation_required = $false
     }
   } else {
     $state = Read-JsonFile $paths.State
-    foreach ($field in @("version", "iteration_counter", "loop_mode", "loop_status", "latest_review", "goal_verdict", "next_action", "stop_reason", "baseline_sent_to_url", "baseline_sent_hash", "latest_prompt_target_url", "latest_prompt_opened_tab_url", "latest_assessment_target_url", "latest_assessment_opened_tab_url")) {
+    foreach ($field in @("version", "iteration_counter", "loop_mode", "loop_status", "latest_review", "goal_verdict", "next_action", "stop_reason", "baseline_sent_to_url", "baseline_sent_hash", "latest_prompt_target_url", "latest_prompt_opened_tab_url", "latest_assessment_target_url", "latest_assessment_opened_tab_url", "continuation_required")) {
       if (-not ($state.PSObject.Properties.Name -contains $field)) {
         $default = $null
         if ($field -eq "version") { $default = 3 }
@@ -262,6 +263,7 @@ function Ensure-ReviewLoop {
         if ($field -eq "loop_status") { $default = "idle" }
         if ($field -eq "goal_verdict") { $default = "CONTINUE" }
         if ($field -eq "next_action") { $default = "prepare_review" }
+        if ($field -eq "continuation_required") { $default = $false }
         Set-ObjectProperty $state $field $default
       }
     }
@@ -1013,6 +1015,7 @@ function Invoke-NextDecision {
   }
   Set-ObjectProperty $state "loop_status" $status
   Set-ObjectProperty $state "stop_reason" $stopReason
+  Set-ObjectProperty $state "continuation_required" ($status -eq "running")
   Save-State $ProjectRoot $state
   $iteration = if ($state.iteration_counter) { "iter-{0:000}" -f [int]$state.iteration_counter } else { "iter-000" }
   $runPath = Join-Path $paths.LoopRuns ("{0}-{1}-loop-run.json" -f (Get-Date -Format "yyyyMMdd-HHmmss"), $iteration)
@@ -1023,6 +1026,7 @@ function Invoke-NextDecision {
     goal_verdict = $verdict
     next_action = $state.next_action
     stop_reason = $stopReason
+    continuation_required = ($status -eq "running")
     latest_prompt = $state.latest_prompt
     latest_review = $state.latest_review
     latest_assessment = $state.latest_assessment
@@ -1030,6 +1034,9 @@ function Invoke-NextDecision {
   ConvertTo-JsonFile $summary $runPath
   Write-Host "Next decision: $verdict" -ForegroundColor Green
   Write-Host "Loop status: $status"
+  if ($status -eq "running") {
+    Write-Host "Continuation required: do not stop the review loop here. Execute next_action, then prepare/send the next review event unless the user stops the session or a hard blocker appears." -ForegroundColor Yellow
+  }
   Write-Host "Loop run record: $runPath"
 }
 
@@ -1095,6 +1102,7 @@ function Show-Status {
     latest_prompt_opened_tab_url = if ($state) { $state.latest_prompt_opened_tab_url } else { $null }
     latest_assessment_target_url = if ($state) { $state.latest_assessment_target_url } else { $null }
     latest_assessment_opened_tab_url = if ($state) { $state.latest_assessment_opened_tab_url } else { $null }
+    continuation_required = if ($state) { $state.continuation_required } else { $false }
     pending_prompt_count = if ($state -and $state.pending_prompts) { @($state.pending_prompts).Count } else { 0 }
     captured_review_count = if ($state -and $state.captured_reviews) { @($state.captured_reviews).Count } else { 0 }
     goal_verdict = if ($state) { $state.goal_verdict } else { $null }
