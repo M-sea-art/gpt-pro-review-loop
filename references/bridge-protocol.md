@@ -41,7 +41,12 @@ docs/ai-review-loop/
   "quota_mode": "economy",
   "default_max_prompt_chars": 8000,
   "visual_evidence_policy": "attach_only_when_requested_or_new_hash",
-  "external_review_policy": "send_only_when_new_evidence_or_explicit_review_needed"
+  "external_review_policy": "send_only_when_new_evidence_or_explicit_review_needed",
+  "active_goal_scope": "project_total",
+  "terminal_goal_scope": "project_total",
+  "completion_guard_policy": "project_total_only",
+  "gpt_courtesy_footer": "谢谢你的工作，GPT朋友。",
+  "courtesy_footer_policy": "after_first_external_review_in_continuous_loop"
 }
 ```
 
@@ -78,6 +83,15 @@ docs/ai-review-loop/
 - `should_send_to_gpt`: false when the next step is local-only and sending would be repetitive.
 - `send_reason`: why GPT should or should not receive the next prompt.
 - `local_only_next_action`: local action to run before another external review.
+- `active_goal_scope`: current assessment scope, one of `task`, `milestone`, `test_line`, or `project_total`.
+- `terminal_goal_scope`: scope required before the loop can complete; default `project_total`.
+- `subgoal_verdict`: latest subgoal result, usually `GOAL_ACHIEVED` when a non-terminal scope passes.
+- `project_goal_verdict`: latest total-project result, usually `CONTINUE` until the completion guard passes.
+- `completion_guard_status`: `not_evaluated`, `project_goal_pass`, `subgoal_achieved_not_terminal`, `blocked_by_project_goal`, or `not_goal_achieved`.
+- `blocking_gates`: compact blocker strings from project goal context.
+- `goal_context_sources`: project files used to build the latest goal context.
+- `goal_achieved_is_terminal`: true only when a `GOAL_ACHIEVED` decision is allowed to stop the loop.
+- `gpt_courtesy_footer_sent_count`: count of GPT-facing prompts that included the configured courtesy footer.
 
 ## URL Confirmation
 
@@ -140,6 +154,30 @@ Economy mode is the default. It keeps full files under `docs/ai-review-loop/` bu
 - visual evidence: send path/hash by default; attach the image only when a visual gate needs it and the same hash has not already been sent.
 
 `NextDecision` sets `should_send_to_gpt`. If it is false, the outer Codex agent should continue `local_only_next_action` and avoid an empty GPT prompt. If it is true, the agent can send the latest compact prompt because there is a new external-review question, new evidence, a requested recheck, or an explicit force flag.
+
+## Project Goal Guard
+
+`GOAL_ACHIEVED` is scoped. It does not automatically mean the whole project is done.
+
+Terminal completion requires:
+
+- `active_goal_scope: project_total`
+- `terminal_goal_scope: project_total`
+- no blocker evidence in the goal context
+
+The goal context is a compact summary of files such as `AGENTS.md`, acceptance documents, human-gate notes, supervisor state, completion reports, roadmap files, and verifier output. If those sources contain `NOT_COMPLETE`, `NOT_READY`, failed gates, incomplete roadmap items, or equivalent blocker language, `NextDecision` must keep the loop running even if a review event says a local target is accepted.
+
+When a non-terminal scope reaches `GOAL_ACHIEVED`, `NextDecision` records the subgoal result, sets `project_goal_verdict: CONTINUE`, and moves to `next_action: assess_parent_project_goal`.
+
+## GPT Courtesy Footer
+
+For continuous loops, the first baseline prompt stays neutral. The second and later GPT-facing review or assessment prompts append:
+
+```text
+谢谢你的工作，GPT朋友。
+```
+
+The footer is prompt etiquette only. It is not part of local verdicts, gate text, or completion evidence.
 
 ## Offline Boundary
 

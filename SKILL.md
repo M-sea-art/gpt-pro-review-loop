@@ -15,6 +15,8 @@ The loop is useful when the user wants an outside GPT Pro review without grantin
 
 Default quota mode is `economy`: keep full evidence in the project ledger, but send GPT Pro compact Markdown summaries and deltas unless the user or GPT explicitly needs a broader baseline.
 
+Default terminal goal scope is `project_total`. A task, milestone, or test-line can be achieved without ending the continuous loop; Codex must continue upward until the project-total completion guard passes, the user stops the session, or a hard blocker appears.
+
 The mental model is:
 
 ```text
@@ -55,6 +57,8 @@ GPT Pro and Codex efficiency review are both `reviewer` values in the same event
    ```
 
    This writes under `docs/ai-review-loop/`, runs the sensitive-data scan, creates a project dossier, creates a code map, creates a round request, assembles a compact ChatGPT prompt, and writes a runtime brief. Use `-ForceBaseline` when the ChatGPT conversation lost context or the user explicitly wants a full baseline resend. Use `-QuotaMode balanced` or `-QuotaMode deep` only when the compact prompt is insufficient.
+
+   Use `-GoalScope task|milestone|test_line|project_total` to label the current review target. Keep `project_total` as the terminal scope unless the user explicitly changes the project governance model. Compact prompts include `Goal Context` so GPT Pro and Codex efficiency review can distinguish a subgoal from total project completion.
 
    Useful quota parameters:
 
@@ -134,7 +138,7 @@ GPT Pro and Codex efficiency review are both `reviewer` values in the same event
    & "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action NextDecision -Root "<project-root>"
    ```
 
-   `GOAL_ACHIEVED` stops with a final report requirement. `CONTINUE`, `NEEDS_EVIDENCE`, and `NEEDS_PROCESS_FIX` are not completion states inside an explicitly started loop; they require Codex to execute `next_action`, prepare the next review event, and keep cycling unless the user stops the session or a hard blocker appears. `NEEDS_HUMAN_DECISION` and `BLOCKED` pause.
+   `GOAL_ACHIEVED` stops only when the active goal scope is `project_total` and the completion guard finds no project blockers. For `task`, `milestone`, or `test_line`, `GOAL_ACHIEVED` becomes `SUBGOAL_ACHIEVED`: keep `loop_status=running`, set `next_action=assess_parent_project_goal`, and continue the loop. If project documents, gates, verifier output, roadmap items, or supervisor state still say `NOT_COMPLETE`, `NOT_READY`, or equivalent, keep the loop running with `next_action=resolve_project_completion_blockers`. `CONTINUE`, `NEEDS_EVIDENCE`, and `NEEDS_PROCESS_FIX` are not completion states inside an explicitly started loop; they require Codex to execute `next_action`, prepare the next review event, and keep cycling unless the user stops the session or a hard blocker appears. `NEEDS_HUMAN_DECISION` and `BLOCKED` pause.
 
     `NextDecision` also records whether the next iteration should be sent to GPT:
 
@@ -166,11 +170,19 @@ When the user explicitly starts continuous review, use:
 & "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action RunLoop -Root "<project-root>" -PreflightBrowser
 ```
 
-`RunLoop` is the compact loop entry for the outer Codex agent. The PowerShell script prepares local ledger material, writes a runtime brief, and prints the browser handoff; it does not control Edge or wait for ChatGPT by itself. After explicit authorization, Codex must continue ordinary next rounds without confirmation until `NextDecision` reports `GOAL_ACHIEVED`, `NEEDS_HUMAN_DECISION`, `BLOCKED`, or the user stops the session. A `running` loop status with `continuation_required=true` is an instruction to keep working, not a final-answer point. Safety blockers, human gates, external account/login/CAPTCHA, publish/push, destructive file operations, and permission changes still pause.
+`RunLoop` is the compact loop entry for the outer Codex agent. The PowerShell script prepares local ledger material, writes a runtime brief, and prints the browser handoff; it does not control Edge or wait for ChatGPT by itself. After explicit authorization, Codex must continue ordinary next rounds without confirmation until `NextDecision` reports terminal project-total completion, `NEEDS_HUMAN_DECISION`, `BLOCKED`, or the user stops the session. A `running` loop status with `continuation_required=true` is an instruction to keep working, not a final-answer point. Safety blockers, human gates, external account/login/CAPTCHA, publish/push, destructive file operations, and permission changes still pause.
+
+For subgoal reviews:
+
+```powershell
+& "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action RunLoop -Root "<project-root>" -GoalScope test_line
+```
+
+This can mark the test-line as achieved, but it must not stop the overall loop unless the project-total guard also passes.
 
 ## Local Practice Assessment Rules
 
-- `GOAL_ACHIEVED`: acceptance gates and evidence show the requested goal is done.
+- `GOAL_ACHIEVED`: acceptance gates and evidence show the assessed scope is done; it is terminal only for `project_total` when the completion guard passes.
 - `CONTINUE`: proceed to the next ordinary implementation, evidence, or review step.
 - `NEEDS_EVIDENCE`: automatically gather missing local evidence and send it back.
 - `NEEDS_PROCESS_FIX`: fix loop/process quality before continuing.
@@ -190,6 +202,7 @@ Always cite local evidence. Evidence can be a file path, command result, test fa
 - Exclude `docs/ai-review-loop/` from generated code maps and sensitive scanning to avoid sending previous review logs back into later rounds by accident.
 - Do not send full source trees by default. Send summaries, code maps, diffs, verification output, and necessary excerpts.
 - Do not send GPT another prompt unless `should_send_to_gpt=true`, `-ForceExternalReview` is used, or a new external-review question has appeared.
+- In continuous loops, the second and later GPT-facing prompts automatically append `谢谢你的工作，GPT朋友。`; this is courtesy text only and must not affect local verdicts or gates.
 - Reuse `runtime_brief` inside one loop iteration instead of rereading full prompts, full state JSON, full gate docs, or full audit text.
 - Use project-relative paths in review material. Avoid exposing local absolute paths.
 - Keep browser automation limited to normal ChatGPT prompt submission and reply reading.

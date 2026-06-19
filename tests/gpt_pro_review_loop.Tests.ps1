@@ -39,11 +39,18 @@ Describe "gpt-pro-review-loop state machine" {
     $config.default_max_prompt_chars | Should -Be 8000
     $config.visual_evidence_policy | Should -Be "attach_only_when_requested_or_new_hash"
     $config.external_review_policy | Should -Be "send_only_when_new_evidence_or_explicit_review_needed"
+    $config.active_goal_scope | Should -Be "project_total"
+    $config.terminal_goal_scope | Should -Be "project_total"
+    $config.completion_guard_policy | Should -Be "project_total_only"
+    $config.gpt_courtesy_footer | Should -Be "谢谢你的工作，GPT朋友。"
+    $config.courtesy_footer_policy | Should -Be "after_first_external_review_in_continuous_loop"
     $state.PSObject.Properties.Name | Should -Contain "pending_prompts"
     $state.PSObject.Properties.Name | Should -Contain "captured_reviews"
     $state.PSObject.Properties.Name | Should -Contain "runtime_brief"
     $state.PSObject.Properties.Name | Should -Contain "browser_preflight_status"
     $state.PSObject.Properties.Name | Should -Contain "should_send_to_gpt"
+    $state.PSObject.Properties.Name | Should -Contain "active_goal_scope"
+    $state.PSObject.Properties.Name | Should -Contain "completion_guard_status"
     @($state.pending_prompts).Count | Should -Be 0
     @($state.captured_reviews).Count | Should -Be 0
     $state.baseline_sent_to_url | Should -Be $null
@@ -59,6 +66,12 @@ Describe "gpt-pro-review-loop state machine" {
     $state.cumulative_prompt_chars | Should -Be 0
     $state.should_send_to_gpt | Should -BeTrue
     $state.send_reason | Should -Be "initial_review"
+    $state.active_goal_scope | Should -Be "project_total"
+    $state.terminal_goal_scope | Should -Be "project_total"
+    $state.project_goal_verdict | Should -Be "CONTINUE"
+    $state.completion_guard_status | Should -Be "not_evaluated"
+    $state.goal_achieved_is_terminal | Should -BeFalse
+    $state.gpt_courtesy_footer_sent_count | Should -Be 0
 
     $statusText = (& $script:Skill -Action Status -Root $project | Out-String)
     $statusText | Should -Match "target_chatgpt_url"
@@ -126,6 +139,8 @@ Describe "gpt-pro-review-loop state machine" {
     $promptPath = Join-Path $project ($state.latest_prompt -replace "/", "\")
     $prompt = Get-Content -Raw -LiteralPath $promptPath
     $prompt.Length | Should -BeLessOrEqual 4000
+    $prompt | Should -Match "Goal Context"
+    $prompt | Should -Not -Match "谢谢你的工作，GPT朋友。"
     $state.quota_mode | Should -Be "economy"
     $state.last_prompt_chars | Should -Be $prompt.Length
     $state.cumulative_prompt_chars | Should -BeGreaterThan 0
@@ -167,6 +182,24 @@ Describe "gpt-pro-review-loop state machine" {
     $state.latest_prompt_opened_tab_url | Should -Be "https://chatgpt.com/g/test-project/c/abc123"
   }
 
+  It "adds GPT courtesy footer only after the first external send" {
+    $project = New-TestProject "courtesy"
+    & $script:Skill -Action Init -Root $project -TargetChatGptUrl "https://chatgpt.com/g/test-project"
+    & $script:Skill -Action Prepare -Root $project
+    $state = Read-State $project
+    $firstPromptPath = Join-Path $project ($state.latest_prompt -replace "/", "\")
+    (Get-Content -Raw -LiteralPath $firstPromptPath) | Should -Not -Match "谢谢你的工作，GPT朋友。"
+
+    & $script:Skill -Action SendPrompt -Root $project -Send
+    & $script:Skill -Action Prepare -Root $project
+    $state = Read-State $project
+    $secondPromptPath = Join-Path $project ($state.latest_prompt -replace "/", "\")
+    (Get-Content -Raw -LiteralPath $secondPromptPath) | Should -Match "谢谢你的工作，GPT朋友。"
+    & $script:Skill -Action SendPrompt -Root $project -Send
+    $state = Read-State $project
+    $state.gpt_courtesy_footer_sent_count | Should -Be 1
+  }
+
   It "deduplicates visual evidence hash when explicitly attached" {
     $project = New-TestProject "visual-hash"
     & $script:Skill -Action Init -Root $project -TargetChatGptUrl "https://chatgpt.com/g/test-project"
@@ -194,6 +227,20 @@ Describe "gpt-pro-review-loop state machine" {
     $state.latest_assessment_target_url | Should -Be "https://chatgpt.com/g/test-project"
     $state.latest_assessment_opened_tab_url | Should -Be "https://chatgpt.com/g/test-project/c/abc123"
     $state.next_action | Should -Be "capture_gpt_pro_recheck"
+  }
+
+  It "adds GPT courtesy footer to assessment return after prior external send" {
+    $project = New-TestProject "assessment-courtesy"
+    & $script:Skill -Action Init -Root $project -TargetChatGptUrl "https://chatgpt.com/g/test-project"
+    & $script:Skill -Action Prepare -Root $project
+    & $script:Skill -Action SendPrompt -Root $project -Send
+    & $script:Skill -Action CaptureReview -Root $project -Reviewer gpt-pro -Phase initial -ReviewText "review"
+    & $script:Skill -Action AssessFeedback -Root $project -GoalVerdict CONTINUE -NextAction "collect_evidence"
+    & $script:Skill -Action SendAssessment -Root $project
+
+    $state = Read-State $project
+    $assessmentPromptPath = Join-Path $project ($state.latest_assessment_prompt -replace "/", "\")
+    (Get-Content -Raw -LiteralPath $assessmentPromptPath) | Should -Match "谢谢你的工作，GPT朋友。"
   }
 
   It "rejects non-ChatGPT opened tab URLs" {
@@ -256,6 +303,74 @@ Describe "gpt-pro-review-loop state machine" {
     $state.loop_status | Should -Be "complete"
     $state.stop_reason | Should -Be "goal_achieved"
     $state.continuation_required | Should -BeFalse
+    $state.completion_guard_status | Should -Be "project_goal_pass"
+    $state.goal_achieved_is_terminal | Should -BeTrue
+    $state.project_goal_verdict | Should -Be "GOAL_ACHIEVED"
+  }
+
+  It "keeps subgoal achievement running instead of completing the total project" {
+    $project = New-TestProject "subgoal"
+    & $script:Skill -Action Init -Root $project -TargetChatGptUrl "https://chatgpt.com/g/test-project" -GoalScope test_line
+    & $script:Skill -Action Prepare -Root $project
+    & $script:Skill -Action CaptureReview -Root $project -Reviewer codex-efficiency-auditor -Phase goal-audit -ReviewText "AUTOMATED_BETA_ACCEPTED"
+    & $script:Skill -Action AssessFeedback -Root $project -GoalVerdict GOAL_ACHIEVED -NextAction "stop_after_final_report"
+    & $script:Skill -Action NextDecision -Root $project
+
+    $state = Read-State $project
+    $state.loop_status | Should -Be "running"
+    $state.stop_reason | Should -Be $null
+    $state.continuation_required | Should -BeTrue
+    $state.completion_guard_status | Should -Be "subgoal_achieved_not_terminal"
+    $state.goal_achieved_is_terminal | Should -BeFalse
+    $state.subgoal_verdict | Should -Be "GOAL_ACHIEVED"
+    $state.project_goal_verdict | Should -Be "CONTINUE"
+    $state.next_action | Should -Be "assess_parent_project_goal"
+    $state.should_send_to_gpt | Should -BeFalse
+    $state.send_reason | Should -Be "local_only_continue"
+    $state.local_only_next_action | Should -Be "assess_parent_project_goal"
+  }
+
+  It "blocks project-total completion when goal context still says not ready" {
+    $project = New-TestProject "project-blocker"
+    New-Item -ItemType Directory -Path (Join-Path $project "docs/project") -Force | Out-Null
+    Set-Content -LiteralPath (Join-Path $project "docs/project/FPV0_COMPLETION_ROADMAP.md") -Encoding UTF8 -Value 'Demo readiness: `NOT_READY`'
+    & $script:Skill -Action Init -Root $project -TargetChatGptUrl "https://chatgpt.com/g/test-project"
+    & $script:Skill -Action Prepare -Root $project
+    & $script:Skill -Action CaptureReview -Root $project -Reviewer codex-efficiency-auditor -Phase goal-audit -ReviewText "done"
+    & $script:Skill -Action AssessFeedback -Root $project -GoalVerdict GOAL_ACHIEVED -NextAction "final_report"
+    & $script:Skill -Action NextDecision -Root $project
+
+    $state = Read-State $project
+    $state.loop_status | Should -Be "running"
+    $state.completion_guard_status | Should -Be "blocked_by_project_goal"
+    $state.goal_achieved_is_terminal | Should -BeFalse
+    @($state.blocking_gates).Count | Should -BeGreaterThan 0
+    $state.next_action | Should -Be "resolve_project_completion_blockers"
+    $state.should_send_to_gpt | Should -BeFalse
+    $state.send_reason | Should -Be "local_only_continue"
+    $state.local_only_next_action | Should -Be "resolve_project_completion_blockers"
+  }
+
+  It "migrates stale complete state back to running when project blockers exist" {
+    $project = New-TestProject "stale-complete"
+    New-Item -ItemType Directory -Path (Join-Path $project "docs/project") -Force | Out-Null
+    Set-Content -LiteralPath (Join-Path $project "docs/project/FPV0_COMPLETION_ROADMAP.md") -Encoding UTF8 -Value "NOT_COMPLETE: V-P0-002 remains"
+    & $script:Skill -Action Init -Root $project -TargetChatGptUrl "https://chatgpt.com/g/test-project"
+    $statePath = Join-Path $project "docs/ai-review-loop/review-state.json"
+    $state = Get-Content -Raw -LiteralPath $statePath | ConvertFrom-Json
+    $state.goal_verdict = "GOAL_ACHIEVED"
+    $state.loop_status = "complete"
+    $state.stop_reason = "goal_achieved"
+    $state.goal_achieved_is_terminal = $false
+    $state | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $statePath -Encoding UTF8
+
+    & $script:Skill -Action Status -Root $project | Out-Null
+    $state = Read-State $project
+    $state.loop_status | Should -Be "running"
+    $state.stop_reason | Should -Be $null
+    $state.completion_guard_status | Should -Be "blocked_by_project_goal"
+    $state.next_action | Should -Be "resolve_project_completion_blockers"
+    $state.should_send_to_gpt | Should -BeFalse
   }
 
   It "requires continuation when next decision is still running" {

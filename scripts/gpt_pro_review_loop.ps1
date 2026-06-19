@@ -14,6 +14,11 @@ param(
   [switch]$PreflightBrowser,
   [switch]$ForceExternalReview,
   [switch]$AttachVisualEvidence,
+  [ValidateSet("task", "milestone", "test_line", "project_total")]
+  [string]$GoalScope = "project_total",
+  [ValidateSet("project_total")]
+  [string]$TerminalGoalScope = "project_total",
+  [switch]$ForceCompleteProjectGoal,
   [ValidateSet("gpt-pro", "codex-efficiency-auditor")]
   [string]$Reviewer = "gpt-pro",
   [ValidateSet("initial", "recheck", "process-audit", "goal-audit")]
@@ -35,6 +40,8 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+$GoalScopeProvided = $PSBoundParameters.ContainsKey("GoalScope")
+$TerminalGoalScopeProvided = $PSBoundParameters.ContainsKey("TerminalGoalScope")
 
 if ($PSVersionTable.PSVersion.Major -lt 7) {
   throw "gpt_pro_review_loop.ps1 requires PowerShell 7+ because it uses .NET path APIs such as System.IO.Path.GetRelativePath."
@@ -241,6 +248,147 @@ function Set-PromptStats {
   Set-ObjectProperty $State "cumulative_prompt_chars" ([int64]($cumulative + $chars))
 }
 
+function Get-CourtesyFooter {
+  param(
+    [Parameter(Mandatory = $true)]$State,
+    [Parameter(Mandatory = $true)]$Config
+  )
+  $footer = if ($Config.gpt_courtesy_footer) { [string]$Config.gpt_courtesy_footer } else { "" }
+  if (-not $footer) { return "" }
+  $externalCount = if ($State.external_review_count) { [int]$State.external_review_count } else { 0 }
+  if ($State.loop_mode -eq "continuous_until_stopped" -and $externalCount -ge 1) {
+    return "`n`n$footer"
+  }
+  return ""
+}
+
+function Add-PromptFooterWithinLimit {
+  param(
+    [Parameter(Mandatory = $true)][string]$Prompt,
+    [string]$Footer,
+    [int]$MaxChars = 0
+  )
+  if (-not $Footer) { return (Limit-Text -Text $Prompt -MaxChars $MaxChars) }
+  if ($MaxChars -gt 0) {
+    $promptMax = [Math]::Max(0, $MaxChars - $Footer.Length)
+    return (Limit-Text -Text $Prompt -MaxChars $promptMax) + $Footer
+  }
+  return $Prompt + $Footer
+}
+
+function Get-GoalContextReport {
+  param(
+    [Parameter(Mandatory = $true)][string]$ProjectRoot,
+    [int]$MaxChars = 2200
+  )
+  $candidatePaths = New-Object System.Collections.Generic.List[string]
+  foreach ($relative in @(
+      "AGENTS.md",
+      "docs/ACCEPTANCE_TESTS.md",
+      "docs/process/HUMAN_GATE.md",
+      "docs/test-line/ACTIVE_SUPERVISOR_STATE.md",
+      "completion_report.md",
+      "docs/completion_report.md"
+    )) {
+    $full = Join-Path $ProjectRoot ($relative -replace "/", "\")
+    if (Test-Path -LiteralPath $full) { $candidatePaths.Add($full) | Out-Null }
+  }
+  foreach ($pattern in @("*ROADMAP*.md", "*COMPLETION*.md", "*GATE*.md")) {
+    foreach ($item in @(Get-ChildItem -LiteralPath (Join-Path $ProjectRoot "docs") -Recurse -File -Filter $pattern -ErrorAction SilentlyContinue | Select-Object -First 40)) {
+      $relative = Get-RelativePath -Root $ProjectRoot -Path $item.FullName
+      if (-not (Test-SkippedPath $relative)) { $candidatePaths.Add($item.FullName) | Out-Null }
+    }
+  }
+  $sources = @($candidatePaths.ToArray() | Sort-Object -Unique | Select-Object -First 60)
+  $blockers = New-Object System.Collections.Generic.List[string]
+  $sourceLines = New-Object System.Collections.Generic.List[string]
+  $patterns = @(
+    "NOT_COMPLETE",
+    "NOT_READY",
+    "NOT_READY_TO_MERGE",
+    "NOT_RUNTIME_APPROVED",
+    "NOT_HUMAN_VISUAL_SIGNOFF",
+    "failed gates?",
+    "failing gates?",
+    "Not implemented",
+    "Remaining P0",
+    "Remaining P1",
+    "Demo readiness.*NOT_READY"
+  )
+  foreach ($source in $sources) {
+    $relative = Get-RelativePath -Root $ProjectRoot -Path $source
+    $sourceLines.Add("- $relative") | Out-Null
+    $text = Get-ContentExcerpt -Path $source -MaxChars 20000
+    foreach ($pattern in $patterns) {
+      if ($text -match $pattern) {
+        $blockers.Add(("{0}: {1}" -f $relative, $pattern)) | Out-Null
+      }
+    }
+  }
+  $uniqueBlockers = @($blockers.ToArray() | Sort-Object -Unique)
+  $blockerText = if ($uniqueBlockers.Count -gt 0) { $uniqueBlockers -join "`n" } else { "(none detected in goal context sources)" }
+  $sourceText = if ($sourceLines.Count -gt 0) { $sourceLines.ToArray() -join "`n" } else { "(no goal context sources found)" }
+  $summary = @"
+## Goal Context
+
+Review the current loop result as a scoped goal, not automatically as total project completion.
+
+- active_goal_scope: (see review-state)
+- terminal_goal_scope: project_total
+- completion rule: subgoal completion must continue upward to parent/project goal assessment.
+
+### Goal Context Sources
+
+$sourceText
+
+### Detected Project Completion Blockers
+
+$blockerText
+
+### Reviewer Instruction
+
+Explicitly distinguish current subgoal completion from project_total completion. If project blockers remain, do not recommend terminal completion.
+"@
+  return [pscustomobject]@{
+    text = (Limit-Text -Text $summary -MaxChars $MaxChars)
+    sources = @($sources | ForEach-Object { Get-RelativePath -Root $ProjectRoot -Path $_ })
+    blockers = $uniqueBlockers
+  }
+}
+
+function Invoke-CompletionGuard {
+  param(
+    [Parameter(Mandatory = $true)][string]$ProjectRoot,
+    [Parameter(Mandatory = $true)]$State,
+    [Parameter(Mandatory = $true)][string]$Verdict
+  )
+  $activeScope = if ($ForceCompleteProjectGoal) { [string]$State.terminal_goal_scope } elseif ($State.active_goal_scope) { [string]$State.active_goal_scope } else { "project_total" }
+  $terminalScope = if ($State.terminal_goal_scope) { [string]$State.terminal_goal_scope } else { "project_total" }
+  $goalContext = Get-GoalContextReport -ProjectRoot $ProjectRoot -MaxChars 4000
+  $blockers = @($goalContext.blockers)
+  $status = "not_evaluated"
+  $isTerminal = $false
+  if ($Verdict -ne "GOAL_ACHIEVED") {
+    $status = "not_goal_achieved"
+  } elseif ($activeScope -ne $terminalScope) {
+    $status = "subgoal_achieved_not_terminal"
+  } elseif ($blockers.Count -gt 0) {
+    $status = "blocked_by_project_goal"
+  } else {
+    $status = "project_goal_pass"
+    $isTerminal = $true
+  }
+  return [pscustomobject]@{
+    status = $status
+    is_terminal = $isTerminal
+    active_goal_scope = $activeScope
+    terminal_goal_scope = $terminalScope
+    blockers = $blockers
+    sources = @($goalContext.sources)
+    text = $goalContext.text
+  }
+}
+
 function New-RuntimeBrief {
   param(
     [Parameter(Mandatory = $true)][string]$ProjectRoot,
@@ -271,6 +419,13 @@ function New-RuntimeBrief {
     browser_target_tab_id = $state.browser_target_tab_id
     loop_status = $state.loop_status
     goal_verdict = $state.goal_verdict
+    active_goal_scope = $state.active_goal_scope
+    terminal_goal_scope = $state.terminal_goal_scope
+    subgoal_verdict = $state.subgoal_verdict
+    project_goal_verdict = $state.project_goal_verdict
+    completion_guard_status = $state.completion_guard_status
+    blocking_gates = $state.blocking_gates
+    goal_achieved_is_terminal = $state.goal_achieved_is_terminal
     next_action = $state.next_action
     should_send_to_gpt = $state.should_send_to_gpt
     send_reason = $state.send_reason
@@ -351,6 +506,8 @@ function Ensure-ReviewLoop {
     }
   }
   $quotaDefaults = Get-QuotaSettings -Mode $QuotaMode -PromptLimit $MaxPromptChars
+  $effectiveGoalScope = if ($GoalScopeProvided) { $GoalScope } elseif ($config.active_goal_scope) { [string]$config.active_goal_scope } else { "project_total" }
+  $effectiveTerminalGoalScope = if ($TerminalGoalScopeProvided) { $TerminalGoalScope } elseif ($config.terminal_goal_scope) { [string]$config.terminal_goal_scope } else { "project_total" }
   $requiredConfig = [ordered]@{
     transport = "browser_dossier"
     run_mode = "continuous_until_stopped"
@@ -365,6 +522,11 @@ function Ensure-ReviewLoop {
     default_max_prompt_chars = $quotaDefaults.prompt_max_chars
     visual_evidence_policy = "attach_only_when_requested_or_new_hash"
     external_review_policy = "send_only_when_new_evidence_or_explicit_review_needed"
+    active_goal_scope = $effectiveGoalScope
+    terminal_goal_scope = $effectiveTerminalGoalScope
+    completion_guard_policy = "project_total_only"
+    gpt_courtesy_footer = "谢谢你的工作，GPT朋友。"
+    courtesy_footer_policy = "after_first_external_review_in_continuous_loop"
   }
   foreach ($key in $requiredConfig.Keys) {
     Set-ObjectProperty $config $key $requiredConfig[$key]
@@ -374,7 +536,7 @@ function Ensure-ReviewLoop {
 
   if (-not (Test-Path -LiteralPath $paths.State)) {
     $state = [ordered]@{
-      version = 3
+      version = 4
       updated_at = (Get-Date).ToString("o")
       baseline_sent = $false
       baseline_hash = $null
@@ -420,13 +582,22 @@ function Ensure-ReviewLoop {
       should_send_to_gpt = $true
       send_reason = "initial_review"
       local_only_next_action = $null
+      active_goal_scope = $effectiveGoalScope
+      terminal_goal_scope = $effectiveTerminalGoalScope
+      subgoal_verdict = $null
+      project_goal_verdict = "CONTINUE"
+      completion_guard_status = "not_evaluated"
+      blocking_gates = @()
+      goal_context_sources = @()
+      goal_achieved_is_terminal = $false
+      gpt_courtesy_footer_sent_count = 0
     }
   } else {
     $state = Read-JsonFile $paths.State
-    foreach ($field in @("version", "iteration_counter", "loop_mode", "loop_status", "latest_review", "latest_assessment_prompt", "goal_verdict", "next_action", "stop_reason", "baseline_sent_to_url", "baseline_sent_hash", "latest_prompt_target_url", "latest_prompt_opened_tab_url", "latest_assessment_target_url", "latest_assessment_opened_tab_url", "continuation_required", "url_confirmation_required", "url_confirmation_reason", "quota_mode", "runtime_brief", "browser_preflight_status", "browser_backend_type", "browser_target_tab_id", "browser_preflight_iteration", "browser_preflight_checked_at", "latest_visual_evidence_hash", "latest_visual_evidence_path", "last_visual_evidence_sent_hash", "attach_visual_evidence_requested", "last_prompt_chars", "cumulative_prompt_chars", "external_review_count", "local_only_iteration_count", "should_send_to_gpt", "send_reason", "local_only_next_action")) {
+    foreach ($field in @("version", "iteration_counter", "loop_mode", "loop_status", "latest_review", "latest_assessment_prompt", "goal_verdict", "next_action", "stop_reason", "baseline_sent_to_url", "baseline_sent_hash", "latest_prompt_target_url", "latest_prompt_opened_tab_url", "latest_assessment_target_url", "latest_assessment_opened_tab_url", "continuation_required", "url_confirmation_required", "url_confirmation_reason", "quota_mode", "runtime_brief", "browser_preflight_status", "browser_backend_type", "browser_target_tab_id", "browser_preflight_iteration", "browser_preflight_checked_at", "latest_visual_evidence_hash", "latest_visual_evidence_path", "last_visual_evidence_sent_hash", "attach_visual_evidence_requested", "last_prompt_chars", "cumulative_prompt_chars", "external_review_count", "local_only_iteration_count", "should_send_to_gpt", "send_reason", "local_only_next_action", "active_goal_scope", "terminal_goal_scope", "subgoal_verdict", "project_goal_verdict", "completion_guard_status", "goal_achieved_is_terminal", "gpt_courtesy_footer_sent_count")) {
       if (-not ($state.PSObject.Properties.Name -contains $field)) {
         $default = $null
-        if ($field -eq "version") { $default = 3 }
+        if ($field -eq "version") { $default = 4 }
         if ($field -eq "iteration_counter") { $default = 0 }
         if ($field -eq "loop_mode") { $default = "continuous_until_stopped" }
         if ($field -eq "loop_status") { $default = "idle" }
@@ -442,17 +613,25 @@ function Ensure-ReviewLoop {
         if ($field -eq "local_only_iteration_count") { $default = 0 }
         if ($field -eq "should_send_to_gpt") { $default = $true }
         if ($field -eq "send_reason") { $default = "initial_review" }
+        if ($field -eq "active_goal_scope") { $default = $effectiveGoalScope }
+        if ($field -eq "terminal_goal_scope") { $default = $effectiveTerminalGoalScope }
+        if ($field -eq "project_goal_verdict") { $default = "CONTINUE" }
+        if ($field -eq "completion_guard_status") { $default = "not_evaluated" }
+        if ($field -eq "goal_achieved_is_terminal") { $default = $false }
+        if ($field -eq "gpt_courtesy_footer_sent_count") { $default = 0 }
         Set-ObjectProperty $state $field $default
       }
     }
-    foreach ($field in @("pending_prompts", "pending_reviews", "captured_reviews", "pending_assessments")) {
+    foreach ($field in @("pending_prompts", "pending_reviews", "captured_reviews", "pending_assessments", "blocking_gates", "goal_context_sources")) {
       if (-not ($state.PSObject.Properties.Name -contains $field) -or $null -eq $state.$field) {
         Set-ObjectProperty $state $field @()
       }
     }
-    Set-ObjectProperty $state "version" 3
+    Set-ObjectProperty $state "version" 4
     Set-ObjectProperty $state "loop_mode" "continuous_until_stopped"
     Set-ObjectProperty $state "quota_mode" $quotaDefaults.mode
+    if ($GoalScopeProvided) { Set-ObjectProperty $state "active_goal_scope" $effectiveGoalScope }
+    if ($TerminalGoalScopeProvided) { Set-ObjectProperty $state "terminal_goal_scope" $effectiveTerminalGoalScope }
     $stateTargetBefore = $state.target_chatgpt_conversation_url
     $configTarget = $config.target_chatgpt_conversation_url
     if (-not $configTarget) { $configTarget = $config.target_chatgpt_url }
@@ -483,6 +662,28 @@ function Ensure-ReviewLoop {
     Set-ObjectProperty $state "url_confirmation_required" $true
     Set-ObjectProperty $state "url_confirmation_reason" "missing_target_chatgpt_url"
     Set-ObjectProperty $state "next_action" "confirm_target_chatgpt_url"
+  }
+  if ($state.goal_verdict -eq "GOAL_ACHIEVED" -and $state.loop_status -eq "complete" -and -not [bool]$state.goal_achieved_is_terminal) {
+    $guard = Invoke-CompletionGuard -ProjectRoot $ProjectRoot -State $state -Verdict "GOAL_ACHIEVED"
+    if (-not $guard.is_terminal) {
+      Set-ObjectProperty $state "loop_status" "running"
+      Set-ObjectProperty $state "stop_reason" $null
+      Set-ObjectProperty $state "continuation_required" $true
+      Set-ObjectProperty $state "completion_guard_status" $guard.status
+      Set-ObjectProperty $state "blocking_gates" @($guard.blockers)
+      Set-ObjectProperty $state "goal_context_sources" @($guard.sources)
+      Set-ObjectProperty $state "goal_achieved_is_terminal" $false
+      Set-ObjectProperty $state "project_goal_verdict" "CONTINUE"
+      if ($guard.status -eq "subgoal_achieved_not_terminal") {
+        Set-ObjectProperty $state "subgoal_verdict" "GOAL_ACHIEVED"
+        Set-ObjectProperty $state "next_action" "assess_parent_project_goal"
+      } else {
+        Set-ObjectProperty $state "next_action" "resolve_project_completion_blockers"
+      }
+      Set-ObjectProperty $state "should_send_to_gpt" $false
+      Set-ObjectProperty $state "send_reason" "local_only_continue"
+      Set-ObjectProperty $state "local_only_next_action" $state.next_action
+    }
   }
   Save-State $ProjectRoot $state
   return $paths
@@ -885,6 +1086,8 @@ function New-ReviewPrompt {
   if (-not $promptPath) { throw "Could not build review prompt path." }
   $target = $config.target_chatgpt_conversation_url
   if (-not $target) { $target = $config.target_chatgpt_url }
+  $goalContext = Get-GoalContextReport -ProjectRoot $ProjectRoot -MaxChars 1800
+  $courtesyFooter = Get-CourtesyFooter -State $state -Config $config
   $includeBaseline = [bool]$ForceFullBaseline -or
     -not [bool]$state.baseline_sent -or
     $state.baseline_sent_to_url -ne $target -or
@@ -925,6 +1128,8 @@ Codex will also run a local Codex efficiency auditor review. Your feedback and t
 - max_prompt_chars: $($settings.prompt_max_chars)
 - instruction: $modeInstruction
 
+$($goalContext.text)
+
 ## Round
 
 $RoundId
@@ -960,8 +1165,9 @@ $request
 - risks:
 - local evidence GPT wants Codex to verify:
 - next narrow question:
+- scope judgment: current subgoal complete? project_total complete?
 "@
-  $prompt = Limit-Text -Text $prompt -MaxChars $settings.prompt_max_chars
+  $prompt = Add-PromptFooterWithinLimit -Prompt $prompt -Footer $courtesyFooter -MaxChars $settings.prompt_max_chars
   $promptOutputPath = [System.IO.Path]::Combine([string]$paths.Prompts, "$RoundId-review-prompt.md")
   if (-not $promptOutputPath) { throw "Could not build review prompt output path." }
   Set-Content -LiteralPath $promptOutputPath -Encoding UTF8 -NoNewline -Value $prompt
@@ -971,6 +1177,7 @@ $request
   $state = Get-State -ProjectRoot $ProjectRoot
   Set-ObjectProperty $state "latest_prompt" $rel
   Set-ObjectProperty $state "attach_visual_evidence_requested" ([bool]$AttachVisualEvidence)
+  Set-ObjectProperty $state "goal_context_sources" @($goalContext.sources)
   Set-PromptStats -State $state -PromptText $storedPrompt -Mode $settings.mode
   Save-State $ProjectRoot $state
   return $promptOutputPath
@@ -1038,6 +1245,11 @@ function Complete-PromptSend {
   Set-ObjectProperty $state "latest_prompt_sent_at" (Get-Date).ToString("o")
   $externalCount = if ($state.external_review_count) { [int]$state.external_review_count } else { 0 }
   Set-ObjectProperty $state "external_review_count" ($externalCount + 1)
+  $footer = if ($config.gpt_courtesy_footer) { [string]$config.gpt_courtesy_footer } else { "" }
+  if ($footer -and (Get-Content -Raw -LiteralPath $PromptPath).Contains($footer)) {
+    $footerCount = if ($state.gpt_courtesy_footer_sent_count) { [int]$state.gpt_courtesy_footer_sent_count } else { 0 }
+    Set-ObjectProperty $state "gpt_courtesy_footer_sent_count" ($footerCount + 1)
+  }
   if ($AttachVisualEvidence -and $state.latest_visual_evidence_hash) {
     Set-ObjectProperty $state "last_visual_evidence_sent_hash" $state.latest_visual_evidence_hash
   }
@@ -1202,6 +1414,8 @@ $gitStatus
 - source: codex
 - assessment_type: $Type
 - goal_verdict: $Verdict
+- active_goal_scope: $($state.active_goal_scope)
+- terminal_goal_scope: $($state.terminal_goal_scope)
 - next_action: $ActionText
 - status: ready_for_next_decision
 
@@ -1235,6 +1449,8 @@ function New-AssessmentPrompt {
   $target = $config.target_chatgpt_conversation_url
   if (-not $target) { $target = $config.target_chatgpt_url }
   if (-not (Test-ChatGptUrl $target)) { throw "project-config.json needs a https://chatgpt.com/... URL." }
+  $goalContext = Get-GoalContextReport -ProjectRoot $ProjectRoot -MaxChars 1600
+  $courtesyFooter = Get-CourtesyFooter -State $state -Config $config
   $round = if ($state.round_counter) { "round-{0:000}" -f [int]$state.round_counter } else { "round-000" }
   $iteration = if ($state.iteration_counter) { "iter-{0:000}" -f [int]$state.iteration_counter } else { "iter-000" }
   $promptPath = Join-Path $paths.Prompts ("{0}-{1}-assessment-return-prompt.md" -f $round, $iteration)
@@ -1256,7 +1472,11 @@ Please recheck this compact assessment. Correct any recommendation that no longe
 - max_prompt_chars: $($settings.assessment_max_chars)
 - latest_review: $reviewSummary
 - goal_verdict: $($state.goal_verdict)
+- active_goal_scope: $($state.active_goal_scope)
+- terminal_goal_scope: $($state.terminal_goal_scope)
 - next_action: $($state.next_action)
+
+$($goalContext.text)
 
 ## Visual Evidence
 
@@ -1272,14 +1492,16 @@ $assessment
 - corrections:
 - evidence still needed:
 - next narrow question:
+- scope judgment: current subgoal complete? project_total complete?
 "@
-  $prompt = Limit-Text -Text $prompt -MaxChars $settings.assessment_max_chars
+  $prompt = Add-PromptFooterWithinLimit -Prompt $prompt -Footer $courtesyFooter -MaxChars $settings.assessment_max_chars
   Set-Content -LiteralPath $promptPath -Encoding UTF8 -NoNewline -Value $prompt
   $storedPrompt = Get-Content -Raw -LiteralPath $promptPath
   $rel = Get-RelativePath -Root $ProjectRoot -Path $promptPath
   Add-StateItem -ProjectRoot $ProjectRoot -Field "pending_prompts" -Value $rel
   $state = Get-State $ProjectRoot
   Set-ObjectProperty $state "latest_assessment_prompt" (Get-RelativePath -Root $ProjectRoot -Path $promptPath)
+  Set-ObjectProperty $state "goal_context_sources" @($goalContext.sources)
   Set-PromptStats -State $state -PromptText $storedPrompt -Mode $settings.mode
   Save-State $ProjectRoot $state
   New-RuntimeBrief -ProjectRoot $ProjectRoot -Reason "assessment_prompt_created" | Out-Null
@@ -1299,6 +1521,11 @@ $assessment
     Set-ObjectProperty $state "latest_assessment_opened_tab_url" $OpenedTabUrl
     $externalCount = if ($state.external_review_count) { [int]$state.external_review_count } else { 0 }
     Set-ObjectProperty $state "external_review_count" ($externalCount + 1)
+    $footer = if ($config.gpt_courtesy_footer) { [string]$config.gpt_courtesy_footer } else { "" }
+    if ($footer -and (Get-Content -Raw -LiteralPath $promptPath).Contains($footer)) {
+      $footerCount = if ($state.gpt_courtesy_footer_sent_count) { [int]$state.gpt_courtesy_footer_sent_count } else { 0 }
+      Set-ObjectProperty $state "gpt_courtesy_footer_sent_count" ($footerCount + 1)
+    }
     Set-ObjectProperty $state "next_action" "capture_gpt_pro_recheck"
     Save-State $ProjectRoot $state
     New-RuntimeBrief -ProjectRoot $ProjectRoot -Reason "assessment_sent" | Out-Null
@@ -1313,13 +1540,37 @@ function Invoke-NextDecision {
   $paths = Get-ReviewPaths $ProjectRoot
   $state = Get-State $ProjectRoot
   $verdict = if ($state.goal_verdict) { [string]$state.goal_verdict } else { "CONTINUE" }
+  $guard = Invoke-CompletionGuard -ProjectRoot $ProjectRoot -State $state -Verdict $verdict
   $status = "running"
   $stopReason = $null
   switch ($verdict) {
-    "GOAL_ACHIEVED" { $status = "complete"; $stopReason = "goal_achieved" }
+    "GOAL_ACHIEVED" {
+      if ($guard.is_terminal) {
+        $status = "complete"
+        $stopReason = "goal_achieved"
+      } else {
+        $status = "running"
+        $stopReason = $null
+        if ($guard.status -eq "subgoal_achieved_not_terminal") {
+          Set-ObjectProperty $state "subgoal_verdict" "GOAL_ACHIEVED"
+          Set-ObjectProperty $state "project_goal_verdict" "CONTINUE"
+          Set-ObjectProperty $state "next_action" "assess_parent_project_goal"
+        } elseif ($guard.status -eq "blocked_by_project_goal") {
+          Set-ObjectProperty $state "project_goal_verdict" "CONTINUE"
+          Set-ObjectProperty $state "next_action" "resolve_project_completion_blockers"
+        }
+      }
+    }
     "NEEDS_HUMAN_DECISION" { $status = "paused"; $stopReason = "human_decision_required" }
     "BLOCKED" { $status = "blocked"; $stopReason = "blocked_by_assessment" }
     default { $status = "running" }
+  }
+  Set-ObjectProperty $state "completion_guard_status" $guard.status
+  Set-ObjectProperty $state "blocking_gates" @($guard.blockers)
+  Set-ObjectProperty $state "goal_context_sources" @($guard.sources)
+  Set-ObjectProperty $state "goal_achieved_is_terminal" ([bool]$guard.is_terminal)
+  if ($guard.is_terminal) {
+    Set-ObjectProperty $state "project_goal_verdict" "GOAL_ACHIEVED"
   }
   Set-ObjectProperty $state "loop_status" $status
   Set-ObjectProperty $state "stop_reason" $stopReason
@@ -1332,7 +1583,7 @@ function Invoke-NextDecision {
     if ($ForceExternalReview) {
       $shouldSend = $true
       $sendReason = "force_external_review"
-    } elseif ($nextActionText -match "(?i)(gpt|pro|external|review|recheck|send)") {
+    } elseif ($nextActionText -match "(?i)(^|[_\-\s])(gpt|pro|external|review|recheck|send)([_\-\s]|$)") {
       $shouldSend = $true
       $sendReason = "next_action_requests_external_review"
     } else {
@@ -1356,6 +1607,11 @@ function Invoke-NextDecision {
     next_action = $state.next_action
     stop_reason = $stopReason
     continuation_required = ($status -eq "running")
+    active_goal_scope = $state.active_goal_scope
+    terminal_goal_scope = $state.terminal_goal_scope
+    completion_guard_status = $guard.status
+    blocking_gates = @($guard.blockers)
+    goal_achieved_is_terminal = [bool]$guard.is_terminal
     should_send_to_gpt = $shouldSend
     send_reason = $sendReason
     local_only_next_action = $localOnlyNextAction
@@ -1367,6 +1623,8 @@ function Invoke-NextDecision {
   New-RuntimeBrief -ProjectRoot $ProjectRoot -Reason "next_decision" | Out-Null
   Write-Host "Next decision: $verdict" -ForegroundColor Green
   Write-Host "Loop status: $status"
+  Write-Host "completion_guard_status: $($guard.status)"
+  Write-Host "goal_achieved_is_terminal: $([bool]$guard.is_terminal)"
   Write-Host "should_send_to_gpt: $shouldSend"
   Write-Host "send_reason: $sendReason"
   if ($status -eq "running") {
@@ -1459,6 +1717,14 @@ function Show-Status {
     pending_prompt_count = if ($state -and $state.pending_prompts) { @($state.pending_prompts).Count } else { 0 }
     captured_review_count = if ($state -and $state.captured_reviews) { @($state.captured_reviews).Count } else { 0 }
     goal_verdict = if ($state) { $state.goal_verdict } else { $null }
+    active_goal_scope = if ($state) { $state.active_goal_scope } else { $null }
+    terminal_goal_scope = if ($state) { $state.terminal_goal_scope } else { $null }
+    subgoal_verdict = if ($state) { $state.subgoal_verdict } else { $null }
+    project_goal_verdict = if ($state) { $state.project_goal_verdict } else { $null }
+    completion_guard_status = if ($state) { $state.completion_guard_status } else { $null }
+    blocking_gate_count = if ($state -and $state.blocking_gates) { @($state.blocking_gates).Count } else { 0 }
+    goal_achieved_is_terminal = if ($state) { $state.goal_achieved_is_terminal } else { $null }
+    gpt_courtesy_footer_sent_count = if ($state) { $state.gpt_courtesy_footer_sent_count } else { 0 }
     next_action = if ($state) { $state.next_action } else { $null }
     stop_reason = if ($state) { $state.stop_reason } else { $null }
     config_path = $paths.Config
@@ -1539,6 +1805,7 @@ switch ($Action) {
     New-ExperienceRecord -ProjectRoot $ProjectRoot -Outcome $ExperienceOutcome -Lesson $ExperienceLesson -Notes $ExperienceNotes
   }
   "Status" {
+    Ensure-ReviewLoop -ProjectRoot $ProjectRoot -ChatUrl $TargetChatGptUrl | Out-Null
     Show-Status -ProjectRoot $ProjectRoot
   }
   "Run" {

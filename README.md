@@ -19,6 +19,7 @@ review package -> external/internal review -> local assessment -> next decision
 - Codex efficiency review is recorded as another `reviewer` in the same event stream.
 - Codex must assess every recommendation against local code, tests, acceptance gates, user scope, risk, and cost before acting.
 - Each loop run stores a compact `runtime-brief.json` so Codex can reuse target URL, prompt path, evidence hash, browser route status, and latest state without repeatedly rereading large files.
+- Completion is guarded at the project-total level. A task, milestone, or test-line can be accepted without stopping the continuous loop.
 
 This skill sends static Markdown only. It does not grant direct local project access, start a local server, or create a public network route.
 
@@ -64,6 +65,18 @@ Start a continuous loop after explicit authorization:
 ```
 
 `RunLoop` marks the start of the outer Codex loop and prepares the current review package. `-PreflightBrowser` records the intended Edge/Chrome extension route once for this iteration. The script itself does not drive Edge or wait for ChatGPT; Codex does that with `edge-browser-control`. Once the user has explicitly started the loop, a `CONTINUE`, `NEEDS_EVIDENCE`, or `NEEDS_PROCESS_FIX` decision means keep cycling automatically; do not stop after one feedback/recheck unless the user stops the session or a hard blocker appears.
+
+By default the terminal scope is the whole project:
+
+```powershell
+& "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action RunLoop -Root "<project-root>" -GoalScope project_total
+```
+
+Use a narrower active scope when the current review is only for a subgoal. The loop will record the subgoal as achieved, then continue upward to assess the parent project goal:
+
+```powershell
+& "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action RunLoop -Root "<project-root>" -GoalScope test_line
+```
 
 Prepare a compact package without starting the outer loop:
 
@@ -184,6 +197,15 @@ Generated review-loop files are excluded from later code maps and sensitive scan
   "should_send_to_gpt": true,
   "send_reason": "initial_review",
   "local_only_next_action": null,
+  "active_goal_scope": "project_total",
+  "terminal_goal_scope": "project_total",
+  "subgoal_verdict": null,
+  "project_goal_verdict": null,
+  "completion_guard_status": "not_evaluated",
+  "blocking_gates": [],
+  "goal_context_sources": [],
+  "goal_achieved_is_terminal": false,
+  "gpt_courtesy_footer_sent_count": 0,
   "pending_prompts": [],
   "pending_reviews": [],
   "captured_reviews": [],
@@ -194,9 +216,21 @@ Generated review-loop files are excluded from later code maps and sensitive scan
 }
 ```
 
+## Project Goal Guard
+
+`GOAL_ACHIEVED` means "the assessed scope is achieved." It is terminal only when all of the following are true:
+
+- `active_goal_scope` is `project_total`.
+- `terminal_goal_scope` is `project_total`.
+- The completion guard finds no project blockers such as `NOT_COMPLETE`, `NOT_READY`, failed gates, unfinished roadmap items, or verifier results saying the project is incomplete.
+
+If a task, milestone, or test-line reaches `GOAL_ACHIEVED`, `NextDecision` records `subgoal_verdict: GOAL_ACHIEVED`, keeps `loop_status: running`, and sets `next_action: assess_parent_project_goal`. If a project-total completion claim conflicts with blocker evidence, `NextDecision` keeps the loop running and sets `next_action: resolve_project_completion_blockers`.
+
+`-ForceCompleteProjectGoal` exists for explicit operator override, but it should not be used to bypass project acceptance gates or human gates.
+
 ## Loop Decisions
 
-- `GOAL_ACHIEVED`: stop; prepare final report.
+- `GOAL_ACHIEVED`: stop only when the project-total completion guard passes; otherwise continue as a subgoal or blocker follow-up.
 - `CONTINUE`: keep going without ordinary per-round confirmation inside an explicitly started loop.
 - `NEEDS_EVIDENCE`: collect local evidence and send it back, then continue the loop.
 - `NEEDS_PROCESS_FIX`: fix process or evidence quality, then continue the loop.
@@ -213,6 +247,14 @@ If `NextDecision` reports `loop_status: running` or `continuation_required: true
 - `local_only_next_action`: the local action to execute before another external review.
 
 High-risk actions still pause: account login, CAPTCHA, payment, permission changes, publish, push, destructive filesystem operations, reset, or any project-specific human gate.
+
+In continuous loops, the second and later GPT-facing prompts automatically end with:
+
+```text
+谢谢你的工作，GPT朋友。
+```
+
+This footer is courtesy text only. It is not written into verdicts, gates, local assessments, or completion decisions.
 
 ## Safety Model
 
