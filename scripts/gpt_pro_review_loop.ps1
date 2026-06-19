@@ -1,6 +1,6 @@
 [CmdletBinding()]
 param(
-  [ValidateSet("Init", "Prepare", "StartSession", "SendPrompt", "WaitFeedback", "StopSession", "Status", "Run")]
+  [ValidateSet("Init", "Prepare", "StartSession", "SendPrompt", "WaitFeedback", "RecordExperience", "StopSession", "Status", "Run")]
   [string]$Action = "Run",
   [string]$Root,
   [string]$TargetChatGptUrl,
@@ -10,6 +10,9 @@ param(
   [int]$FeedbackTimeoutSeconds = 900,
   [int]$StartupTimeoutSeconds = 90,
   [int]$TunnelTimeoutSeconds = 90,
+  [string]$ExperienceOutcome = "unspecified",
+  [string]$ExperienceLesson,
+  [string]$ExperienceNotes,
   [switch]$StopDevSpace
 )
 
@@ -75,6 +78,8 @@ function Get-BridgePaths {
     Reports = Join-Path $bridge "codex-reports"
     Feedback = Join-Path $bridge "gpt-pro-feedback"
     Scans = Join-Path $bridge "security-scans"
+    ExperienceLog = Join-Path $bridge "experience-log.md"
+    ExperienceIssues = Join-Path $bridge "experience-issues"
   }
 }
 
@@ -101,7 +106,7 @@ function Ensure-Bridge {
   )
 
   $paths = Get-BridgePaths $ProjectRoot
-  foreach ($dir in @($paths.Bridge, $paths.Inbox, $paths.Reports, $paths.Feedback, $paths.Scans)) {
+  foreach ($dir in @($paths.Bridge, $paths.Inbox, $paths.Reports, $paths.Feedback, $paths.Scans, $paths.ExperienceIssues)) {
     if (-not (Test-Path -LiteralPath $dir)) {
       New-Item -ItemType Directory -Path $dir -Force | Out-Null
     }
@@ -109,6 +114,10 @@ function Ensure-Bridge {
 
   if (-not (Test-Path -LiteralPath $paths.Decisions)) {
     Set-Content -LiteralPath $paths.Decisions -Encoding UTF8 -Value "# AI Bridge Decisions`n"
+  }
+
+  if (-not (Test-Path -LiteralPath $paths.ExperienceLog)) {
+    Set-Content -LiteralPath $paths.ExperienceLog -Encoding UTF8 -Value "# GPT Pro Review Loop Experience Log`n"
   }
 
   if (Test-Path -LiteralPath $paths.Config) {
@@ -814,6 +823,115 @@ function Wait-Feedback {
   return $feedbackFile.FullName
 }
 
+function Get-LatestBridgeFile {
+  param(
+    [string]$Directory,
+    [string]$Filter = "*.md"
+  )
+
+  if (-not (Test-Path -LiteralPath $Directory)) {
+    return $null
+  }
+
+  return Get-ChildItem -LiteralPath $Directory -File -Filter $Filter -ErrorAction SilentlyContinue |
+    Where-Object { $_.Name -ne "README.md" } |
+    Sort-Object LastWriteTime -Descending |
+    Select-Object -First 1
+}
+
+function New-ExperienceRecord {
+  param(
+    [string]$ProjectRoot,
+    [string]$Outcome,
+    [string]$Lesson,
+    [string]$Notes
+  )
+
+  Ensure-Bridge $ProjectRoot $null | Out-Null
+  $paths = Get-BridgePaths $ProjectRoot
+  [string]$experienceLogPath = if ($paths.ExperienceLog) { [string]$paths.ExperienceLog } else { [System.IO.Path]::Combine([string]$paths.Bridge, "experience-log.md") }
+  [string]$experienceIssuesPath = if ($paths.ExperienceIssues) { [string]$paths.ExperienceIssues } else { [System.IO.Path]::Combine([string]$paths.Bridge, "experience-issues") }
+  if ([string]::IsNullOrWhiteSpace($experienceLogPath) -or [string]::IsNullOrWhiteSpace($experienceIssuesPath)) {
+    throw "Experience paths did not resolve for project root: $ProjectRoot"
+  }
+  if (-not (Test-Path -LiteralPath $experienceIssuesPath)) {
+    New-Item -ItemType Directory -Path $experienceIssuesPath -Force | Out-Null
+  }
+  if (-not (Test-Path -LiteralPath $experienceLogPath)) {
+    Set-Content -LiteralPath $experienceLogPath -Encoding UTF8 -Value "# GPT Pro Review Loop Experience Log`n"
+  }
+  $stamp = Get-Date -Format "yyyy-MM-dd-HHmmss"
+  $projectName = Split-Path -Leaf $ProjectRoot
+  $latestReport = Get-LatestBridgeFile $paths.Reports
+  $latestFeedback = Get-LatestBridgeFile $paths.Feedback
+  $reportRel = if ($latestReport) { [System.IO.Path]::GetRelativePath($ProjectRoot, $latestReport.FullName) } else { "(none)" }
+  $feedbackRel = if ($latestFeedback) { [System.IO.Path]::GetRelativePath($ProjectRoot, $latestFeedback.FullName) } else { "(none)" }
+  $safeLesson = if ($Lesson) { $Lesson } else { "(fill in the reusable lesson)" }
+  $safeNotes = if ($Notes) { $Notes } else { "(fill in what happened, without secrets or private data)" }
+  $safeOutcome = if ($Outcome) { $Outcome } else { "unspecified" }
+  $gitStatus = Get-GitText $ProjectRoot @("status", "--short")
+  if (-not $gitStatus) { $gitStatus = "(not available)" }
+
+  $entryLines = @(
+    "",
+    "## $stamp",
+    "",
+    "- outcome: $safeOutcome",
+    "- latest_report: $reportRel",
+    "- latest_feedback: $feedbackRel",
+    "",
+    "### Notes",
+    "",
+    $safeNotes,
+    "",
+    "### Reusable Lesson",
+    "",
+    $safeLesson,
+    "",
+    "### Local Git Status At Capture",
+    "",
+    '```text',
+    $gitStatus,
+    '```'
+  )
+  Add-Content -LiteralPath $experienceLogPath -Encoding UTF8 -Value ($entryLines -join [Environment]::NewLine)
+
+  [string]$issueFileName = "{0}-github-issue-draft.md" -f $stamp
+  [string]$issuePath = "$experienceIssuesPath\$issueFileName"
+  if ([string]::IsNullOrWhiteSpace($issuePath)) {
+    throw "Experience issue draft path did not resolve."
+  }
+  $issueLines = @(
+    "# [experience] $projectName - $safeOutcome",
+    "",
+    "## Scenario",
+    "",
+    'Project-local use of `gpt-pro-review-loop`.',
+    "",
+    "## Observed behavior",
+    "",
+    $safeNotes,
+    "",
+    "## Reusable lesson",
+    "",
+    $safeLesson,
+    "",
+    "## Local evidence",
+    "",
+    "- Latest Codex report: $reportRel",
+    "- Latest GPT Pro feedback: $feedbackRel",
+    "",
+    "## Privacy check",
+    "",
+    "This draft should contain only process-level experience. Do not paste API keys, cookies, OAuth tokens, owner tokens, private account data, proprietary source snippets, or private business data into the public GitHub issue."
+  )
+  [System.IO.File]::WriteAllLines($issuePath, [string[]]$issueLines, [System.Text.Encoding]::UTF8)
+
+  Write-Host "Experience recorded: $experienceLogPath" -ForegroundColor Green
+  Write-Host "GitHub issue draft created: $issuePath" -ForegroundColor Green
+  return $issuePath
+}
+
 function Show-Status {
   param([string]$ProjectRoot)
 
@@ -854,6 +972,9 @@ switch ($Action) {
   }
   "WaitFeedback" {
     Wait-Feedback $ProjectRoot $FeedbackTimeoutSeconds | Out-Null
+  }
+  "RecordExperience" {
+    New-ExperienceRecord $ProjectRoot $ExperienceOutcome $ExperienceLesson $ExperienceNotes | Out-Null
   }
   "StopSession" {
     Stop-Session $ProjectRoot -IncludeDevSpace:$StopDevSpace

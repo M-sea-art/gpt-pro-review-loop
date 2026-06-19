@@ -59,7 +59,15 @@ Default v1 policy:
    ```
 
 9. Read the new feedback file, summarize the actionable items, and pause. Do not start the next loop until the user confirms the next round.
-10. Stop the public exposure:
+10. Record project-local experience when the round produced a reusable lesson:
+
+   ```powershell
+   & "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action RecordExperience -Root "<project-root>" -ExperienceOutcome "success|blocked|needs-improvement" -ExperienceLesson "<short reusable lesson>" -ExperienceNotes "<sanitized notes>"
+   ```
+
+   This appends to `docs/ai-bridge/experience-log.md` and creates a sanitized GitHub issue draft under `docs/ai-bridge/experience-issues/`.
+
+11. Stop the public exposure:
 
    ```powershell
    & "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action StopSession -Root "<project-root>"
@@ -82,9 +90,11 @@ This prepares the report, starts DevSpace and the quick tunnel, opens the ChatGP
 - If GPT changes files outside `docs/ai-bridge/gpt-pro-feedback/`, stop and report the changed paths before doing anything else.
 - Close the quick tunnel at the end of each round or when the user pauses.
 - Do not paste owner tokens, OAuth callbacks, cookies, or browser session data into ChatGPT.
+- Keep experience records process-level. Do not copy secrets, account details, proprietary source snippets, or private business data into public issue drafts.
 
 ## References
 
 - Read `references/bridge-protocol.md` when inspecting or modifying the project bridge files.
+- Read `references/experience-collection.md` when deciding what to record locally and what to promote to a GitHub issue.
 - Read `references/devspace-session.md` when troubleshooting DevSpace, tunnel, OAuth, or connector setup.
 - Read `references/chatgpt-browser-flow.md` when browser automation fails or ChatGPT UI changes.
