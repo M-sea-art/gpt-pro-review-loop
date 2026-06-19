@@ -84,13 +84,6 @@ Codex must assess every actionable GPT recommendation before implementation:
 
 Decisions must be grounded in local facts such as code, tests, acceptance gates, project goals, user boundaries, cost, or risk.
 
-## Removed v1 Concepts
+## Offline Boundary
 
-These are not part of v2:
-
-- DevSpace local server.
-- Cloudflare quick tunnel.
-- MCP connector setup.
-- OAuth owner token.
-- GPT-side local file reads or writes.
-- Out-of-bounds write detection, because GPT no longer has local write access.
+GPT Pro reviews only the Markdown material in the ChatGPT conversation. Codex remains responsible for reading local files, running tests, saving feedback, and deciding whether a recommendation fits local constraints.

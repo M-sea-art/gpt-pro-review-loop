@@ -1,6 +1,6 @@
 # ChatGPT Browser Flow
 
-Use `edge-browser-control` for ChatGPT web UI operations. Do not use Edge remote debugging, CDP helpers, cookie export, browser profile scraping, DevSpace connector setup, or MCP tools.
+Use `edge-browser-control` for ChatGPT web UI operations. Do not use Edge remote debugging, CDP helpers, cookie export, browser profile scraping, or account/session data inspection.
 
 ## Send Review Prompt
 

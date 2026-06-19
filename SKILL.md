@@ -1,6 +1,6 @@
 ---
 name: gpt-pro-review-loop
-description: Run a semi-automatic offline review loop between Codex and GPT Pro without MCP, DevSpace, tunnels, or direct GPT file access. Use when the user explicitly asks to send a project, Codex report, milestone status, implementation plan, verification result, or local practice assessment to GPT Pro for review through ChatGPT, then bring GPT Pro feedback back into Codex. Also use for the Chinese request "Pro 审阅循环".
+description: Run a semi-automatic offline review loop between Codex and GPT Pro using Markdown review packages, code maps, ChatGPT conversation memory, and Codex local practice assessments. Use when the user explicitly asks to send a project, Codex report, milestone status, implementation plan, verification result, or local practice assessment to GPT Pro for review through ChatGPT, then bring GPT Pro feedback back into Codex. Also use for the Chinese request "Pro 审阅循环".
 ---
 
 # GPT Pro Review Loop
@@ -13,9 +13,9 @@ Use this skill only after an explicit user request such as "use GPT Pro to revie
 
 This v2 skill is offline by design:
 
-- Do not start DevSpace.
-- Do not start Cloudflare Tunnel.
-- Do not use MCP connectors or OAuth preflight.
+- Send review material as Markdown through ChatGPT.
+- Use ChatGPT conversation memory as the long-running review context.
+- Keep all local reads, writes, tests, and implementation inside Codex.
 - Do not give GPT Pro direct local file access.
 - Do not assume GPT Pro can write local files.
 
@@ -114,7 +114,7 @@ Always cite local evidence. Evidence can be a file path, command result, test fa
 - Use project-relative paths in review material. Avoid exposing local absolute paths.
 - Keep browser automation limited to normal ChatGPT prompt submission and reply reading.
 - Do not inspect cookies, passwords, browser storage, or session files.
-- Do not enter account credentials, OAuth approvals, purchases, or permission changes through browser automation.
+- Do not enter account credentials, purchases, or permission changes through browser automation.
 - If the ChatGPT conversation changes or GPT says context is missing, resend a compressed baseline before asking for another verdict.
 
 ## References

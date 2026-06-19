@@ -1,6 +1,6 @@
 [CmdletBinding()]
 param(
-  [ValidateSet("Init", "Prepare", "SendPrompt", "CaptureFeedback", "WaitFeedback", "AssessFeedback", "SendAssessment", "RecordExperience", "Status", "Run", "StartSession", "PreflightConnector", "StopSession")]
+  [ValidateSet("Init", "Prepare", "SendPrompt", "CaptureFeedback", "WaitFeedback", "AssessFeedback", "SendAssessment", "RecordExperience", "Status", "Run")]
   [string]$Action = "Run",
   [string]$Root,
   [string]$TargetChatGptUrl,
@@ -614,7 +614,7 @@ function New-CodeMap {
     "",
     "## CodeGraph Note",
     "",
-    "If Codex has CodeGraph MCP available in the active project, Codex should add structural summaries from CodeGraph to the review prompt. This script provides a deterministic filesystem fallback and does not require CodeGraph.",
+    "If Codex has CodeGraph available in the active project, Codex should add structural summaries from CodeGraph to the review prompt. This script provides a deterministic filesystem fallback and does not require CodeGraph.",
     "",
     "## File Type Summary",
     "",
@@ -751,7 +751,7 @@ function New-ReviewPrompt {
   $prompt = @"
 You are GPT Pro reviewing a Codex project through an offline review loop.
 
-There is no DevSpace, no MCP connector, no tunnel, and no direct file access. Use only the project baseline and round material in this ChatGPT conversation. If you need more context, ask Codex for a specific snippet or command result.
+Use only the project baseline and round material in this ChatGPT conversation. You do not have direct local file access. If you need more context, ask Codex for a specific snippet or command result.
 
 Codex must locally assess your recommendations before acting and will report back with accept/modify/reject/needs-more-info decisions based on real project constraints.
 
@@ -851,7 +851,7 @@ function Show-PromptHandoff {
   Write-Host $target
   Write-Host "Paste or send this prompt file:" -ForegroundColor Cyan
   Write-Host $promptPath
-  Write-Host "No MCP, DevSpace, tunnel, owner token, or connector is used." -ForegroundColor Green
+  Write-Host "Offline browser dossier only. No local service or public endpoint is used." -ForegroundColor Green
 
   if ($MarkSent) {
     Complete-PromptSend $ProjectRoot $promptPath
@@ -1111,7 +1111,7 @@ $safeLesson
 
 ## Privacy check
 
-This draft should contain only process-level experience. Do not paste API keys, cookies, OAuth tokens, private account data, proprietary source snippets, or private business data into the public GitHub issue.
+This draft should contain only process-level experience. Do not paste API keys, cookies, private account data, proprietary source snippets, or private business data into the public GitHub issue.
 "@
   Set-Content -LiteralPath $issuePath -Encoding UTF8 -Value $issue
 
@@ -1138,11 +1138,6 @@ function Show-Status {
     latest_feedback = if ($state) { $state.latest_feedback } else { $null }
     latest_assessment = if ($state) { $state.latest_assessment } else { $null }
   } | Format-List
-}
-
-function Invoke-LegacyRemovedAction {
-  param([string]$Name)
-  throw "$Name was removed in gpt-pro-review-loop v2. This skill no longer uses DevSpace, MCP connectors, Cloudflare tunnels, OAuth owner tokens, or public endpoints. Use Init, Prepare, SendPrompt, CaptureFeedback, AssessFeedback, and SendAssessment."
 }
 
 $ProjectRoot = Resolve-ProjectRoot $Root
@@ -1193,15 +1188,6 @@ switch ($Action) {
     $scan = Invoke-SensitiveScan $ProjectRoot -Allow:$AllowSensitive
     New-ReviewPackage $ProjectRoot $scan | Out-Null
     Show-PromptHandoff $ProjectRoot -MarkSent:$Send
-  }
-  "StartSession" {
-    Invoke-LegacyRemovedAction $Action
-  }
-  "PreflightConnector" {
-    Invoke-LegacyRemovedAction $Action
-  }
-  "StopSession" {
-    Invoke-LegacyRemovedAction $Action
   }
 }
 

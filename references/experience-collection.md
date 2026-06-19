@@ -24,7 +24,7 @@ Record:
 
 Do not record:
 
-- API keys, OAuth callbacks, cookies, browser session data, passwords, private account data.
+- API keys, cookies, browser session data, passwords, private account data.
 - Large source snippets or proprietary business data.
 - Full ChatGPT conversations when a short behavior summary is enough.
 
