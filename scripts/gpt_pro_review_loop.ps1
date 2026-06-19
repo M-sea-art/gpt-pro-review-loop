@@ -711,7 +711,7 @@ function Show-PromptHandoff {
   Write-Host $target
   Write-Host "Paste or send this prompt file:" -ForegroundColor Cyan
   Write-Host $promptPath
-  Write-Host "Offline browser dossier only. No local service or public endpoint is used." -ForegroundColor Green
+  Write-Host "Offline browser dossier only. No local service or public network route is used." -ForegroundColor Green
   if ($MarkSent) {
     Complete-PromptSend $ProjectRoot $promptPath
     Write-Host "Marked prompt as sent." -ForegroundColor Green

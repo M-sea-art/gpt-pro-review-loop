@@ -1,6 +1,6 @@
 # Experience Collection
 
-Use `RecordExperience` after a review round when the result teaches something reusable about the offline review loop, browser handoff, prompt quality, sensitive-data scanning, GPT feedback quality, or Codex local assessment quality.
+Use `RecordExperience` after a review round when the result teaches something reusable about the offline review loop, browser handoff, prompt quality, sensitive-data scanning, review event quality, or Codex local assessment quality.
 
 Command:
 
@@ -18,7 +18,7 @@ Record:
 - What task or round was being reviewed.
 - Whether the loop succeeded, blocked, or needs improvement.
 - Whether GPT had enough baseline context.
-- Whether Codex accepted, modified, rejected, or asked for more context on GPT recommendations.
+- Whether Codex accepted, modified, rejected, or asked for more context on review recommendations.
 - What should change in the skill, scripts, prompts, safety checks, or docs.
 - Which prompt, review event, assessment event, and loop-run record provide evidence.
 
