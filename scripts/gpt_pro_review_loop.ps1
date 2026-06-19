@@ -4,6 +4,7 @@ param(
   [string]$Action = "Run",
   [string]$Root,
   [string]$TargetChatGptUrl,
+  [string]$OpenedTabUrl,
   [switch]$AllowSensitive,
   [switch]$Send,
   [switch]$ForceBaseline,
@@ -245,10 +246,14 @@ function Ensure-ReviewLoop {
       target_chatgpt_conversation_url = $targetUrl
       baseline_sent_to_url = $null
       baseline_sent_hash = $null
+      latest_prompt_target_url = $null
+      latest_prompt_opened_tab_url = $null
+      latest_assessment_target_url = $null
+      latest_assessment_opened_tab_url = $null
     }
   } else {
     $state = Read-JsonFile $paths.State
-    foreach ($field in @("version", "iteration_counter", "loop_mode", "loop_status", "latest_review", "goal_verdict", "next_action", "stop_reason", "baseline_sent_to_url", "baseline_sent_hash")) {
+    foreach ($field in @("version", "iteration_counter", "loop_mode", "loop_status", "latest_review", "goal_verdict", "next_action", "stop_reason", "baseline_sent_to_url", "baseline_sent_hash", "latest_prompt_target_url", "latest_prompt_opened_tab_url", "latest_assessment_target_url", "latest_assessment_opened_tab_url")) {
       if (-not ($state.PSObject.Properties.Name -contains $field)) {
         $default = $null
         if ($field -eq "version") { $default = 3 }
@@ -753,16 +758,22 @@ function New-ReviewPackage {
 function Complete-PromptSend {
   param(
     [Parameter(Mandatory = $true)][string]$ProjectRoot,
-    [Parameter(Mandatory = $true)][string]$PromptPath
+    [Parameter(Mandatory = $true)][string]$PromptPath,
+    [string]$ActualTabUrl
   )
   $config = Get-Config -ProjectRoot $ProjectRoot
   $state = Get-State $ProjectRoot
   $target = $config.target_chatgpt_conversation_url
   if (-not $target) { $target = $config.target_chatgpt_url }
+  if ($ActualTabUrl -and -not (Test-ChatGptUrl $ActualTabUrl)) {
+    throw "-OpenedTabUrl must be a https://chatgpt.com/... URL."
+  }
   Set-ObjectProperty $state "baseline_sent" $true
   Set-ObjectProperty $state "baseline_sent_to_url" $target
   Set-ObjectProperty $state "baseline_sent_hash" $state.baseline_hash
   Set-ObjectProperty $state "latest_prompt" (Get-RelativePath -Root $ProjectRoot -Path $PromptPath)
+  Set-ObjectProperty $state "latest_prompt_target_url" $target
+  Set-ObjectProperty $state "latest_prompt_opened_tab_url" $ActualTabUrl
   Set-ObjectProperty $state "latest_prompt_sent_at" (Get-Date).ToString("o")
   Set-ObjectProperty $state "next_action" "capture_gpt_pro_review"
   Save-State $ProjectRoot $state
@@ -783,14 +794,15 @@ function Show-PromptHandoff {
   if (-not (Test-ChatGptUrl $target)) { throw "project-config.json needs a https://chatgpt.com/... URL." }
   Write-Host "Open this ChatGPT target with the edge-browser-control skill:" -ForegroundColor Cyan
   Write-Host $target
+  Write-Host "If Edge is open but no ChatGPT conversation page is available, navigate the current or a fresh Edge tab to this URL." -ForegroundColor Yellow
   Write-Host "Paste or send this prompt file:" -ForegroundColor Cyan
   Write-Host $promptPath
   Write-Host "Offline browser dossier only. No local service or public network route is used." -ForegroundColor Green
   if ($MarkSent) {
-    Complete-PromptSend $ProjectRoot $promptPath
+    Complete-PromptSend $ProjectRoot $promptPath $OpenedTabUrl
     Write-Host "Marked prompt as sent." -ForegroundColor Green
   } else {
-    Write-Host "After Edge submits it, rerun SendPrompt with -Send to mark it as sent." -ForegroundColor Yellow
+    Write-Host "After Edge submits it, rerun SendPrompt with -Send to mark it as sent. Add -OpenedTabUrl <actual-chatgpt-tab-url> when available." -ForegroundColor Yellow
   }
 }
 
@@ -968,15 +980,21 @@ $assessment
   Save-State $ProjectRoot $state
   Write-Host "Open this ChatGPT target with the edge-browser-control skill:" -ForegroundColor Cyan
   Write-Host $target
+  Write-Host "If Edge is open but no ChatGPT conversation page is available, navigate the current or a fresh Edge tab to this URL." -ForegroundColor Yellow
   Write-Host "Send this assessment-return prompt:" -ForegroundColor Cyan
   Write-Host $promptPath
   if ($Send) {
+    if ($OpenedTabUrl -and -not (Test-ChatGptUrl $OpenedTabUrl)) {
+      throw "-OpenedTabUrl must be a https://chatgpt.com/... URL."
+    }
     Set-ObjectProperty $state "latest_assessment_sent_at" (Get-Date).ToString("o")
+    Set-ObjectProperty $state "latest_assessment_target_url" $target
+    Set-ObjectProperty $state "latest_assessment_opened_tab_url" $OpenedTabUrl
     Set-ObjectProperty $state "next_action" "capture_gpt_pro_recheck"
     Save-State $ProjectRoot $state
     Write-Host "Marked assessment as sent." -ForegroundColor Green
   } else {
-    Write-Host "After Edge submits it, rerun SendAssessment with -Send to mark it as sent." -ForegroundColor Yellow
+    Write-Host "After Edge submits it, rerun SendAssessment with -Send to mark it as sent. Add -OpenedTabUrl <actual-chatgpt-tab-url> when available." -ForegroundColor Yellow
   }
 }
 
@@ -1062,6 +1080,7 @@ function Show-Status {
     project_name = (Split-Path -Leaf $ProjectRoot)
     review_loop_exists = (Test-Path -LiteralPath $paths.Base)
     transport = if ($config) { $config.transport } else { $null }
+    target_chatgpt_url = if ($config) { if ($config.target_chatgpt_conversation_url) { $config.target_chatgpt_conversation_url } else { $config.target_chatgpt_url } } else { $null }
     loop_mode = if ($state) { $state.loop_mode } else { $null }
     loop_status = if ($state) { $state.loop_status } else { $null }
     round_counter = if ($state) { $state.round_counter } else { 0 }
@@ -1072,6 +1091,10 @@ function Show-Status {
     baseline_sent = if ($state) { $state.baseline_sent } else { $false }
     baseline_sent_to_url = if ($state) { $state.baseline_sent_to_url } else { $null }
     baseline_sent_hash = if ($state) { $state.baseline_sent_hash } else { $null }
+    latest_prompt_target_url = if ($state) { $state.latest_prompt_target_url } else { $null }
+    latest_prompt_opened_tab_url = if ($state) { $state.latest_prompt_opened_tab_url } else { $null }
+    latest_assessment_target_url = if ($state) { $state.latest_assessment_target_url } else { $null }
+    latest_assessment_opened_tab_url = if ($state) { $state.latest_assessment_opened_tab_url } else { $null }
     pending_prompt_count = if ($state -and $state.pending_prompts) { @($state.pending_prompts).Count } else { 0 }
     captured_review_count = if ($state -and $state.captured_reviews) { @($state.captured_reviews).Count } else { 0 }
     goal_verdict = if ($state) { $state.goal_verdict } else { $null }

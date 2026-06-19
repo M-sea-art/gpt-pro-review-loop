@@ -23,6 +23,7 @@ Before operating ChatGPT, read the current `edge-browser-control` skill body and
 - Tab objects are controlled through `tab.playwright`. Do not assume a raw Playwright `page` property exists.
 - If claiming an existing tab fails with a tab grouping or window grouping error, do not retry the same claim in a tight loop.
 - After a claim/grouping failure, reconnect the browser runtime once, list tabs once, and either open a fresh extension tab or mark the browser handoff blocked with the target URL and prompt path.
+- If the browser is open but no ChatGPT conversation tab is present, navigate the current tab or a fresh extension tab to the previously configured target URL printed by `SendPrompt`, `SendAssessment`, or `Status`. This is the normal recovery path, not a blocker.
 - Use the in-app browser only as a last-resort diagnostic or when a logged-in ChatGPT state is not required. It may not share the user's Edge ChatGPT login.
 - If the ChatGPT page already shows a submitted message or a stop-generating control, do not submit the same prompt again. Mark the prompt as sent, then move to low-frequency capture.
 

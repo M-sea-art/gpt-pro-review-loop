@@ -66,7 +66,7 @@ GPT Pro and Codex efficiency review are both `reviewer` values in the same event
    & "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action SendPrompt -Root "<project-root>" -Send
    ```
 
-   If Edge tab claiming or grouping fails, read `references/chatgpt-browser-flow.md` and follow its fallback rules. Do not repeatedly retry the same failing tab claim, and do not use stale browser snippets that expect a raw `.page` property.
+   If Edge opens but no ChatGPT conversation page is present, navigate the current or a fresh Edge tab to the target URL printed by `SendPrompt`, `SendAssessment`, or `Status`. If Edge tab claiming or grouping fails, read `references/chatgpt-browser-flow.md` and follow its fallback rules. Do not repeatedly retry the same failing tab claim, and do not use stale browser snippets that expect a raw `.page` property.
 
 5. After submitting the prompt, automatically wait for GPT Pro to finish with low-frequency Edge checks. Do not require the user to watch the page. When generation completes, read the latest visible GPT Pro reply through Edge and save it as a review event:
 

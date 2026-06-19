@@ -40,6 +40,14 @@ Describe "gpt-pro-review-loop state machine" {
     @($state.captured_reviews).Count | Should -Be 0
     $state.baseline_sent_to_url | Should -Be $null
     $state.baseline_sent_hash | Should -Be $null
+    $state.latest_prompt_target_url | Should -Be $null
+    $state.latest_prompt_opened_tab_url | Should -Be $null
+    $state.latest_assessment_target_url | Should -Be $null
+    $state.latest_assessment_opened_tab_url | Should -Be $null
+
+    $statusText = (& $script:Skill -Action Status -Root $project | Out-String)
+    $statusText | Should -Match "target_chatgpt_url"
+    $statusText | Should -Match "https://chatgpt.com/g/test-project"
   }
 
   It "rejects invalid ChatGPT URLs at init" {
@@ -62,12 +70,36 @@ Describe "gpt-pro-review-loop state machine" {
     $project = New-TestProject "send"
     & $script:Skill -Action Init -Root $project -TargetChatGptUrl "https://chatgpt.com/g/test-project"
     & $script:Skill -Action Prepare -Root $project
-    & $script:Skill -Action SendPrompt -Root $project -Send
+    & $script:Skill -Action SendPrompt -Root $project -Send -OpenedTabUrl "https://chatgpt.com/g/test-project/c/abc123"
 
     $state = Read-State $project
     $state.baseline_sent | Should -BeTrue
     $state.baseline_sent_to_url | Should -Be "https://chatgpt.com/g/test-project"
     $state.baseline_sent_hash | Should -Be $state.baseline_hash
+    $state.latest_prompt_target_url | Should -Be "https://chatgpt.com/g/test-project"
+    $state.latest_prompt_opened_tab_url | Should -Be "https://chatgpt.com/g/test-project/c/abc123"
+  }
+
+  It "records actual ChatGPT tab URL after assessment send" {
+    $project = New-TestProject "assessment-url"
+    & $script:Skill -Action Init -Root $project -TargetChatGptUrl "https://chatgpt.com/g/test-project"
+    & $script:Skill -Action Prepare -Root $project
+    & $script:Skill -Action CaptureReview -Root $project -Reviewer gpt-pro -Phase initial -ReviewText "review"
+    & $script:Skill -Action AssessFeedback -Root $project -GoalVerdict CONTINUE -NextAction "collect_evidence"
+    & $script:Skill -Action SendAssessment -Root $project -Send -OpenedTabUrl "https://chatgpt.com/g/test-project/c/abc123"
+
+    $state = Read-State $project
+    $state.latest_assessment_target_url | Should -Be "https://chatgpt.com/g/test-project"
+    $state.latest_assessment_opened_tab_url | Should -Be "https://chatgpt.com/g/test-project/c/abc123"
+    $state.next_action | Should -Be "capture_gpt_pro_recheck"
+  }
+
+  It "rejects non-ChatGPT opened tab URLs" {
+    $project = New-TestProject "bad-opened-url"
+    & $script:Skill -Action Init -Root $project -TargetChatGptUrl "https://chatgpt.com/g/test-project"
+    & $script:Skill -Action Prepare -Root $project
+
+    { & $script:Skill -Action SendPrompt -Root $project -Send -OpenedTabUrl "https://example.com/not-chatgpt" } | Should -Throw
   }
 
   It "resets baseline when target URL changes" {
