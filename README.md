@@ -41,7 +41,7 @@ Restart the Codex session if the skill metadata is not visible immediately.
 - Codex with this skill installed.
 - A ChatGPT project or conversation URL.
 - Existing Edge login state for ChatGPT.
-- `edge-browser-control` skill for browser submission and reply capture.
+- `edge-browser-control` skill for browser submission and reply capture. This is a skill/instruction set that uses the official Codex Edge/Chrome extension backend; it may not appear as a same-named callable tool.
 - Optional: `codex-efficiency-auditor` skill for process and goal audits.
 
 ## Quick Start
@@ -197,6 +197,7 @@ High-risk actions still pause: account login, CAPTCHA, payment, permission chang
 - Missing baseline: run `Prepare -ForceBaseline` or initialize with the correct ChatGPT URL.
 - Secret scan blocked: inspect the generated `security-scans/*.json`; use `-AllowSensitive` only after explicit authorization.
 - GPT reply is long: save it to a temporary file and pass `-ReviewFile`.
+- `edge-browser-control` not visible as a tool: treat it as a skill, read its `SKILL.md`, and use the official Codex Edge/Chrome extension backend through the bundled browser-client. Do not fall back to a generic Playwright browser or unauthenticated in-app browser for ChatGPT login state.
 - Edge tab grouping error: reconnect the browser runtime once, list tabs once, then open a fresh extension tab or stop with the prompt path. Do not repeatedly retry the same tab claim.
 - Edge opened but GPT page is absent: use the target URL printed by `SendPrompt`, `SendAssessment`, or `Status` and navigate the current or a fresh Edge tab there.
 - In-app browser fallback: use it only as a diagnostic or when ChatGPT login state is not required. Its tab API uses `tab.playwright`, not a raw `.page` property, and it may not share Edge login.

@@ -830,6 +830,7 @@ function Show-PromptHandoff {
   if (-not (Test-ChatGptUrl $target)) { throw "project-config.json needs a https://chatgpt.com/... URL." }
   Write-Host "Open this ChatGPT target with the edge-browser-control skill:" -ForegroundColor Cyan
   Write-Host $target
+  Write-Host "Use the official Codex Edge/Chrome extension backend from edge-browser-control; do not substitute a generic Playwright browser or in-app browser for logged-in ChatGPT." -ForegroundColor Yellow
   Write-Host "If Edge is open but no ChatGPT conversation page is available, navigate the current or a fresh Edge tab to this URL." -ForegroundColor Yellow
   Write-Host "Paste or send this prompt file:" -ForegroundColor Cyan
   Write-Host $promptPath
@@ -1016,6 +1017,7 @@ $assessment
   Save-State $ProjectRoot $state
   Write-Host "Open this ChatGPT target with the edge-browser-control skill:" -ForegroundColor Cyan
   Write-Host $target
+  Write-Host "Use the official Codex Edge/Chrome extension backend from edge-browser-control; do not substitute a generic Playwright browser or in-app browser for logged-in ChatGPT." -ForegroundColor Yellow
   Write-Host "If Edge is open but no ChatGPT conversation page is available, navigate the current or a fresh Edge tab to this URL." -ForegroundColor Yellow
   Write-Host "Send this assessment-return prompt:" -ForegroundColor Cyan
   Write-Host $promptPath

@@ -1,6 +1,8 @@
 # ChatGPT Browser Flow
 
-Use `edge-browser-control` for ChatGPT web UI operations. Do not use Edge remote debugging, CDP helpers, cookie export, browser profile scraping, or account/session data inspection.
+Use `edge-browser-control` for ChatGPT web UI operations. `edge-browser-control` is a Codex skill/instruction set, not necessarily a same-named callable tool. Do not use Edge remote debugging, CDP helpers, cookie export, browser profile scraping, generic Playwright browser launch, unauthenticated in-app browser, or account/session data inspection.
+
+Before browser submission or capture, read `C:\Users\Administrator\.codex\skills\edge-browser-control\SKILL.md`. The expected route is the official Codex Edge/Chrome extension backend, usually reached through the bundled browser-client from `node_repl`; it reuses the user's existing Edge ChatGPT login without reading cookies or session stores.
 
 ## Send Review Prompt
 

@@ -226,4 +226,14 @@ Describe "gpt-pro-review-loop state machine" {
     Set-Content -LiteralPath (Join-Path $project ".env") -Encoding UTF8 -Value "API_KEY=sk-abcdefghijklmnopqrstuvwxyz"
     { & $script:Skill -Action Prepare -Root $project } | Should -Throw
   }
+
+  It "documents Codex extension backend as the required browser route" {
+    $skillText = Get-Content -Raw -LiteralPath (Join-Path $script:Root "SKILL.md")
+    $browserFlow = Get-Content -Raw -LiteralPath (Join-Path $script:Root "references/chatgpt-browser-flow.md")
+
+    $skillText | Should -Match "skill/instruction set"
+    $skillText | Should -Match "Codex Edge/Chrome extension backend"
+    $browserFlow | Should -Match "not necessarily a same-named callable tool"
+    $browserFlow | Should -Match "Do not.*generic Playwright browser"
+  }
 }

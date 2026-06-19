@@ -56,6 +56,8 @@ GPT Pro and Codex efficiency review are both `reviewer` values in the same event
 
 4. Send the prompt through Edge using `edge-browser-control`.
 
+   `edge-browser-control` is a Codex skill/instruction set, not necessarily a same-named callable tool. Do not conclude that Edge control is unavailable just because no direct tool named `edge-browser-control` appears in the active tool list. Read `C:\Users\Administrator\.codex\skills\edge-browser-control\SKILL.md` and use the official Codex Edge/Chrome extension backend described there. Do not substitute a generic Playwright browser, in-app browser, or unauthenticated browser for the user's logged-in Edge ChatGPT state.
+
    First print the target URL and prompt path:
 
    ```powershell
