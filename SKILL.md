@@ -1,13 +1,15 @@
 ---
 name: gpt-pro-review-loop
-description: Run a semi-automatic review loop between Codex and GPT Pro through DevSpace MCP and ChatGPT. Use when the user explicitly asks to send a project, Codex execution report, milestone status, implementation plan, or verification results to GPT Pro for review, then bring GPT Pro feedback back into the local project for Codex to act on. This skill starts only after explicit user authorization because it can expose the current project through a short-lived public tunnel.
+description: Run a semi-automatic review loop between Codex and GPT Pro through DevSpace MCP and ChatGPT. Use when the user explicitly asks to send a project, Codex execution report, milestone status, implementation plan, or verification results to GPT Pro for review, then bring GPT Pro feedback back into the local project for Codex to act on. Also use for Chinese requests such as "GPT Pro 审阅循环", "Pro 审稿循环", "项目送审循环", "AI 复审循环", "Codex-GPT 审阅桥", or "GPT 专家复核". This skill starts only after explicit user authorization because it can expose the current project through a short-lived public tunnel.
 ---
 
 # GPT Pro Review Loop
 
+Chinese aliases: `GPT Pro 审阅循环`, `Pro 审稿循环`, `项目送审循环`, `AI 复审循环`, `Codex-GPT 审阅桥`, `GPT 专家复核`.
+
 ## Core Rule
 
-Use this skill only after an explicit user request such as "use GPT Pro to review this project", "start the review loop", or "$gpt-pro-review-loop". Do not start DevSpace, Cloudflare Tunnel, or browser automation implicitly.
+Use this skill only after an explicit user request such as "use GPT Pro to review this project", "start the review loop", "$gpt-pro-review-loop", "启动 GPT Pro 审阅循环", "把项目送审", or "让 GPT 专家复核". Do not start DevSpace, Cloudflare Tunnel, or browser automation implicitly.
 
 Default v1 policy:
 
