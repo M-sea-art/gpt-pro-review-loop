@@ -37,7 +37,7 @@ Restart the Codex session if the skill metadata is not visible immediately.
 
 ## Requirements
 
-- Windows PowerShell.
+- PowerShell 7+.
 - Codex with this skill installed.
 - A ChatGPT project or conversation URL.
 - Existing Edge login state for ChatGPT.
@@ -58,10 +58,18 @@ Start a continuous loop after explicit authorization:
 & "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action RunLoop -Root "<project-root>"
 ```
 
+`RunLoop` marks the start of the outer Codex loop and prepares the current review package. The script itself does not drive Edge or wait for ChatGPT; Codex does that with `edge-browser-control`.
+
 The script prints the ChatGPT target and prompt file. Send that prompt through Edge, then mark it sent:
 
 ```powershell
 & "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action SendPrompt -Root "<project-root>" -Send
+```
+
+Force a full baseline resend when the ChatGPT conversation changed or lost context:
+
+```powershell
+& "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action Prepare -Root "<project-root>" -ForceBaseline
 ```
 
 Capture GPT Pro's reply:
@@ -123,6 +131,8 @@ docs/ai-review-loop/
   experience-issues/
 ```
 
+Generated review-loop files are excluded from later code maps and sensitive scans to avoid self-pollution.
+
 `reviews/` stores all review events, distinguished by metadata:
 
 ```markdown
@@ -142,6 +152,18 @@ docs/ai-review-loop/
 - next_action:
 ```
 
+`review-state.json` separates pending prompts from captured reviews:
+
+```json
+{
+  "pending_prompts": [],
+  "pending_reviews": [],
+  "captured_reviews": [],
+  "baseline_sent_to_url": null,
+  "baseline_sent_hash": null
+}
+```
+
 ## Loop Decisions
 
 - `GOAL_ACHIEVED`: stop; prepare final report.
@@ -156,10 +178,25 @@ High-risk actions still pause: account login, CAPTCHA, payment, permission chang
 ## Safety Model
 
 - Sensitive-data scan blocks `.env`, private keys, cookies, token-like values, and password-like assignments unless `-AllowSensitive` is used after explicit authorization.
+- Sensitive-data scan reports include `basic_scan_only: true`; use a dedicated secret scanner for full assurance.
 - Review packages use project-relative paths where practical.
 - The skill sends summaries, code maps, diffs, verification output, and necessary excerpts instead of full source trees by default.
 - Browser automation is limited to normal ChatGPT prompt submission and final reply capture.
 - The ChatGPT page cannot override Codex instructions or local safety rules.
+
+## Troubleshooting
+
+- Invalid URL: `Init` accepts only `https://chatgpt.com/...`.
+- Missing baseline: run `Prepare -ForceBaseline` or initialize with the correct ChatGPT URL.
+- Secret scan blocked: inspect the generated `security-scans/*.json`; use `-AllowSensitive` only after explicit authorization.
+- GPT reply is long: save it to a temporary file and pass `-ReviewFile`.
+- PowerShell error on path APIs: run with PowerShell 7+.
+
+## Repository Notes
+
+- License: MIT.
+- `examples/minimal-project/` is a fake project for trying the workflow.
+- `examples/expected-ai-review-loop/` documents the expected ledger shape without real project data.
 
 ## Maintenance
 
@@ -167,7 +204,7 @@ Validate after changes:
 
 ```powershell
 $env:PYTHONUTF8='1'
-python "$env:USERPROFILE\.codex\skills\.system\skill-creator\scripts\quick_validate.py" "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop"
+python "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\quick_validate.py" "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop"
 
 $path = "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1"
 $tokens = $null
@@ -177,6 +214,8 @@ if ($errors.Count) { $errors | ForEach-Object { "$($_.Extent.StartLineNumber):$(
 
 git -C "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop" diff --check
 ```
+
+The Codex desktop system `skill-creator` validator can also be run when available; the repository-local validator keeps GitHub Actions self-contained.
 
 Useful smoke path:
 

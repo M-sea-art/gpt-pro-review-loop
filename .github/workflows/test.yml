@@ -1,0 +1,38 @@
+name: test
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate skill metadata
+        shell: pwsh
+        run: python scripts/quick_validate.py .
+
+      - name: Parse PowerShell
+        shell: pwsh
+        run: |
+          $path = "scripts/gpt_pro_review_loop.ps1"
+          $tokens = $null
+          $errors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path $path), [ref]$tokens, [ref]$errors) | Out-Null
+          if ($errors.Count) {
+            $errors | ForEach-Object { "$($_.Extent.StartLineNumber):$($_.Message)" }
+            exit 1
+          }
+
+      - name: Run Pester
+        shell: pwsh
+        run: |
+          Install-Module Pester -Force -Scope CurrentUser
+          Import-Module Pester -MinimumVersion 5.0 -Force
+          Invoke-Pester -CI
+
+      - name: Diff check
+        shell: pwsh
+        run: git diff --check

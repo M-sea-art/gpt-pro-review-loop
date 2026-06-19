@@ -17,7 +17,7 @@ If the target conversation is missing context or GPT asks for a baseline, rerun 
 
 ## Capture Review
 
-Default to automatic completion detection; do not require the user to say the reply is finished.
+Default to automatic completion detection at the Codex agent layer; do not require the user to say the reply is finished. The PowerShell script records captured text but does not control Edge or wait for ChatGPT by itself.
 
 1. After submitting the prompt, wait 30-60 seconds before the first check.
 2. Use the cheapest `edge-browser-control` observation that answers whether generation is still running:

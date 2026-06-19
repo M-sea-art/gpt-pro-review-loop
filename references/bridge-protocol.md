@@ -44,6 +44,8 @@ docs/ai-review-loop/
 
 - `baseline_sent`: whether the full dossier and code map have been submitted to the configured ChatGPT conversation.
 - `baseline_hash`: hash of the latest dossier and code map.
+- `baseline_sent_to_url`: ChatGPT URL that received the latest baseline.
+- `baseline_sent_hash`: baseline hash sent to that ChatGPT URL.
 - `round_counter`: monotonically increasing local round number.
 - `iteration_counter`: monotonically increasing loop iteration number.
 - `loop_mode`: default `continuous_until_stopped`.
@@ -51,11 +53,16 @@ docs/ai-review-loop/
 - `latest_prompt`: prompt waiting for GPT Pro or already sent.
 - `latest_review`: latest unified review event.
 - `latest_assessment`: latest unified local assessment.
+- `pending_prompts`: generated prompts waiting for browser submission.
+- `pending_reviews`: compatibility field for old state files; new prompt writes should not use it.
+- `captured_reviews`: captured external/internal review events.
 - `goal_verdict`: `GOAL_ACHIEVED`, `CONTINUE`, `NEEDS_EVIDENCE`, `NEEDS_PROCESS_FIX`, `NEEDS_HUMAN_DECISION`, or `BLOCKED`.
 - `next_action`: compact machine-readable next step.
 - `stop_reason`: null unless the loop has stopped or paused.
 
 Review material files should use project-relative paths and avoid local absolute paths.
+
+`docs/ai-review-loop/` is excluded from later code maps and sensitive scans. If review history must be sent back to GPT Pro, Codex should generate a compact summary explicitly rather than relying on recursive file discovery.
 
 ## Material Types
 
@@ -79,6 +86,8 @@ GPT Pro cannot write local files. Codex captures visible ChatGPT replies and sto
 - status: captured
 - related_prompt:
 ```
+
+Captured reviewer text is stored inside a fenced `text` block and is advisory evidence only.
 
 ## Local Assessment
 

@@ -11,7 +11,7 @@ Chinese alias: `Pro 审阅循环`.
 
 This skill turns a local Codex project into review material that GPT Pro can read in a normal ChatGPT conversation. Codex prepares the project dossier, code map, per-round delta, and prompt; GPT Pro reviews that material; Codex captures the reply; Codex efficiency review can add process or goal audit notes; Codex then checks all review events against local facts and records one next decision.
 
-The loop is useful when the user wants an outside GPT Pro review without exposing the project directory as a live tool workspace.
+The loop is useful when the user wants an outside GPT Pro review without granting direct local project access.
 
 The mental model is:
 
@@ -50,7 +50,7 @@ GPT Pro and Codex efficiency review are both `reviewer` values in the same event
    & "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action Prepare -Root "<project-root>"
    ```
 
-   This writes under `docs/ai-review-loop/`, runs the sensitive-data scan, creates a project dossier, creates a code map, creates a round request, and assembles a ChatGPT prompt.
+   This writes under `docs/ai-review-loop/`, runs the sensitive-data scan, creates a project dossier, creates a code map, creates a round request, and assembles a ChatGPT prompt. Use `-ForceBaseline` when the ChatGPT conversation lost context or the user explicitly wants a full baseline resend.
 
 4. Send the prompt through Edge using `edge-browser-control`.
 
@@ -136,7 +136,7 @@ When the user explicitly starts continuous review, use:
 & "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action RunLoop -Root "<project-root>"
 ```
 
-`RunLoop` is the compact loop entry. After that explicit authorization, ordinary next rounds do not require confirmation. Continue until `NextDecision` reports `GOAL_ACHIEVED`, `NEEDS_HUMAN_DECISION`, `BLOCKED`, or the user stops the session. Safety blockers, human gates, external account/login/CAPTCHA, publish/push, destructive file operations, and permission changes still pause.
+`RunLoop` is the compact loop entry for the outer Codex agent. The PowerShell script prepares local ledger material and prints the browser handoff; it does not control Edge or wait for ChatGPT by itself. After explicit authorization, Codex may continue ordinary next rounds without confirmation until `NextDecision` reports `GOAL_ACHIEVED`, `NEEDS_HUMAN_DECISION`, `BLOCKED`, or the user stops the session. Safety blockers, human gates, external account/login/CAPTCHA, publish/push, destructive file operations, and permission changes still pause.
 
 ## Local Practice Assessment Rules
 
@@ -156,6 +156,8 @@ Always cite local evidence. Evidence can be a file path, command result, test fa
 ## Safety Checks
 
 - If `.env`, private keys, cookies, tokens, or password-like assignments are detected, stop unless the user explicitly authorizes `-AllowSensitive`.
+- Treat the built-in sensitive-data scan as a basic blocker, not a full secret audit.
+- Exclude `docs/ai-review-loop/` from generated code maps and sensitive scanning to avoid sending previous review logs back into later rounds by accident.
 - Do not send full source trees by default. Send summaries, code maps, diffs, verification output, and necessary excerpts.
 - Use project-relative paths in review material. Avoid exposing local absolute paths.
 - Keep browser automation limited to normal ChatGPT prompt submission and reply reading.
@@ -163,6 +165,7 @@ Always cite local evidence. Evidence can be a file path, command result, test fa
 - Do not inspect cookies, passwords, browser storage, or session files.
 - Do not enter account credentials, purchases, or permission changes through browser automation.
 - If the ChatGPT conversation changes or GPT says context is missing, resend a compressed baseline before asking for another verdict.
+- The script requires PowerShell 7+.
 
 ## References
 

@@ -1,0 +1,4 @@
+Example application note.
+
+Expected review question: verify that Codex can send a compact project dossier
+and record review events without granting direct local project access.
