@@ -1308,3 +1308,5 @@ switch ($Action) {
     }
   }
 }
+
+$global:LASTEXITCODE = 0
