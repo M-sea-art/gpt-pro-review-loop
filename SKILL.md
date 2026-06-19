@@ -66,13 +66,15 @@ Codex owns all local reads, writes, tests, and final execution decisions. GPT Pr
    & "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action SendPrompt -Root "<project-root>" -Send
    ```
 
-5. When GPT Pro replies in ChatGPT, read the visible reply through Edge and save it locally:
+5. After submitting the prompt, automatically wait for GPT Pro to finish with low-frequency Edge checks. Do not require the user to watch the page. When generation completes, read the latest visible GPT Pro reply through Edge and save it locally:
 
    ```powershell
    & "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action CaptureFeedback -Root "<project-root>" -FeedbackText "<GPT reply>"
    ```
 
    For long replies, save the reply to a temporary file and pass `-FeedbackFile`.
+
+   Completion detection should be conservative: check for the ChatGPT stop-generating control no more often than every 30-60 seconds, avoid full-page dumps during the wait, and capture only the final assistant reply after the stop control disappears. Hand off to the user only for login, CAPTCHA, permission, or account-security blockers.
 
 6. Assess GPT Pro feedback against local reality before acting:
 
@@ -127,6 +129,7 @@ Always cite local evidence. Evidence can be a file path, command result, test fa
 - Do not send full source trees by default. Send summaries, code maps, diffs, verification output, and necessary excerpts.
 - Use project-relative paths in review material. Avoid exposing local absolute paths.
 - Keep browser automation limited to normal ChatGPT prompt submission and reply reading.
+- Use low-frequency completion checks after submission; do not high-frequency poll or repeatedly dump page DOM/screenshots.
 - Do not inspect cookies, passwords, browser storage, or session files.
 - Do not enter account credentials, purchases, or permission changes through browser automation.
 - If the ChatGPT conversation changes or GPT says context is missing, resend a compressed baseline before asking for another verdict.

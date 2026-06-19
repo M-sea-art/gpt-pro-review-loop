@@ -17,15 +17,25 @@ If the target conversation is missing context or GPT asks for a baseline, rerun 
 
 ## Capture GPT Feedback
 
-1. Use `edge-browser-control` to inspect the ChatGPT reply.
-2. Copy only the GPT Pro review text, not browser metadata or private account details.
-3. Save it with:
+Default to automatic completion detection; do not require the user to say the reply is finished.
+
+1. After submitting the prompt, wait 30-60 seconds before the first check.
+2. Use the cheapest `edge-browser-control` observation that answers whether generation is still running:
+   - Prefer checking for the visible stop-generating button/control.
+   - Do not repeatedly dump the full DOM.
+   - Do not take repeated screenshots unless visual state is ambiguous.
+3. If the stop control is still visible, wait another 30-60 seconds and check again.
+4. When the stop control disappears and the composer/send controls are stable, extract only the latest assistant reply.
+5. Copy only the GPT Pro review text, not browser metadata or private account details.
+6. Save it with:
 
    ```powershell
    & "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action CaptureFeedback -Root "<project-root>" -FeedbackText "<GPT reply>"
    ```
 
    For long replies, write the reply to a temporary file and pass `-FeedbackFile`.
+
+If generation exceeds a practical wait window, keep checking at low frequency and report status briefly. Hand off only for login, CAPTCHA, permission prompts, or account-security blockers.
 
 ## Return Codex Local Assessment
 
