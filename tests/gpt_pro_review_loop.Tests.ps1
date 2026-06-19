@@ -51,6 +51,9 @@ Describe "gpt-pro-review-loop state machine" {
     $state.PSObject.Properties.Name | Should -Contain "should_send_to_gpt"
     $state.PSObject.Properties.Name | Should -Contain "active_goal_scope"
     $state.PSObject.Properties.Name | Should -Contain "completion_guard_status"
+    $state.PSObject.Properties.Name | Should -Contain "project_blocker_queue"
+    $state.PSObject.Properties.Name | Should -Contain "current_blocker_id"
+    $state.PSObject.Properties.Name | Should -Contain "stalled_local_action_count"
     @($state.pending_prompts).Count | Should -Be 0
     @($state.captured_reviews).Count | Should -Be 0
     $state.baseline_sent_to_url | Should -Be $null
@@ -72,6 +75,9 @@ Describe "gpt-pro-review-loop state machine" {
     $state.completion_guard_status | Should -Be "not_evaluated"
     $state.goal_achieved_is_terminal | Should -BeFalse
     $state.gpt_courtesy_footer_sent_count | Should -Be 0
+    @($state.project_blocker_queue).Count | Should -Be 0
+    $state.current_blocker_id | Should -Be $null
+    $state.stalled_local_action_count | Should -Be 0
 
     $statusText = (& $script:Skill -Action Status -Root $project | Out-String)
     $statusText | Should -Match "target_chatgpt_url"
@@ -345,10 +351,13 @@ Describe "gpt-pro-review-loop state machine" {
     $state.completion_guard_status | Should -Be "blocked_by_project_goal"
     $state.goal_achieved_is_terminal | Should -BeFalse
     @($state.blocking_gates).Count | Should -BeGreaterThan 0
-    $state.next_action | Should -Be "resolve_project_completion_blockers"
+    $state.next_action | Should -Be "collect_evidence_for_demo_readiness_not_ready"
     $state.should_send_to_gpt | Should -BeFalse
     $state.send_reason | Should -Be "local_only_continue"
-    $state.local_only_next_action | Should -Be "resolve_project_completion_blockers"
+    $state.local_only_next_action | Should -Be "collect_evidence_for_demo_readiness_not_ready"
+    @($state.project_blocker_queue).Count | Should -BeGreaterThan 0
+    $state.current_blocker_category | Should -Be "needs_evidence"
+    Test-Path -LiteralPath (Join-Path $project "docs/ai-review-loop/project-goal-plan.md") | Should -BeTrue
   }
 
   It "migrates stale complete state back to running when project blockers exist" {
@@ -369,8 +378,81 @@ Describe "gpt-pro-review-loop state machine" {
     $state.loop_status | Should -Be "running"
     $state.stop_reason | Should -Be $null
     $state.completion_guard_status | Should -Be "blocked_by_project_goal"
-    $state.next_action | Should -Be "resolve_project_completion_blockers"
+    $state.next_action | Should -Be "collect_evidence_for_not_complete_v_p0_002_remains"
     $state.should_send_to_gpt | Should -BeFalse
+  }
+
+  It "builds a categorized project blocker queue and goal plan" {
+    $project = New-TestProject "blocker-queue"
+    New-Item -ItemType Directory -Path (Join-Path $project "docs/project") -Force | Out-Null
+    Set-Content -LiteralPath (Join-Path $project "docs/project/FPV0_COMPLETION_ROADMAP.md") -Encoding UTF8 -Value @"
+# Roadmap
+
+| Big World runtime | Not implemented |
+| Demo readiness | `NOT_READY` |
+| Remaining P0 Before Human Playtest | Manual visual acceptance |
+| Remote Sync Path | separately authorized |
+"@
+    & $script:Skill -Action Init -Root $project -TargetChatGptUrl "https://chatgpt.com/g/test-project"
+    & $script:Skill -Action BuildProjectGoalPlan -Root $project
+
+    $state = Read-State $project
+    @($state.project_blocker_queue).Count | Should -BeGreaterThan 0
+    @($state.project_blocker_queue | Where-Object { $_.category -eq "explicit_authorization_required" }).Count | Should -BeGreaterThan 0
+    @($state.project_blocker_queue | Where-Object { $_.category -eq "needs_evidence" }).Count | Should -BeGreaterThan 0
+    @($state.project_blocker_queue | Where-Object { $_.category -eq "human_gate" }).Count | Should -BeGreaterThan 0
+    Test-Path -LiteralPath (Join-Path $project "docs/ai-review-loop/project-goal-plan.md") | Should -BeTrue
+    @(Get-ChildItem -LiteralPath (Join-Path $project "docs/ai-review-loop/loop-runs") -Filter "*project-goal-plan.json").Count | Should -BeGreaterThan 0
+  }
+
+  It "selects the next local action from the blocker queue" {
+    $project = New-TestProject "next-local-action"
+    New-Item -ItemType Directory -Path (Join-Path $project "docs/project") -Force | Out-Null
+    Set-Content -LiteralPath (Join-Path $project "docs/project/FPV0_COMPLETION_ROADMAP.md") -Encoding UTF8 -Value 'Demo readiness: `NOT_READY`'
+    & $script:Skill -Action Init -Root $project -TargetChatGptUrl "https://chatgpt.com/g/test-project"
+    & $script:Skill -Action BuildProjectGoalPlan -Root $project
+    & $script:Skill -Action NextLocalAction -Root $project
+
+    $state = Read-State $project
+    $state.local_only_next_action | Should -Be "collect_evidence_for_demo_readiness_not_ready"
+    $state.should_send_to_gpt | Should -BeFalse
+    $state.send_reason | Should -Be "local_only_continue"
+  }
+
+  It "pauses when only human or explicit authorization blockers remain" {
+    $project = New-TestProject "human-only"
+    New-Item -ItemType Directory -Path (Join-Path $project "docs/project") -Force | Out-Null
+    Set-Content -LiteralPath (Join-Path $project "docs/project/FPV0_COMPLETION_ROADMAP.md") -Encoding UTF8 -Value "Human Gate: manual visual signoff required"
+    & $script:Skill -Action Init -Root $project -TargetChatGptUrl "https://chatgpt.com/g/test-project"
+    & $script:Skill -Action Prepare -Root $project
+    & $script:Skill -Action CaptureReview -Root $project -Reviewer codex-efficiency-auditor -Phase goal-audit -ReviewText "done"
+    & $script:Skill -Action AssessFeedback -Root $project -GoalVerdict GOAL_ACHIEVED -NextAction "final_report"
+    & $script:Skill -Action NextDecision -Root $project
+
+    $state = Read-State $project
+    $state.loop_status | Should -Be "paused"
+    $state.goal_verdict | Should -Be "NEEDS_HUMAN_DECISION"
+    $state.stop_reason | Should -Be "human_or_authorization_required"
+    $state.next_action | Should -Be "request_human_decision_for_project_blockers"
+    $state.should_send_to_gpt | Should -BeFalse
+  }
+
+  It "marks repeated local-only actions without artifacts as a process fix" {
+    $project = New-TestProject "stalled-local"
+    New-Item -ItemType Directory -Path (Join-Path $project "docs/project") -Force | Out-Null
+    Set-Content -LiteralPath (Join-Path $project "docs/project/FPV0_COMPLETION_ROADMAP.md") -Encoding UTF8 -Value 'Demo readiness: `NOT_READY`'
+    & $script:Skill -Action Init -Root $project -TargetChatGptUrl "https://chatgpt.com/g/test-project"
+    & $script:Skill -Action Prepare -Root $project
+    & $script:Skill -Action CaptureReview -Root $project -Reviewer codex-efficiency-auditor -Phase goal-audit -ReviewText "done"
+    & $script:Skill -Action AssessFeedback -Root $project -GoalVerdict GOAL_ACHIEVED -NextAction "final_report"
+    & $script:Skill -Action NextDecision -Root $project
+    & $script:Skill -Action NextDecision -Root $project
+    & $script:Skill -Action NextDecision -Root $project
+
+    $state = Read-State $project
+    $state.goal_verdict | Should -Be "NEEDS_PROCESS_FIX"
+    $state.local_only_next_action | Should -Be "split_or_update_project_goal_plan"
+    $state.stalled_local_action_count | Should -BeGreaterOrEqual 2
   }
 
   It "requires continuation when next decision is still running" {

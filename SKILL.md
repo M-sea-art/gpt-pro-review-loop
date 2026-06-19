@@ -17,6 +17,8 @@ Default quota mode is `economy`: keep full evidence in the project ledger, but s
 
 Default terminal goal scope is `project_total`. A task, milestone, or test-line can be achieved without ending the continuous loop; Codex must continue upward until the project-total completion guard passes, the user stops the session, or a hard blocker appears.
 
+When project-total blockers remain, the skill normalizes them into a queue and chooses a concrete `local_only_next_action`. `should_send_to_gpt=false` means execute that local action; it is not a completion signal.
+
 The mental model is:
 
 ```text
@@ -138,13 +140,22 @@ GPT Pro and Codex efficiency review are both `reviewer` values in the same event
    & "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action NextDecision -Root "<project-root>"
    ```
 
-   `GOAL_ACHIEVED` stops only when the active goal scope is `project_total` and the completion guard finds no project blockers. For `task`, `milestone`, or `test_line`, `GOAL_ACHIEVED` becomes `SUBGOAL_ACHIEVED`: keep `loop_status=running`, set `next_action=assess_parent_project_goal`, and continue the loop. If project documents, gates, verifier output, roadmap items, or supervisor state still say `NOT_COMPLETE`, `NOT_READY`, or equivalent, keep the loop running with `next_action=resolve_project_completion_blockers`. `CONTINUE`, `NEEDS_EVIDENCE`, and `NEEDS_PROCESS_FIX` are not completion states inside an explicitly started loop; they require Codex to execute `next_action`, prepare the next review event, and keep cycling unless the user stops the session or a hard blocker appears. `NEEDS_HUMAN_DECISION` and `BLOCKED` pause.
+   `GOAL_ACHIEVED` stops only when the active goal scope is `project_total` and the completion guard finds no project blockers. For `task`, `milestone`, or `test_line`, `GOAL_ACHIEVED` becomes `SUBGOAL_ACHIEVED`: keep `loop_status=running`, set `next_action=assess_parent_project_goal`, and continue the loop. If project documents, gates, verifier output, roadmap items, or supervisor state still say `NOT_COMPLETE`, `NOT_READY`, or equivalent, build `project_blocker_queue`, write `project-goal-plan.md`, and continue with the selected `local_only_next_action`. `CONTINUE`, `NEEDS_EVIDENCE`, and `NEEDS_PROCESS_FIX` are not completion states inside an explicitly started loop; they require Codex to execute `next_action`, prepare the next review event, and keep cycling unless the user stops the session or a hard blocker appears. `NEEDS_HUMAN_DECISION` and `BLOCKED` pause.
 
     `NextDecision` also records whether the next iteration should be sent to GPT:
 
     - `should_send_to_gpt=false`: continue local execution or evidence collection first; do not send an empty repeat prompt.
     - `should_send_to_gpt=true`: send because there is a new external-review question, a recheck request, new evidence, or `-ForceExternalReview`.
     - `send_reason` and `local_only_next_action` explain the choice.
+
+   For explicit local planning without a full review round:
+
+   ```powershell
+   & "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action BuildProjectGoalPlan -Root "<project-root>"
+   & "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action NextLocalAction -Root "<project-root>"
+   ```
+
+   Execute `local_only_next_action` before sending GPT another prompt. If only Human Gate, protected scope, or explicit authorization blockers remain, pause for the user.
 
 10. Record project-local experience when the round produced a reusable lesson:
 
@@ -202,6 +213,7 @@ Always cite local evidence. Evidence can be a file path, command result, test fa
 - Exclude `docs/ai-review-loop/` from generated code maps and sensitive scanning to avoid sending previous review logs back into later rounds by accident.
 - Do not send full source trees by default. Send summaries, code maps, diffs, verification output, and necessary excerpts.
 - Do not send GPT another prompt unless `should_send_to_gpt=true`, `-ForceExternalReview` is used, or a new external-review question has appeared.
+- When `should_send_to_gpt=false`, keep working locally on `local_only_next_action`; do not final unless the loop is paused, blocked, or project-total complete.
 - In continuous loops, the second and later GPT-facing prompts automatically append `谢谢你的工作，GPT朋友。`; this is courtesy text only and must not affect local verdicts or gates.
 - Reuse `runtime_brief` inside one loop iteration instead of rereading full prompts, full state JSON, full gate docs, or full audit text.
 - Use project-relative paths in review material. Avoid exposing local absolute paths.

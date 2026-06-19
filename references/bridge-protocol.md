@@ -19,6 +19,7 @@ docs/ai-review-loop/
   assessments/
   loop-runs/
   security-scans/
+  project-goal-plan.md
   experience-log.md
   experience-issues/
 ```
@@ -89,6 +90,12 @@ docs/ai-review-loop/
 - `project_goal_verdict`: latest total-project result, usually `CONTINUE` until the completion guard passes.
 - `completion_guard_status`: `not_evaluated`, `project_goal_pass`, `subgoal_achieved_not_terminal`, `blocked_by_project_goal`, or `not_goal_achieved`.
 - `blocking_gates`: compact blocker strings from project goal context.
+- `project_blocker_queue`: normalized blocker entries with `id`, `source`, `raw_text`, `category`, `scope`, `status`, `action_kind`, and `recommended_next_action`.
+- `current_blocker_id`: selected blocker id for the current local step.
+- `current_blocker_category`: selected blocker category.
+- `blocker_queue_updated_at`: timestamp of the latest queue rebuild.
+- `local_progress_artifacts`: optional local artifact paths created while executing local-only steps.
+- `stalled_local_action_count`: repeated local-only action count without new artifacts.
 - `goal_context_sources`: project files used to build the latest goal context.
 - `goal_achieved_is_terminal`: true only when a `GOAL_ACHIEVED` decision is allowed to stop the loop.
 - `gpt_courtesy_footer_sent_count`: count of GPT-facing prompts that included the configured courtesy footer.
@@ -110,6 +117,7 @@ Review material files should use project-relative paths and avoid local absolute
 - `reviews/`: all external and internal review events. GPT Pro initial review, GPT Pro recheck, Codex efficiency process audit, and Codex efficiency goal audit all live here.
 - `assessments/`: local-practice and combined-next-decision assessments.
 - `loop-runs/`: small JSON records emitted by `NextDecision` and `runtime-brief.json` snapshots for low-quota reuse.
+- `project-goal-plan.md`: compact local plan generated from `project_blocker_queue`.
 
 ## Review Capture
 
@@ -168,6 +176,17 @@ Terminal completion requires:
 The goal context is a compact summary of files such as `AGENTS.md`, acceptance documents, human-gate notes, supervisor state, completion reports, roadmap files, and verifier output. If those sources contain `NOT_COMPLETE`, `NOT_READY`, failed gates, incomplete roadmap items, or equivalent blocker language, `NextDecision` must keep the loop running even if a review event says a local target is accepted.
 
 When a non-terminal scope reaches `GOAL_ACHIEVED`, `NextDecision` records the subgoal result, sets `project_goal_verdict: CONTINUE`, and moves to `next_action: assess_parent_project_goal`.
+
+When project-total blockers remain, the guard becomes a local progress engine:
+
+- `blocking_gates` is normalized into `project_blocker_queue`.
+- `project-goal-plan.md` and a `loop-runs/*-project-goal-plan.json` snapshot are written.
+- The next open blocker is selected in this priority order: `local_fixable`, `needs_evidence`, `needs_external_review`, `human_gate`, `explicit_authorization_required`, `future_scope`.
+- For local blockers, `should_send_to_gpt: false` and `local_only_next_action` is set to the blocker recommendation.
+- If only `human_gate`, `explicit_authorization_required`, or `future_scope` blockers remain, the loop pauses with `NEEDS_HUMAN_DECISION`.
+- If the same local action repeats twice without new `local_progress_artifacts`, the loop marks `NEEDS_PROCESS_FIX`.
+
+Blocker text must preserve governance phrases such as `NOT_READY`, `NOT_HUMAN_VISUAL_SIGNOFF`, and `NOT_RUNTIME_APPROVED`; do not rewrite accurate project limits to satisfy the guard.
 
 ## GPT Courtesy Footer
 

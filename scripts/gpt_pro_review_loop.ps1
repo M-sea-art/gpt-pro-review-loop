@@ -1,6 +1,6 @@
 [CmdletBinding()]
 param(
-  [ValidateSet("Init", "Prepare", "PrepareCompactReview", "PreflightBrowser", "SendPrompt", "CaptureFeedback", "CaptureReview", "WaitFeedback", "AssessFeedback", "SendAssessment", "NextDecision", "RunLoop", "RecordExperience", "Status", "Run")]
+  [ValidateSet("Init", "Prepare", "PrepareCompactReview", "PreflightBrowser", "SendPrompt", "CaptureFeedback", "CaptureReview", "WaitFeedback", "AssessFeedback", "SendAssessment", "NextDecision", "BuildProjectGoalPlan", "NextLocalAction", "RunLoop", "RecordExperience", "Status", "Run")]
   [string]$Action = "Run",
   [string]$Root,
   [string]$TargetChatGptUrl,
@@ -122,6 +122,7 @@ function Get-ReviewPaths {
     Assessments = Join-Path $base "assessments"
     LoopRuns = Join-Path $base "loop-runs"
     SecurityScans = Join-Path $base "security-scans"
+    ProjectGoalPlan = Join-Path $base "project-goal-plan.md"
     ExperienceLog = Join-Path $base "experience-log.md"
     ExperienceIssues = Join-Path $base "experience-issues"
   }
@@ -276,6 +277,256 @@ function Add-PromptFooterWithinLimit {
   return $Prompt + $Footer
 }
 
+function ConvertTo-SafeActionName {
+  param([string]$Text)
+  $value = if ($Text) { $Text.ToLowerInvariant() } else { "project_blocker" }
+  $value = $value -replace "[^a-z0-9]+", "_"
+  $value = $value.Trim("_")
+  if (-not $value) { $value = "project_blocker" }
+  if ($value.Length -gt 72) { $value = $value.Substring(0, 72).Trim("_") }
+  return $value
+}
+
+function Get-BlockerClassification {
+  param(
+    [Parameter(Mandatory = $true)][string]$RawText,
+    [string]$Source
+  )
+  $text = "$Source $RawText"
+  $lower = $text.ToLowerInvariant()
+  $category = "needs_evidence"
+  $scope = "project_total"
+  $actionKind = "collect_evidence"
+  $basis = $RawText
+
+  if ($lower -match "human gate|human visual|human signoff|human decision|protected issue|merge|publish|remote|pr workflow|manual visual") {
+    $category = "human_gate"
+    $actionKind = "request_human_decision"
+  } elseif ($lower -match "big world|sect battle|runtime|save|rng|gameflow|worldstate|contentdb|autoload|main\.gd|main\.tscn|project\.godot|binary|font|image|audio|core systems?") {
+    $category = "explicit_authorization_required"
+    $actionKind = "draft_authorization_request"
+  } elseif ($lower -match "future|separately authorized|specs-only") {
+    $category = "future_scope"
+    $actionKind = "defer_future_scope"
+  } elseif ($lower -match "gpt|external review|recheck") {
+    $category = "needs_external_review"
+    $actionKind = "prepare_external_review_question"
+  } elseif ($lower -match "first consequence|20-second|comprehension|trace readability|content density|local playtest|playtest evidence|screenshot|contact sheet|verification|evidence") {
+    $category = "local_fixable"
+    $actionKind = "collect_or_improve_local_evidence"
+  } elseif ($lower -match "not_ready|not complete|not_complete|remaining p0|remaining p1|failed|failing") {
+    $category = "needs_evidence"
+    $actionKind = "collect_evidence"
+  }
+
+  if ($lower -match "test-line|test line|automated beta") {
+    $scope = "test_line"
+  }
+  if ($lower -match "project_total|demo readiness|remaining p0|remaining p1|big world|sect battle") {
+    $scope = "project_total"
+  }
+
+  $actionBase = switch ($actionKind) {
+    "request_human_decision" { "request_human_decision_for" }
+    "draft_authorization_request" { "draft_authorization_request_for" }
+    "defer_future_scope" { "defer_future_scope_for" }
+    "prepare_external_review_question" { "prepare_external_review_question_for" }
+    "collect_or_improve_local_evidence" { "collect_local_evidence_for" }
+    default { "collect_evidence_for" }
+  }
+  $recommended = "{0}_{1}" -f $actionBase, (ConvertTo-SafeActionName $basis)
+  return [pscustomobject]@{
+    category = $category
+    scope = $scope
+    action_kind = $actionKind
+    recommended_next_action = $recommended
+  }
+}
+
+function New-ProjectBlockerQueue {
+  param(
+    [AllowEmptyCollection()][string[]]$Blockers = @()
+  )
+  $items = New-Object System.Collections.Generic.List[object]
+  $index = 1
+  foreach ($blocker in @($Blockers | Where-Object { $_ })) {
+    $source = "(unknown)"
+    $raw = [string]$blocker
+    if ($raw -match "^(?<source>[^:]+):\s*(?<text>.+)$") {
+      $source = $Matches.source.Trim()
+      $rawText = $Matches.text.Trim()
+    } else {
+      $rawText = $raw.Trim()
+    }
+    $classification = Get-BlockerClassification -RawText $rawText -Source $source
+    $id = "PB-{0:000}" -f $index
+    $items.Add([pscustomobject]@{
+        id = $id
+        source = $source
+        raw_text = $rawText
+        category = $classification.category
+        scope = $classification.scope
+        status = "open"
+        action_kind = $classification.action_kind
+        recommended_next_action = $classification.recommended_next_action
+      }) | Out-Null
+    $index += 1
+  }
+  return @($items.ToArray())
+}
+
+function Select-NextProjectBlocker {
+  param([object[]]$Queue)
+  $priority = @("local_fixable", "needs_evidence", "needs_external_review", "human_gate", "explicit_authorization_required", "future_scope")
+  foreach ($category in $priority) {
+    $candidate = @($Queue | Where-Object { $_.status -eq "open" -and $_.category -eq $category } | Select-Object -First 1)
+    if ($candidate.Count -gt 0) { return $candidate[0] }
+  }
+  return $null
+}
+
+function Test-QueueHasOnlyHumanOrAuthorization {
+  param([object[]]$Queue)
+  $open = @($Queue | Where-Object { $_.status -eq "open" })
+  if ($open.Count -eq 0) { return $false }
+  $auto = @($open | Where-Object { $_.category -in @("local_fixable", "needs_evidence", "needs_external_review") })
+  return ($auto.Count -eq 0)
+}
+
+function Write-ProjectGoalPlan {
+  param(
+    [Parameter(Mandatory = $true)][string]$ProjectRoot,
+    [Parameter(Mandatory = $true)]$State
+  )
+  $paths = Get-ReviewPaths -ProjectRoot $ProjectRoot
+  $queue = @($State.project_blocker_queue)
+  $lines = New-Object System.Collections.Generic.List[string]
+  $lines.Add("# Project Goal Plan") | Out-Null
+  $lines.Add("") | Out-Null
+  $lines.Add("- created_at: $(Get-Date -Format o)") | Out-Null
+  $lines.Add("- active_goal_scope: $($State.active_goal_scope)") | Out-Null
+  $lines.Add("- terminal_goal_scope: $($State.terminal_goal_scope)") | Out-Null
+  $lines.Add("- completion_guard_status: $($State.completion_guard_status)") | Out-Null
+  $lines.Add("- next_action: $($State.next_action)") | Out-Null
+  $lines.Add("- local_only_next_action: $($State.local_only_next_action)") | Out-Null
+  $lines.Add("") | Out-Null
+  $lines.Add("## Goal Matrix") | Out-Null
+  $lines.Add("") | Out-Null
+  $lines.Add("| Category | Count | Meaning |") | Out-Null
+  $lines.Add("|---|---:|---|") | Out-Null
+  foreach ($category in @("local_fixable", "needs_evidence", "needs_external_review", "human_gate", "explicit_authorization_required", "future_scope")) {
+    $count = @($queue | Where-Object { $_.category -eq $category }).Count
+    $meaning = switch ($category) {
+      "local_fixable" { "Codex can progress locally." }
+      "needs_evidence" { "Codex should gather or update proof." }
+      "needs_external_review" { "Send GPT only after a narrow new question exists." }
+      "human_gate" { "Pause for explicit human decision." }
+      "explicit_authorization_required" { "Pause before changing protected scope or systems." }
+      default { "Keep out of current completion claim." }
+    }
+    $lines.Add("| $category | $count | $meaning |") | Out-Null
+  }
+  $lines.Add("") | Out-Null
+  $lines.Add("## Blocker Queue") | Out-Null
+  $lines.Add("") | Out-Null
+  $lines.Add("| ID | Category | Scope | Status | Recommended next action | Source | Raw text |") | Out-Null
+  $lines.Add("|---|---|---|---|---|---|---|") | Out-Null
+  foreach ($item in $queue) {
+    $raw = ([string]$item.raw_text).Replace("|", "\|")
+    $source = ([string]$item.source).Replace("|", "\|")
+    $lines.Add("| $($item.id) | $($item.category) | $($item.scope) | $($item.status) | $($item.recommended_next_action) | $source | $raw |") | Out-Null
+  }
+  if ($queue.Count -eq 0) {
+    $lines.Add("") | Out-Null
+    $lines.Add("(no open project blockers detected)") | Out-Null
+  }
+  $content = $lines.ToArray() -join [Environment]::NewLine
+  Set-Content -LiteralPath $paths.ProjectGoalPlan -Encoding UTF8 -Value $content
+  $jsonPath = Join-Path $paths.LoopRuns ("{0}-project-goal-plan.json" -f (Get-Date -Format "yyyyMMdd-HHmmss-fff"))
+  $json = [ordered]@{
+    created_at = (Get-Date).ToString("o")
+    project_goal_plan = (Get-RelativePath -Root $ProjectRoot -Path $paths.ProjectGoalPlan)
+    project_blocker_queue = $queue
+    current_blocker_id = $State.current_blocker_id
+    current_blocker_category = $State.current_blocker_category
+    local_only_next_action = $State.local_only_next_action
+  }
+  ConvertTo-JsonFile $json $jsonPath
+  return [pscustomobject]@{
+    markdown = $paths.ProjectGoalPlan
+    json = $jsonPath
+  }
+}
+
+function Update-ProjectBlockerQueue {
+  param(
+    [Parameter(Mandatory = $true)][string]$ProjectRoot,
+    [Parameter(Mandatory = $true)]$State,
+    [AllowEmptyCollection()][string[]]$Blockers = @()
+  )
+  $queue = New-ProjectBlockerQueue -Blockers $Blockers
+  Set-ObjectProperty $State "project_blocker_queue" @($queue)
+  Set-ObjectProperty $State "blocker_queue_updated_at" (Get-Date).ToString("o")
+  $next = Select-NextProjectBlocker -Queue $queue
+  if ($next) {
+    Set-ObjectProperty $State "current_blocker_id" $next.id
+    Set-ObjectProperty $State "current_blocker_category" $next.category
+  } else {
+    Set-ObjectProperty $State "current_blocker_id" $null
+    Set-ObjectProperty $State "current_blocker_category" $null
+  }
+  return $next
+}
+
+function Invoke-NextLocalAction {
+  param([Parameter(Mandatory = $true)][string]$ProjectRoot)
+  $state = Get-State -ProjectRoot $ProjectRoot
+  $queue = @($state.project_blocker_queue)
+  if ($queue.Count -eq 0 -and $state.blocking_gates) {
+    $queue = New-ProjectBlockerQueue -Blockers @($state.blocking_gates)
+    Set-ObjectProperty $state "project_blocker_queue" @($queue)
+    Set-ObjectProperty $state "blocker_queue_updated_at" (Get-Date).ToString("o")
+  }
+  $next = Select-NextProjectBlocker -Queue $queue
+  if (-not $next) {
+    Set-ObjectProperty $state "next_action" "no_project_blocker_queue_item"
+    Set-ObjectProperty $state "local_only_next_action" "no_project_blocker_queue_item"
+    Set-ObjectProperty $state "should_send_to_gpt" $false
+    Set-ObjectProperty $state "send_reason" "local_only_continue"
+  } else {
+    Set-ObjectProperty $state "current_blocker_id" $next.id
+    Set-ObjectProperty $state "current_blocker_category" $next.category
+    Set-ObjectProperty $state "next_action" $next.recommended_next_action
+    Set-ObjectProperty $state "local_only_next_action" $next.recommended_next_action
+    Set-ObjectProperty $state "should_send_to_gpt" ($next.category -eq "needs_external_review")
+    Set-ObjectProperty $state "send_reason" $(if ($next.category -eq "needs_external_review") { "next_action_requests_external_review" } else { "local_only_continue" })
+  }
+  Save-State $ProjectRoot $state
+  $plan = Write-ProjectGoalPlan -ProjectRoot $ProjectRoot -State $state
+  New-RuntimeBrief -ProjectRoot $ProjectRoot -Reason "next_local_action" | Out-Null
+  Write-Host "Next local action: $($state.local_only_next_action)" -ForegroundColor Green
+  Write-Host "Project goal plan: $($plan.markdown)"
+}
+
+function Invoke-BuildProjectGoalPlan {
+  param([Parameter(Mandatory = $true)][string]$ProjectRoot)
+  $state = Get-State -ProjectRoot $ProjectRoot
+  $guard = Invoke-CompletionGuard -ProjectRoot $ProjectRoot -State $state -Verdict $(if ($state.goal_verdict) { [string]$state.goal_verdict } else { "CONTINUE" })
+  Set-ObjectProperty $state "blocking_gates" @($guard.blockers)
+  Set-ObjectProperty $state "goal_context_sources" @($guard.sources)
+  Set-ObjectProperty $state "completion_guard_status" $guard.status
+  Set-ObjectProperty $state "goal_achieved_is_terminal" ([bool]$guard.is_terminal)
+  $next = Update-ProjectBlockerQueue -ProjectRoot $ProjectRoot -State $state -Blockers @($guard.blockers)
+  if ($next -and -not $state.local_only_next_action) {
+    Set-ObjectProperty $state "local_only_next_action" $next.recommended_next_action
+  }
+  Save-State $ProjectRoot $state
+  $plan = Write-ProjectGoalPlan -ProjectRoot $ProjectRoot -State $state
+  New-RuntimeBrief -ProjectRoot $ProjectRoot -Reason "project_goal_plan" | Out-Null
+  Write-Host "Project goal plan: $($plan.markdown)" -ForegroundColor Green
+  Write-Host "Project goal plan JSON: $($plan.json)"
+}
+
 function Get-GoalContextReport {
   param(
     [Parameter(Mandatory = $true)][string]$ProjectRoot,
@@ -313,21 +564,37 @@ function Get-GoalContextReport {
     "Not implemented",
     "Remaining P0",
     "Remaining P1",
-    "Demo readiness.*NOT_READY"
+    "Demo readiness.*NOT_READY",
+    "Human Gate",
+    "Human visual signoff",
+    "explicit human",
+    "separately authorized"
   )
   foreach ($source in $sources) {
     $relative = Get-RelativePath -Root $ProjectRoot -Path $source
     $sourceLines.Add("- $relative") | Out-Null
     $text = Get-ContentExcerpt -Path $source -MaxChars 20000
+    $textLines = @($text -split "`r?`n")
     foreach ($pattern in $patterns) {
       if ($text -match $pattern) {
-        $blockers.Add(("{0}: {1}" -f $relative, $pattern)) | Out-Null
+        $matchedLine = @($textLines | Where-Object { $_ -match $pattern } | Select-Object -First 1)
+        $lineText = if ($matchedLine.Count -gt 0) { [string]$matchedLine[0] } else { $pattern }
+        $lineText = ($lineText -replace "\s+", " ").Trim()
+        if ($lineText.Length -gt 180) { $lineText = $lineText.Substring(0, 180).Trim() }
+        $blockers.Add(("{0}: {1}" -f $relative, $lineText)) | Out-Null
       }
     }
   }
   $uniqueBlockers = @($blockers.ToArray() | Sort-Object -Unique)
+  $queue = New-ProjectBlockerQueue -Blockers $uniqueBlockers
   $blockerText = if ($uniqueBlockers.Count -gt 0) { $uniqueBlockers -join "`n" } else { "(none detected in goal context sources)" }
   $sourceText = if ($sourceLines.Count -gt 0) { $sourceLines.ToArray() -join "`n" } else { "(no goal context sources found)" }
+  $matrixLines = New-Object System.Collections.Generic.List[string]
+  foreach ($category in @("local_fixable", "needs_evidence", "needs_external_review", "human_gate", "explicit_authorization_required", "future_scope")) {
+    $count = @($queue | Where-Object { $_.category -eq $category }).Count
+    $matrixLines.Add("- ${category}: $count") | Out-Null
+  }
+  $matrixText = $matrixLines.ToArray() -join "`n"
   $summary = @"
 ## Goal Context
 
@@ -345,6 +612,10 @@ $sourceText
 
 $blockerText
 
+### Project Goal Matrix
+
+$matrixText
+
 ### Reviewer Instruction
 
 Explicitly distinguish current subgoal completion from project_total completion. If project blockers remain, do not recommend terminal completion.
@@ -353,6 +624,7 @@ Explicitly distinguish current subgoal completion from project_total completion.
     text = (Limit-Text -Text $summary -MaxChars $MaxChars)
     sources = @($sources | ForEach-Object { Get-RelativePath -Root $ProjectRoot -Path $_ })
     blockers = $uniqueBlockers
+    queue = @($queue)
   }
 }
 
@@ -385,6 +657,7 @@ function Invoke-CompletionGuard {
     terminal_goal_scope = $terminalScope
     blockers = $blockers
     sources = @($goalContext.sources)
+    queue = @($goalContext.queue)
     text = $goalContext.text
   }
 }
@@ -426,6 +699,10 @@ function New-RuntimeBrief {
     completion_guard_status = $state.completion_guard_status
     blocking_gates = $state.blocking_gates
     goal_achieved_is_terminal = $state.goal_achieved_is_terminal
+    project_blocker_queue = $state.project_blocker_queue
+    current_blocker_id = $state.current_blocker_id
+    current_blocker_category = $state.current_blocker_category
+    stalled_local_action_count = $state.stalled_local_action_count
     next_action = $state.next_action
     should_send_to_gpt = $state.should_send_to_gpt
     send_reason = $state.send_reason
@@ -536,7 +813,7 @@ function Ensure-ReviewLoop {
 
   if (-not (Test-Path -LiteralPath $paths.State)) {
     $state = [ordered]@{
-      version = 4
+      version = 5
       updated_at = (Get-Date).ToString("o")
       baseline_sent = $false
       baseline_hash = $null
@@ -591,13 +868,19 @@ function Ensure-ReviewLoop {
       goal_context_sources = @()
       goal_achieved_is_terminal = $false
       gpt_courtesy_footer_sent_count = 0
+      project_blocker_queue = @()
+      current_blocker_id = $null
+      current_blocker_category = $null
+      blocker_queue_updated_at = $null
+      local_progress_artifacts = @()
+      stalled_local_action_count = 0
     }
   } else {
     $state = Read-JsonFile $paths.State
-    foreach ($field in @("version", "iteration_counter", "loop_mode", "loop_status", "latest_review", "latest_assessment_prompt", "goal_verdict", "next_action", "stop_reason", "baseline_sent_to_url", "baseline_sent_hash", "latest_prompt_target_url", "latest_prompt_opened_tab_url", "latest_assessment_target_url", "latest_assessment_opened_tab_url", "continuation_required", "url_confirmation_required", "url_confirmation_reason", "quota_mode", "runtime_brief", "browser_preflight_status", "browser_backend_type", "browser_target_tab_id", "browser_preflight_iteration", "browser_preflight_checked_at", "latest_visual_evidence_hash", "latest_visual_evidence_path", "last_visual_evidence_sent_hash", "attach_visual_evidence_requested", "last_prompt_chars", "cumulative_prompt_chars", "external_review_count", "local_only_iteration_count", "should_send_to_gpt", "send_reason", "local_only_next_action", "active_goal_scope", "terminal_goal_scope", "subgoal_verdict", "project_goal_verdict", "completion_guard_status", "goal_achieved_is_terminal", "gpt_courtesy_footer_sent_count")) {
+    foreach ($field in @("version", "iteration_counter", "loop_mode", "loop_status", "latest_review", "latest_assessment_prompt", "goal_verdict", "next_action", "stop_reason", "baseline_sent_to_url", "baseline_sent_hash", "latest_prompt_target_url", "latest_prompt_opened_tab_url", "latest_assessment_target_url", "latest_assessment_opened_tab_url", "continuation_required", "url_confirmation_required", "url_confirmation_reason", "quota_mode", "runtime_brief", "browser_preflight_status", "browser_backend_type", "browser_target_tab_id", "browser_preflight_iteration", "browser_preflight_checked_at", "latest_visual_evidence_hash", "latest_visual_evidence_path", "last_visual_evidence_sent_hash", "attach_visual_evidence_requested", "last_prompt_chars", "cumulative_prompt_chars", "external_review_count", "local_only_iteration_count", "should_send_to_gpt", "send_reason", "local_only_next_action", "active_goal_scope", "terminal_goal_scope", "subgoal_verdict", "project_goal_verdict", "completion_guard_status", "goal_achieved_is_terminal", "gpt_courtesy_footer_sent_count", "current_blocker_id", "current_blocker_category", "blocker_queue_updated_at", "stalled_local_action_count")) {
       if (-not ($state.PSObject.Properties.Name -contains $field)) {
         $default = $null
-        if ($field -eq "version") { $default = 4 }
+        if ($field -eq "version") { $default = 5 }
         if ($field -eq "iteration_counter") { $default = 0 }
         if ($field -eq "loop_mode") { $default = "continuous_until_stopped" }
         if ($field -eq "loop_status") { $default = "idle" }
@@ -619,15 +902,16 @@ function Ensure-ReviewLoop {
         if ($field -eq "completion_guard_status") { $default = "not_evaluated" }
         if ($field -eq "goal_achieved_is_terminal") { $default = $false }
         if ($field -eq "gpt_courtesy_footer_sent_count") { $default = 0 }
+        if ($field -eq "stalled_local_action_count") { $default = 0 }
         Set-ObjectProperty $state $field $default
       }
     }
-    foreach ($field in @("pending_prompts", "pending_reviews", "captured_reviews", "pending_assessments", "blocking_gates", "goal_context_sources")) {
+    foreach ($field in @("pending_prompts", "pending_reviews", "captured_reviews", "pending_assessments", "blocking_gates", "goal_context_sources", "project_blocker_queue", "local_progress_artifacts")) {
       if (-not ($state.PSObject.Properties.Name -contains $field) -or $null -eq $state.$field) {
         Set-ObjectProperty $state $field @()
       }
     }
-    Set-ObjectProperty $state "version" 4
+    Set-ObjectProperty $state "version" 5
     Set-ObjectProperty $state "loop_mode" "continuous_until_stopped"
     Set-ObjectProperty $state "quota_mode" $quotaDefaults.mode
     if ($GoalScopeProvided) { Set-ObjectProperty $state "active_goal_scope" $effectiveGoalScope }
@@ -674,9 +958,12 @@ function Ensure-ReviewLoop {
       Set-ObjectProperty $state "goal_context_sources" @($guard.sources)
       Set-ObjectProperty $state "goal_achieved_is_terminal" $false
       Set-ObjectProperty $state "project_goal_verdict" "CONTINUE"
+      $selectedBlocker = Update-ProjectBlockerQueue -ProjectRoot $ProjectRoot -State $state -Blockers @($guard.blockers)
       if ($guard.status -eq "subgoal_achieved_not_terminal") {
         Set-ObjectProperty $state "subgoal_verdict" "GOAL_ACHIEVED"
         Set-ObjectProperty $state "next_action" "assess_parent_project_goal"
+      } elseif ($selectedBlocker) {
+        Set-ObjectProperty $state "next_action" $selectedBlocker.recommended_next_action
       } else {
         Set-ObjectProperty $state "next_action" "resolve_project_completion_blockers"
       }
@@ -1539,10 +1826,13 @@ function Invoke-NextDecision {
   param([Parameter(Mandatory = $true)][string]$ProjectRoot)
   $paths = Get-ReviewPaths $ProjectRoot
   $state = Get-State $ProjectRoot
+  $previousLocalAction = if ($state.local_only_next_action) { [string]$state.local_only_next_action } else { $null }
+  $previousArtifactCount = if ($state.local_progress_artifacts) { @($state.local_progress_artifacts).Count } else { 0 }
   $verdict = if ($state.goal_verdict) { [string]$state.goal_verdict } else { "CONTINUE" }
   $guard = Invoke-CompletionGuard -ProjectRoot $ProjectRoot -State $state -Verdict $verdict
   $status = "running"
   $stopReason = $null
+  $selectedBlocker = $null
   switch ($verdict) {
     "GOAL_ACHIEVED" {
       if ($guard.is_terminal) {
@@ -1569,8 +1859,19 @@ function Invoke-NextDecision {
   Set-ObjectProperty $state "blocking_gates" @($guard.blockers)
   Set-ObjectProperty $state "goal_context_sources" @($guard.sources)
   Set-ObjectProperty $state "goal_achieved_is_terminal" ([bool]$guard.is_terminal)
+  $selectedBlocker = Update-ProjectBlockerQueue -ProjectRoot $ProjectRoot -State $state -Blockers @($guard.blockers)
   if ($guard.is_terminal) {
     Set-ObjectProperty $state "project_goal_verdict" "GOAL_ACHIEVED"
+  }
+  if ($status -eq "running" -and $state.next_action -eq "resolve_project_completion_blockers") {
+    if (Test-QueueHasOnlyHumanOrAuthorization -Queue @($state.project_blocker_queue)) {
+      $status = "paused"
+      $stopReason = "human_or_authorization_required"
+      Set-ObjectProperty $state "goal_verdict" "NEEDS_HUMAN_DECISION"
+      Set-ObjectProperty $state "next_action" "request_human_decision_for_project_blockers"
+    } elseif ($selectedBlocker) {
+      Set-ObjectProperty $state "next_action" $selectedBlocker.recommended_next_action
+    }
   }
   Set-ObjectProperty $state "loop_status" $status
   Set-ObjectProperty $state "stop_reason" $stopReason
@@ -1593,10 +1894,31 @@ function Invoke-NextDecision {
       Set-ObjectProperty $state "local_only_iteration_count" ($localCount + 1)
     }
   }
+  if ($status -eq "running" -and $localOnlyNextAction) {
+    $currentArtifactCount = if ($state.local_progress_artifacts) { @($state.local_progress_artifacts).Count } else { 0 }
+    $stalledCount = if ($state.stalled_local_action_count) { [int]$state.stalled_local_action_count } else { 0 }
+    if ($previousLocalAction -eq $localOnlyNextAction -and $currentArtifactCount -le $previousArtifactCount) {
+      $stalledCount += 1
+    } else {
+      $stalledCount = 0
+    }
+    Set-ObjectProperty $state "stalled_local_action_count" $stalledCount
+    if ($stalledCount -ge 2) {
+      Set-ObjectProperty $state "goal_verdict" "NEEDS_PROCESS_FIX"
+      Set-ObjectProperty $state "next_action" "split_or_update_project_goal_plan"
+      $nextActionText = "split_or_update_project_goal_plan"
+      $localOnlyNextAction = "split_or_update_project_goal_plan"
+      $sendReason = "local_only_continue"
+      $shouldSend = $false
+    }
+  } elseif ($status -ne "running") {
+    Set-ObjectProperty $state "stalled_local_action_count" 0
+  }
   Set-ObjectProperty $state "should_send_to_gpt" $shouldSend
   Set-ObjectProperty $state "send_reason" $sendReason
   Set-ObjectProperty $state "local_only_next_action" $localOnlyNextAction
   Save-State $ProjectRoot $state
+  $planArtifacts = Write-ProjectGoalPlan -ProjectRoot $ProjectRoot -State $state
   $iteration = if ($state.iteration_counter) { "iter-{0:000}" -f [int]$state.iteration_counter } else { "iter-000" }
   $runPath = Join-Path $paths.LoopRuns ("{0}-{1}-loop-run.json" -f (Get-Date -Format "yyyyMMdd-HHmmss"), $iteration)
   $summary = [ordered]@{
@@ -1615,6 +1937,10 @@ function Invoke-NextDecision {
     should_send_to_gpt = $shouldSend
     send_reason = $sendReason
     local_only_next_action = $localOnlyNextAction
+    current_blocker_id = $state.current_blocker_id
+    current_blocker_category = $state.current_blocker_category
+    project_goal_plan = (Get-RelativePath -Root $ProjectRoot -Path $planArtifacts.markdown)
+    project_blocker_queue = @($state.project_blocker_queue)
     latest_prompt = $state.latest_prompt
     latest_review = $state.latest_review
     latest_assessment = $state.latest_assessment
@@ -1627,6 +1953,10 @@ function Invoke-NextDecision {
   Write-Host "goal_achieved_is_terminal: $([bool]$guard.is_terminal)"
   Write-Host "should_send_to_gpt: $shouldSend"
   Write-Host "send_reason: $sendReason"
+  if ($state.current_blocker_id) {
+    Write-Host "current_blocker_id: $($state.current_blocker_id)"
+    Write-Host "current_blocker_category: $($state.current_blocker_category)"
+  }
   if ($status -eq "running") {
     if ($shouldSend) {
       Write-Host "Continuation required: prepare or send the external review handoff unless the user stops the session or a hard blocker appears." -ForegroundColor Yellow
@@ -1723,6 +2053,12 @@ function Show-Status {
     project_goal_verdict = if ($state) { $state.project_goal_verdict } else { $null }
     completion_guard_status = if ($state) { $state.completion_guard_status } else { $null }
     blocking_gate_count = if ($state -and $state.blocking_gates) { @($state.blocking_gates).Count } else { 0 }
+    project_blocker_queue_count = if ($state -and $state.project_blocker_queue) { @($state.project_blocker_queue).Count } else { 0 }
+    current_blocker_id = if ($state) { $state.current_blocker_id } else { $null }
+    current_blocker_category = if ($state) { $state.current_blocker_category } else { $null }
+    blocker_queue_updated_at = if ($state) { $state.blocker_queue_updated_at } else { $null }
+    stalled_local_action_count = if ($state) { $state.stalled_local_action_count } else { 0 }
+    project_goal_plan = $paths.ProjectGoalPlan
     goal_achieved_is_terminal = if ($state) { $state.goal_achieved_is_terminal } else { $null }
     gpt_courtesy_footer_sent_count = if ($state) { $state.gpt_courtesy_footer_sent_count } else { 0 }
     next_action = if ($state) { $state.next_action } else { $null }
@@ -1792,6 +2128,14 @@ switch ($Action) {
   "NextDecision" {
     Ensure-ReviewLoop -ProjectRoot $ProjectRoot -ChatUrl $TargetChatGptUrl | Out-Null
     Invoke-NextDecision -ProjectRoot $ProjectRoot
+  }
+  "BuildProjectGoalPlan" {
+    Ensure-ReviewLoop -ProjectRoot $ProjectRoot -ChatUrl $TargetChatGptUrl | Out-Null
+    Invoke-BuildProjectGoalPlan -ProjectRoot $ProjectRoot
+  }
+  "NextLocalAction" {
+    Ensure-ReviewLoop -ProjectRoot $ProjectRoot -ChatUrl $TargetChatGptUrl | Out-Null
+    Invoke-NextLocalAction -ProjectRoot $ProjectRoot
   }
   "RunLoop" {
     Ensure-ReviewLoop -ProjectRoot $ProjectRoot -ChatUrl $TargetChatGptUrl | Out-Null

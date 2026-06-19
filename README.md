@@ -20,6 +20,7 @@ review package -> external/internal review -> local assessment -> next decision
 - Codex must assess every recommendation against local code, tests, acceptance gates, user scope, risk, and cost before acting.
 - Each loop run stores a compact `runtime-brief.json` so Codex can reuse target URL, prompt path, evidence hash, browser route status, and latest state without repeatedly rereading large files.
 - Completion is guarded at the project-total level. A task, milestone, or test-line can be accepted without stopping the continuous loop.
+- Project blockers are normalized into a queue so a running loop gets a concrete local next action instead of stopping at a generic blocker label.
 
 This skill sends static Markdown only. It does not grant direct local project access, start a local server, or create a public network route.
 
@@ -128,6 +129,13 @@ Build the local assessment and next decision:
 & "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action NextDecision -Root "<project-root>"
 ```
 
+When project-total blockers remain, build the local project goal plan and ask for the next local action:
+
+```powershell
+& "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action BuildProjectGoalPlan -Root "<project-root>"
+& "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action NextLocalAction -Root "<project-root>"
+```
+
 Return Codex's local assessment to the same ChatGPT conversation:
 
 ```powershell
@@ -158,6 +166,7 @@ docs/ai-review-loop/
   assessments/
   loop-runs/
   security-scans/
+  project-goal-plan.md
   experience-log.md
   experience-issues/
 ```
@@ -203,6 +212,12 @@ Generated review-loop files are excluded from later code maps and sensitive scan
   "project_goal_verdict": null,
   "completion_guard_status": "not_evaluated",
   "blocking_gates": [],
+  "project_blocker_queue": [],
+  "current_blocker_id": null,
+  "current_blocker_category": null,
+  "blocker_queue_updated_at": null,
+  "local_progress_artifacts": [],
+  "stalled_local_action_count": 0,
   "goal_context_sources": [],
   "goal_achieved_is_terminal": false,
   "gpt_courtesy_footer_sent_count": 0,
@@ -224,9 +239,20 @@ Generated review-loop files are excluded from later code maps and sensitive scan
 - `terminal_goal_scope` is `project_total`.
 - The completion guard finds no project blockers such as `NOT_COMPLETE`, `NOT_READY`, failed gates, unfinished roadmap items, or verifier results saying the project is incomplete.
 
-If a task, milestone, or test-line reaches `GOAL_ACHIEVED`, `NextDecision` records `subgoal_verdict: GOAL_ACHIEVED`, keeps `loop_status: running`, and sets `next_action: assess_parent_project_goal`. If a project-total completion claim conflicts with blocker evidence, `NextDecision` keeps the loop running and sets `next_action: resolve_project_completion_blockers`.
+If a task, milestone, or test-line reaches `GOAL_ACHIEVED`, `NextDecision` records `subgoal_verdict: GOAL_ACHIEVED`, keeps `loop_status: running`, and sets `next_action: assess_parent_project_goal`. If a project-total completion claim conflicts with blocker evidence, `NextDecision` builds `project_blocker_queue`, writes `project-goal-plan.md`, and replaces the generic blocker action with a concrete `local_only_next_action` where possible.
 
 `-ForceCompleteProjectGoal` exists for explicit operator override, but it should not be used to bypass project acceptance gates or human gates.
+
+Blocker categories are:
+
+- `local_fixable`: Codex can progress locally.
+- `needs_evidence`: Codex should gather or update proof.
+- `needs_external_review`: send GPT only after a narrow new question exists.
+- `human_gate`: pause for explicit human decision.
+- `explicit_authorization_required`: pause before changing protected scope or systems.
+- `future_scope`: keep out of the current completion claim.
+
+If only `human_gate`, `explicit_authorization_required`, or `future_scope` items remain, `NextDecision` pauses with `NEEDS_HUMAN_DECISION`. If the same local action repeats twice without new `local_progress_artifacts`, the loop marks `NEEDS_PROCESS_FIX` to avoid silent local-only spinning.
 
 ## Loop Decisions
 
@@ -244,7 +270,7 @@ If `NextDecision` reports `loop_status: running` or `continuation_required: true
 - `should_send_to_gpt: false`: continue local work first; do not send an empty or repetitive GPT prompt.
 - `should_send_to_gpt: true`: send only because there is new evidence, a new risk, an explicit recheck, or `-ForceExternalReview`.
 - `send_reason`: the reason for that choice.
-- `local_only_next_action`: the local action to execute before another external review.
+- `local_only_next_action`: the concrete local action to execute before another external review.
 
 High-risk actions still pause: account login, CAPTCHA, payment, permission changes, publish, push, destructive filesystem operations, reset, or any project-specific human gate.
 
