@@ -13,6 +13,8 @@ This skill turns a local Codex project into review material that GPT Pro can rea
 
 The loop is useful when the user wants an outside GPT Pro review without granting direct local project access.
 
+Default quota mode is `economy`: keep full evidence in the project ledger, but send GPT Pro compact Markdown summaries and deltas unless the user or GPT explicitly needs a broader baseline.
+
 The mental model is:
 
 ```text
@@ -49,10 +51,20 @@ GPT Pro and Codex efficiency review are both `reviewer` values in the same event
 3. Prepare the offline review package:
 
    ```powershell
-   & "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action Prepare -Root "<project-root>"
+   & "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action PrepareCompactReview -Root "<project-root>"
    ```
 
-   This writes under `docs/ai-review-loop/`, runs the sensitive-data scan, creates a project dossier, creates a code map, creates a round request, and assembles a ChatGPT prompt. Use `-ForceBaseline` when the ChatGPT conversation lost context or the user explicitly wants a full baseline resend.
+   This writes under `docs/ai-review-loop/`, runs the sensitive-data scan, creates a project dossier, creates a code map, creates a round request, assembles a compact ChatGPT prompt, and writes a runtime brief. Use `-ForceBaseline` when the ChatGPT conversation lost context or the user explicitly wants a full baseline resend. Use `-QuotaMode balanced` or `-QuotaMode deep` only when the compact prompt is insufficient.
+
+   Useful quota parameters:
+
+   ```powershell
+   -QuotaMode economy|balanced|deep
+   -MaxPromptChars 8000
+   -AttachVisualEvidence
+   ```
+
+   Default image behavior is path/hash only. Attach visual evidence only for visual gates, and do not resend the same contact sheet hash in the same ChatGPT conversation.
 
 4. Send the prompt through Edge using `edge-browser-control`.
 
@@ -64,7 +76,13 @@ GPT Pro and Codex efficiency review are both `reviewer` values in the same event
    & "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action SendPrompt -Root "<project-root>"
    ```
 
-   Then use `edge-browser-control` to open the target ChatGPT URL, paste the prompt file, and submit it. After the message is actually submitted, mark the prompt sent:
+   Before the first browser operation in an iteration, run one lightweight browser preflight and then reuse the recorded runtime brief:
+
+   ```powershell
+   & "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action PreflightBrowser -Root "<project-root>"
+   ```
+
+   Then use `edge-browser-control` to open the target ChatGPT URL, paste the prompt file, and submit it. Do not repeatedly probe browser-client exports, tab APIs, or locator APIs in the same iteration. After the message is actually submitted, mark the prompt sent:
 
    ```powershell
    & "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action SendPrompt -Root "<project-root>" -Send
@@ -118,6 +136,12 @@ GPT Pro and Codex efficiency review are both `reviewer` values in the same event
 
    `GOAL_ACHIEVED` stops with a final report requirement. `CONTINUE`, `NEEDS_EVIDENCE`, and `NEEDS_PROCESS_FIX` are not completion states inside an explicitly started loop; they require Codex to execute `next_action`, prepare the next review event, and keep cycling unless the user stops the session or a hard blocker appears. `NEEDS_HUMAN_DECISION` and `BLOCKED` pause.
 
+    `NextDecision` also records whether the next iteration should be sent to GPT:
+
+    - `should_send_to_gpt=false`: continue local execution or evidence collection first; do not send an empty repeat prompt.
+    - `should_send_to_gpt=true`: send because there is a new external-review question, a recheck request, new evidence, or `-ForceExternalReview`.
+    - `send_reason` and `local_only_next_action` explain the choice.
+
 10. Record project-local experience when the round produced a reusable lesson:
 
    ```powershell
@@ -139,10 +163,10 @@ When the target ChatGPT URL is already configured and the user explicitly asks f
 When the user explicitly starts continuous review, use:
 
 ```powershell
-& "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action RunLoop -Root "<project-root>"
+& "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action RunLoop -Root "<project-root>" -PreflightBrowser
 ```
 
-`RunLoop` is the compact loop entry for the outer Codex agent. The PowerShell script prepares local ledger material and prints the browser handoff; it does not control Edge or wait for ChatGPT by itself. After explicit authorization, Codex must continue ordinary next rounds without confirmation until `NextDecision` reports `GOAL_ACHIEVED`, `NEEDS_HUMAN_DECISION`, `BLOCKED`, or the user stops the session. A `running` loop status with `continuation_required=true` is an instruction to keep working, not a final-answer point. Safety blockers, human gates, external account/login/CAPTCHA, publish/push, destructive file operations, and permission changes still pause.
+`RunLoop` is the compact loop entry for the outer Codex agent. The PowerShell script prepares local ledger material, writes a runtime brief, and prints the browser handoff; it does not control Edge or wait for ChatGPT by itself. After explicit authorization, Codex must continue ordinary next rounds without confirmation until `NextDecision` reports `GOAL_ACHIEVED`, `NEEDS_HUMAN_DECISION`, `BLOCKED`, or the user stops the session. A `running` loop status with `continuation_required=true` is an instruction to keep working, not a final-answer point. Safety blockers, human gates, external account/login/CAPTCHA, publish/push, destructive file operations, and permission changes still pause.
 
 ## Local Practice Assessment Rules
 
@@ -165,6 +189,8 @@ Always cite local evidence. Evidence can be a file path, command result, test fa
 - Treat the built-in sensitive-data scan as a basic blocker, not a full secret audit.
 - Exclude `docs/ai-review-loop/` from generated code maps and sensitive scanning to avoid sending previous review logs back into later rounds by accident.
 - Do not send full source trees by default. Send summaries, code maps, diffs, verification output, and necessary excerpts.
+- Do not send GPT another prompt unless `should_send_to_gpt=true`, `-ForceExternalReview` is used, or a new external-review question has appeared.
+- Reuse `runtime_brief` inside one loop iteration instead of rereading full prompts, full state JSON, full gate docs, or full audit text.
 - Use project-relative paths in review material. Avoid exposing local absolute paths.
 - Keep browser automation limited to normal ChatGPT prompt submission and reply reading.
 - Use low-frequency completion checks after submission; do not high-frequency poll or repeatedly dump page DOM/screenshots.

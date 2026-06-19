@@ -4,12 +4,21 @@ Use `edge-browser-control` for ChatGPT web UI operations. `edge-browser-control`
 
 Before browser submission or capture, read `C:\Users\Administrator\.codex\skills\edge-browser-control\SKILL.md`. The expected route is the official Codex Edge/Chrome extension backend, usually reached through the bundled browser-client from `node_repl`; it reuses the user's existing Edge ChatGPT login without reading cookies or session stores.
 
+Run one lightweight local preflight per review-loop iteration:
+
+```powershell
+& "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action PreflightBrowser -Root "<project-root>"
+```
+
+This records `browser_preflight_status`, `browser_backend_type`, and `runtime_brief` in `review-state.json`. The Codex agent should reuse that runtime brief instead of repeatedly inspecting browser-client exports, tab APIs, or locator APIs in the same iteration.
+
 ## Send Review Prompt
 
 1. Run `Prepare` or `Run` to generate the prompt file.
 2. Run `SendPrompt` without `-Send` to print:
    - target ChatGPT URL.
    - prompt file path.
+   - current runtime brief if a preflight was recorded.
 3. Use `edge-browser-control` to open or claim the target ChatGPT tab.
 4. Paste the full prompt file into the ChatGPT composer.
 5. Submit only after the user has authorized the review loop or review round.
@@ -21,6 +30,8 @@ If the target conversation is missing context or GPT asks for a baseline, rerun 
 
 Before operating ChatGPT, read the current `edge-browser-control` skill body and follow its bundled browser-client API. Do not reuse stale snippets from older browser plugins.
 
+- Do browser-route discovery once per iteration, then cache the result in `runtime_brief`.
+- Do not reread full prompt files, full state JSON, full gate documents, or full audit text during browser handoff unless the prompt has changed or a capture failed.
 - The Codex extension backend may expose Edge as `extension` or with a Chrome-flavored name. Trust the returned tab URLs, not the display name.
 - Tab objects are controlled through `tab.playwright`. Do not assume a raw Playwright `page` property exists.
 - If claiming an existing tab fails with a tab grouping or window grouping error, do not retry the same claim in a tight loop.

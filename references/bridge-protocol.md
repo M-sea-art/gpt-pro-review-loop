@@ -37,7 +37,11 @@ docs/ai-review-loop/
   "code_map_policy": "filesystem_map_with_optional_codegraph_context",
   "codex_assessment_required": true,
   "feedback_return_policy": "send_local_assessment_to_same_chat",
-  "url_selection_policy": "ask_once_when_missing_or_changed"
+  "url_selection_policy": "ask_once_when_missing_or_changed",
+  "quota_mode": "economy",
+  "default_max_prompt_chars": 8000,
+  "visual_evidence_policy": "attach_only_when_requested_or_new_hash",
+  "external_review_policy": "send_only_when_new_evidence_or_explicit_review_needed"
 }
 ```
 
@@ -63,6 +67,17 @@ docs/ai-review-loop/
 - `continuation_required`: true when `NextDecision` leaves `loop_status` as `running`; the outer Codex agent must continue with `next_action` instead of giving a final answer.
 - `url_confirmation_required`: true when this project needs a one-time user confirmation of its ChatGPT project/conversation URL.
 - `url_confirmation_reason`: `missing_target_chatgpt_url`, `target_chatgpt_url_changed`, or null.
+- `quota_mode`: `economy`, `balanced`, or `deep`; default is `economy`.
+- `runtime_brief`: latest small JSON snapshot under `loop-runs/` for the current iteration.
+- `browser_preflight_status`: one-per-iteration browser route status, usually `pending_edge_browser_control` before the Codex agent claims a tab.
+- `browser_target_tab_id`: optional extension tab id recorded by the outer Codex browser flow.
+- `latest_visual_evidence_hash`: latest contact sheet or screenshot hash if visual evidence is relevant.
+- `last_visual_evidence_sent_hash`: last visual hash intentionally sent or attached to ChatGPT.
+- `last_prompt_chars`: character count of the latest generated prompt.
+- `cumulative_prompt_chars`: approximate running total of generated prompt characters.
+- `should_send_to_gpt`: false when the next step is local-only and sending would be repetitive.
+- `send_reason`: why GPT should or should not receive the next prompt.
+- `local_only_next_action`: local action to run before another external review.
 
 ## URL Confirmation
 
@@ -80,7 +95,7 @@ Review material files should use project-relative paths and avoid local absolute
 - `prompts/`: assembled ChatGPT messages for review requests or Codex assessment returns.
 - `reviews/`: all external and internal review events. GPT Pro initial review, GPT Pro recheck, Codex efficiency process audit, and Codex efficiency goal audit all live here.
 - `assessments/`: local-practice and combined-next-decision assessments.
-- `loop-runs/`: small JSON records emitted by `NextDecision`.
+- `loop-runs/`: small JSON records emitted by `NextDecision` and `runtime-brief.json` snapshots for low-quota reuse.
 
 ## Review Capture
 
@@ -114,6 +129,17 @@ Codex must assess every actionable review recommendation before implementation:
 Decisions must be grounded in local facts such as code, tests, acceptance gates, project goals, user boundaries, cost, or risk. The assessment also includes the overall goal verdict so the loop can continue, gather evidence, fix process, stop, or pause for the user. `CONTINUE`, `NEEDS_EVIDENCE`, and `NEEDS_PROCESS_FIX` are running states inside an explicitly started loop; they require the next iteration unless the user stops the session or a hard blocker appears.
 
 The assessment is the handoff contract between "GPT suggested it" and "Codex should act." A recommendation without local evidence remains advisory.
+
+## Quota And Send Gate
+
+Economy mode is the default. It keeps full files under `docs/ai-review-loop/` but sends compact Markdown to ChatGPT:
+
+- first baseline: bounded dossier and code-map excerpts.
+- later rounds: delta, evidence hashes, key paths, verdict target, and narrow questions.
+- Codex efficiency review: send only a compact summary, not the full local audit body.
+- visual evidence: send path/hash by default; attach the image only when a visual gate needs it and the same hash has not already been sent.
+
+`NextDecision` sets `should_send_to_gpt`. If it is false, the outer Codex agent should continue `local_only_next_action` and avoid an empty GPT prompt. If it is true, the agent can send the latest compact prompt because there is a new external-review question, new evidence, a requested recheck, or an explicit force flag.
 
 ## Offline Boundary
 

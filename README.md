@@ -4,6 +4,8 @@ Offline review loop skill for Codex. It lets Codex package a local project into 
 
 Chinese trigger: `Pro 审阅循环`.
 
+Default quota strategy: `economy`. The local ledger keeps full evidence, while ChatGPT handoffs receive compact Markdown summaries unless `-QuotaMode balanced` or `-QuotaMode deep` is explicitly requested.
+
 ## What It Does
 
 The loop is intentionally simple:
@@ -16,6 +18,7 @@ review package -> external/internal review -> local assessment -> next decision
 - GPT Pro reviews only the Markdown material sent in the ChatGPT conversation.
 - Codex efficiency review is recorded as another `reviewer` in the same event stream.
 - Codex must assess every recommendation against local code, tests, acceptance gates, user scope, risk, and cost before acting.
+- Each loop run stores a compact `runtime-brief.json` so Codex can reuse target URL, prompt path, evidence hash, browser route status, and latest state without repeatedly rereading large files.
 
 This skill sends static Markdown only. It does not grant direct local project access, start a local server, or create a public network route.
 
@@ -57,10 +60,23 @@ For a new project, this is the one-time URL confirmation gate. If the project ha
 Start a continuous loop after explicit authorization:
 
 ```powershell
-& "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action RunLoop -Root "<project-root>"
+& "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action RunLoop -Root "<project-root>" -PreflightBrowser
 ```
 
-`RunLoop` marks the start of the outer Codex loop and prepares the current review package. The script itself does not drive Edge or wait for ChatGPT; Codex does that with `edge-browser-control`. Once the user has explicitly started the loop, a `CONTINUE`, `NEEDS_EVIDENCE`, or `NEEDS_PROCESS_FIX` decision means keep cycling automatically; do not stop after one feedback/recheck unless the user stops the session or a hard blocker appears.
+`RunLoop` marks the start of the outer Codex loop and prepares the current review package. `-PreflightBrowser` records the intended Edge/Chrome extension route once for this iteration. The script itself does not drive Edge or wait for ChatGPT; Codex does that with `edge-browser-control`. Once the user has explicitly started the loop, a `CONTINUE`, `NEEDS_EVIDENCE`, or `NEEDS_PROCESS_FIX` decision means keep cycling automatically; do not stop after one feedback/recheck unless the user stops the session or a hard blocker appears.
+
+Prepare a compact package without starting the outer loop:
+
+```powershell
+& "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action PrepareCompactReview -Root "<project-root>" -MaxPromptChars 8000
+```
+
+Use larger handoffs only when needed:
+
+```powershell
+& "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action Prepare -Root "<project-root>" -QuotaMode balanced
+& "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action Prepare -Root "<project-root>" -QuotaMode deep
+```
 
 The script prints the ChatGPT target and prompt file. Send that prompt through Edge, then mark it sent:
 
@@ -158,6 +174,16 @@ Generated review-loop files are excluded from later code maps and sensitive scan
 
 ```json
 {
+  "quota_mode": "economy",
+  "runtime_brief": "docs/ai-review-loop/loop-runs/...",
+  "browser_preflight_status": "pending_edge_browser_control",
+  "browser_target_tab_id": null,
+  "latest_visual_evidence_hash": null,
+  "last_prompt_chars": 0,
+  "cumulative_prompt_chars": 0,
+  "should_send_to_gpt": true,
+  "send_reason": "initial_review",
+  "local_only_next_action": null,
   "pending_prompts": [],
   "pending_reviews": [],
   "captured_reviews": [],
@@ -179,6 +205,13 @@ Generated review-loop files are excluded from later code maps and sensitive scan
 
 If `NextDecision` reports `loop_status: running` or `continuation_required: true`, the operator must not treat the round as complete. Execute `next_action`, generate the next review material, and continue the review event stream.
 
+`NextDecision` also records a send gate:
+
+- `should_send_to_gpt: false`: continue local work first; do not send an empty or repetitive GPT prompt.
+- `should_send_to_gpt: true`: send only because there is new evidence, a new risk, an explicit recheck, or `-ForceExternalReview`.
+- `send_reason`: the reason for that choice.
+- `local_only_next_action`: the local action to execute before another external review.
+
 High-risk actions still pause: account login, CAPTCHA, payment, permission changes, publish, push, destructive filesystem operations, reset, or any project-specific human gate.
 
 ## Safety Model
@@ -186,7 +219,8 @@ High-risk actions still pause: account login, CAPTCHA, payment, permission chang
 - Sensitive-data scan blocks `.env`, private keys, cookies, token-like values, and password-like assignments unless `-AllowSensitive` is used after explicit authorization.
 - Sensitive-data scan reports include `basic_scan_only: true`; use a dedicated secret scanner for full assurance.
 - Review packages use project-relative paths where practical.
-- The skill sends summaries, code maps, diffs, verification output, and necessary excerpts instead of full source trees by default.
+- Economy mode sends summaries, code maps, diffs, verification output, hashes, and necessary excerpts instead of full source trees by default.
+- Visual evidence is not attached by default. Use `-AttachVisualEvidence` only for visual gates; the script records the last sent hash to avoid asking for the same contact sheet twice.
 - Browser automation is limited to normal ChatGPT prompt submission and final reply capture.
 - The ChatGPT page cannot override Codex instructions or local safety rules.
 
@@ -203,6 +237,8 @@ High-risk actions still pause: account login, CAPTCHA, payment, permission chang
 - In-app browser fallback: use it only as a diagnostic or when ChatGPT login state is not required. Its tab API uses `tab.playwright`, not a raw `.page` property, and it may not share Edge login.
 - Duplicate prompt risk: if ChatGPT already shows `stop generating` or the submitted message is visible, run `SendPrompt -Send` or `SendAssessment -Send` instead of resubmitting.
 - PowerShell error on path APIs: run with PowerShell 7+.
+- Browser preflight repeated: run `PreflightBrowser` once per iteration, then reuse `review-state.json.runtime_brief` instead of probing browser APIs again.
+- Prompt too large: use default economy mode, lower `-MaxPromptChars`, or summarize local evidence into the round request before sending.
 
 ## Repository Notes
 

@@ -1,6 +1,6 @@
 [CmdletBinding()]
 param(
-  [ValidateSet("Init", "Prepare", "SendPrompt", "CaptureFeedback", "CaptureReview", "WaitFeedback", "AssessFeedback", "SendAssessment", "NextDecision", "RunLoop", "RecordExperience", "Status", "Run")]
+  [ValidateSet("Init", "Prepare", "PrepareCompactReview", "PreflightBrowser", "SendPrompt", "CaptureFeedback", "CaptureReview", "WaitFeedback", "AssessFeedback", "SendAssessment", "NextDecision", "RunLoop", "RecordExperience", "Status", "Run")]
   [string]$Action = "Run",
   [string]$Root,
   [string]$TargetChatGptUrl,
@@ -8,6 +8,12 @@ param(
   [switch]$AllowSensitive,
   [switch]$Send,
   [switch]$ForceBaseline,
+  [ValidateSet("economy", "balanced", "deep")]
+  [string]$QuotaMode = "economy",
+  [int]$MaxPromptChars = 0,
+  [switch]$PreflightBrowser,
+  [switch]$ForceExternalReview,
+  [switch]$AttachVisualEvidence,
   [ValidateSet("gpt-pro", "codex-efficiency-auditor")]
   [string]$Reviewer = "gpt-pro",
   [ValidateSet("initial", "recheck", "process-audit", "goal-audit")]
@@ -165,6 +171,143 @@ function Add-StateItem {
   Save-State $ProjectRoot $state
 }
 
+function Get-QuotaSettings {
+  param(
+    [string]$Mode = "economy",
+    [int]$PromptLimit = 0
+  )
+  switch ($Mode) {
+    "balanced" {
+      $promptMax = 16000
+      $assessmentMax = 12000
+      $dossierMax = 5000
+      $codeMapMax = 6000
+      $requestMax = 5000
+    }
+    "deep" {
+      $promptMax = 60000
+      $assessmentMax = 24000
+      $dossierMax = 18000
+      $codeMapMax = 22000
+      $requestMax = 18000
+    }
+    default {
+      $promptMax = 8000
+      $assessmentMax = 6000
+      $dossierMax = 2200
+      $codeMapMax = 2600
+      $requestMax = 2200
+    }
+  }
+  if ($PromptLimit -gt 0) {
+    $promptMax = $PromptLimit
+    $assessmentMax = [Math]::Min($assessmentMax, $PromptLimit)
+  }
+  return [pscustomobject]@{
+    mode = $Mode
+    prompt_max_chars = $promptMax
+    assessment_max_chars = $assessmentMax
+    dossier_excerpt_chars = $dossierMax
+    code_map_excerpt_chars = $codeMapMax
+    request_excerpt_chars = $requestMax
+  }
+}
+
+function Limit-Text {
+  param(
+    [AllowNull()][string]$Text,
+    [int]$MaxChars = 0
+  )
+  if ($null -eq $Text) { return "" }
+  if ($MaxChars -le 0 -or $Text.Length -le $MaxChars) { return $Text }
+  $note = "`n`n...(truncated by quota mode; full material remains in docs/ai-review-loop/)"
+  $headLength = [Math]::Max(0, $MaxChars - $note.Length)
+  return $Text.Substring(0, $headLength) + $note
+}
+
+function Set-PromptStats {
+  param(
+    [Parameter(Mandatory = $true)]$State,
+    [Parameter(Mandatory = $true)][string]$PromptText,
+    [Parameter(Mandatory = $true)][string]$Mode
+  )
+  $chars = $PromptText.Length
+  $cumulative = 0
+  if ($State.PSObject.Properties.Name -contains "cumulative_prompt_chars" -and $null -ne $State.cumulative_prompt_chars) {
+    $cumulative = [int64]$State.cumulative_prompt_chars
+  }
+  Set-ObjectProperty $State "quota_mode" $Mode
+  Set-ObjectProperty $State "last_prompt_chars" $chars
+  Set-ObjectProperty $State "cumulative_prompt_chars" ([int64]($cumulative + $chars))
+}
+
+function New-RuntimeBrief {
+  param(
+    [Parameter(Mandatory = $true)][string]$ProjectRoot,
+    [string]$Reason = "state_snapshot"
+  )
+  $paths = Get-ReviewPaths -ProjectRoot $ProjectRoot
+  $config = Get-Config -ProjectRoot $ProjectRoot
+  $state = Get-State -ProjectRoot $ProjectRoot
+  $safeReason = if ($Reason) { $Reason -replace "[^A-Za-z0-9_.-]", "-" } else { "state_snapshot" }
+  $briefPath = Join-Path $paths.LoopRuns ("{0}-{1}-runtime-brief.json" -f (Get-Date -Format "yyyyMMdd-HHmmss-fff"), $safeReason)
+  $target = $config.target_chatgpt_conversation_url
+  if (-not $target) { $target = $config.target_chatgpt_url }
+  $brief = [ordered]@{
+    created_at = (Get-Date).ToString("o")
+    reason = $Reason
+    project_root = $ProjectRoot
+    target_chatgpt_url = $target
+    quota_mode = $state.quota_mode
+    latest_prompt = $state.latest_prompt
+    latest_assessment_prompt = if ($state.PSObject.Properties.Name -contains "latest_assessment_prompt") { $state.latest_assessment_prompt } else { $null }
+    latest_dossier = if ($state.PSObject.Properties.Name -contains "latest_dossier") { $state.latest_dossier } else { $null }
+    latest_code_map = if ($state.PSObject.Properties.Name -contains "latest_code_map") { $state.latest_code_map } else { $null }
+    latest_round_request = if ($state.PSObject.Properties.Name -contains "latest_round_request") { $state.latest_round_request } else { $null }
+    latest_visual_evidence_path = $state.latest_visual_evidence_path
+    latest_visual_evidence_hash = $state.latest_visual_evidence_hash
+    browser_preflight_status = $state.browser_preflight_status
+    browser_backend_type = $state.browser_backend_type
+    browser_target_tab_id = $state.browser_target_tab_id
+    loop_status = $state.loop_status
+    goal_verdict = $state.goal_verdict
+    next_action = $state.next_action
+    should_send_to_gpt = $state.should_send_to_gpt
+    send_reason = $state.send_reason
+    last_prompt_chars = $state.last_prompt_chars
+    cumulative_prompt_chars = $state.cumulative_prompt_chars
+  }
+  ConvertTo-JsonFile $brief $briefPath
+  $state = Get-State -ProjectRoot $ProjectRoot
+  Set-ObjectProperty $state "runtime_brief" (Get-RelativePath -Root $ProjectRoot -Path $briefPath)
+  Save-State $ProjectRoot $state
+  return $briefPath
+}
+
+function Invoke-BrowserPreflight {
+  param([Parameter(Mandatory = $true)][string]$ProjectRoot)
+  $state = Get-State -ProjectRoot $ProjectRoot
+  $iteration = if ($state.iteration_counter) { [int]$state.iteration_counter } else { 0 }
+  if ($state.browser_preflight_iteration -eq $iteration -and $state.browser_preflight_status) {
+    $briefPath = New-RuntimeBrief -ProjectRoot $ProjectRoot -Reason "browser_preflight_cached"
+    Write-Host "Browser preflight reused from runtime state: $($state.browser_preflight_status)" -ForegroundColor Green
+    Write-Host "Runtime brief: $briefPath"
+    return
+  }
+  Set-ObjectProperty $state "browser_preflight_status" "pending_edge_browser_control"
+  Set-ObjectProperty $state "browser_backend_type" "codex_edge_chrome_extension_backend"
+  if (-not ($state.PSObject.Properties.Name -contains "browser_target_tab_id")) {
+    Set-ObjectProperty $state "browser_target_tab_id" $null
+  }
+  Set-ObjectProperty $state "browser_preflight_iteration" $iteration
+  Set-ObjectProperty $state "browser_preflight_checked_at" (Get-Date).ToString("o")
+  Save-State $ProjectRoot $state
+  $briefPath = New-RuntimeBrief -ProjectRoot $ProjectRoot -Reason "browser_preflight"
+  Write-Host "Browser preflight recorded once for this iteration." -ForegroundColor Green
+  Write-Host "Preferred route: Codex Edge/Chrome extension backend."
+  Write-Host "Runtime brief: $briefPath"
+}
+
 function Ensure-ReviewLoop {
   param(
     [Parameter(Mandatory = $true)][string]$ProjectRoot,
@@ -207,6 +350,7 @@ function Ensure-ReviewLoop {
       local_project_name = (Split-Path -Leaf $ProjectRoot)
     }
   }
+  $quotaDefaults = Get-QuotaSettings -Mode $QuotaMode -PromptLimit $MaxPromptChars
   $requiredConfig = [ordered]@{
     transport = "browser_dossier"
     run_mode = "continuous_until_stopped"
@@ -217,6 +361,10 @@ function Ensure-ReviewLoop {
     codex_assessment_required = $true
     feedback_return_policy = "send_local_assessment_to_same_chat"
     url_selection_policy = "ask_once_when_missing_or_changed"
+    quota_mode = $quotaDefaults.mode
+    default_max_prompt_chars = $quotaDefaults.prompt_max_chars
+    visual_evidence_policy = "attach_only_when_requested_or_new_hash"
+    external_review_policy = "send_only_when_new_evidence_or_explicit_review_needed"
   }
   foreach ($key in $requiredConfig.Keys) {
     Set-ObjectProperty $config $key $requiredConfig[$key]
@@ -254,10 +402,28 @@ function Ensure-ReviewLoop {
       continuation_required = $false
       url_confirmation_required = -not (Test-ChatGptUrl $targetUrl)
       url_confirmation_reason = if (Test-ChatGptUrl $targetUrl) { $null } else { "missing_target_chatgpt_url" }
+      quota_mode = $quotaDefaults.mode
+      runtime_brief = $null
+      browser_preflight_status = $null
+      browser_backend_type = $null
+      browser_target_tab_id = $null
+      browser_preflight_iteration = $null
+      browser_preflight_checked_at = $null
+      latest_visual_evidence_hash = $null
+      latest_visual_evidence_path = $null
+      last_visual_evidence_sent_hash = $null
+      attach_visual_evidence_requested = $false
+      last_prompt_chars = 0
+      cumulative_prompt_chars = 0
+      external_review_count = 0
+      local_only_iteration_count = 0
+      should_send_to_gpt = $true
+      send_reason = "initial_review"
+      local_only_next_action = $null
     }
   } else {
     $state = Read-JsonFile $paths.State
-    foreach ($field in @("version", "iteration_counter", "loop_mode", "loop_status", "latest_review", "goal_verdict", "next_action", "stop_reason", "baseline_sent_to_url", "baseline_sent_hash", "latest_prompt_target_url", "latest_prompt_opened_tab_url", "latest_assessment_target_url", "latest_assessment_opened_tab_url", "continuation_required", "url_confirmation_required", "url_confirmation_reason")) {
+    foreach ($field in @("version", "iteration_counter", "loop_mode", "loop_status", "latest_review", "latest_assessment_prompt", "goal_verdict", "next_action", "stop_reason", "baseline_sent_to_url", "baseline_sent_hash", "latest_prompt_target_url", "latest_prompt_opened_tab_url", "latest_assessment_target_url", "latest_assessment_opened_tab_url", "continuation_required", "url_confirmation_required", "url_confirmation_reason", "quota_mode", "runtime_brief", "browser_preflight_status", "browser_backend_type", "browser_target_tab_id", "browser_preflight_iteration", "browser_preflight_checked_at", "latest_visual_evidence_hash", "latest_visual_evidence_path", "last_visual_evidence_sent_hash", "attach_visual_evidence_requested", "last_prompt_chars", "cumulative_prompt_chars", "external_review_count", "local_only_iteration_count", "should_send_to_gpt", "send_reason", "local_only_next_action")) {
       if (-not ($state.PSObject.Properties.Name -contains $field)) {
         $default = $null
         if ($field -eq "version") { $default = 3 }
@@ -268,6 +434,14 @@ function Ensure-ReviewLoop {
         if ($field -eq "next_action") { $default = "prepare_review" }
         if ($field -eq "continuation_required") { $default = $false }
         if ($field -eq "url_confirmation_required") { $default = $true }
+        if ($field -eq "quota_mode") { $default = $quotaDefaults.mode }
+        if ($field -eq "attach_visual_evidence_requested") { $default = $false }
+        if ($field -eq "last_prompt_chars") { $default = 0 }
+        if ($field -eq "cumulative_prompt_chars") { $default = 0 }
+        if ($field -eq "external_review_count") { $default = 0 }
+        if ($field -eq "local_only_iteration_count") { $default = 0 }
+        if ($field -eq "should_send_to_gpt") { $default = $true }
+        if ($field -eq "send_reason") { $default = "initial_review" }
         Set-ObjectProperty $state $field $default
       }
     }
@@ -278,6 +452,7 @@ function Ensure-ReviewLoop {
     }
     Set-ObjectProperty $state "version" 3
     Set-ObjectProperty $state "loop_mode" "continuous_until_stopped"
+    Set-ObjectProperty $state "quota_mode" $quotaDefaults.mode
     $stateTargetBefore = $state.target_chatgpt_conversation_url
     $configTarget = $config.target_chatgpt_conversation_url
     if (-not $configTarget) { $configTarget = $config.target_chatgpt_url }
@@ -694,11 +869,14 @@ function New-ReviewPrompt {
     [Parameter(Mandatory = $true)][string]$CodeMapPath,
     [Parameter(Mandatory = $true)][string]$RequestPath,
     [Parameter(Mandatory = $true)][string]$BaselineHash,
-    [switch]$ForceFullBaseline
+    [switch]$ForceFullBaseline,
+    [string]$Mode = "economy",
+    [int]$PromptLimit = 0
   )
   $paths = Get-ReviewPaths -ProjectRoot $ProjectRoot
   $config = Get-Config -ProjectRoot $ProjectRoot
   $state = Get-State -ProjectRoot $ProjectRoot
+  $settings = Get-QuotaSettings -Mode $Mode -PromptLimit $PromptLimit
   if (-not $paths.Prompts) { throw "Review path set is missing Prompts directory." }
   if (-not (Test-Path -LiteralPath $paths.Prompts)) {
     New-Item -ItemType Directory -Path $paths.Prompts -Force | Out-Null
@@ -716,15 +894,36 @@ function New-ReviewPrompt {
   } else {
     "Baseline already sent to this ChatGPT conversation with the same baseline hash; this round is delta-only."
   }
-  $dossier = if ($includeBaseline) { Get-ContentExcerpt $DossierPath 18000 } else { "(baseline already sent in this ChatGPT conversation with matching hash)" }
-  $codeMap = if ($includeBaseline) { Get-ContentExcerpt $CodeMapPath 22000 } else { "(baseline code map already sent; this round is delta-only)" }
-  $request = Get-ContentExcerpt $RequestPath 18000
+  $dossier = if ($includeBaseline) { Get-ContentExcerpt $DossierPath $settings.dossier_excerpt_chars } else { "(baseline already sent in this ChatGPT conversation with matching hash)" }
+  $codeMap = if ($includeBaseline) { Get-ContentExcerpt $CodeMapPath $settings.code_map_excerpt_chars } else { "(baseline code map already sent; this round is delta-only)" }
+  $request = Get-ContentExcerpt $RequestPath $settings.request_excerpt_chars
+  $visualEvidence = if ($state.latest_visual_evidence_hash) {
+    "- visual_evidence_hash: $($state.latest_visual_evidence_hash)`n- visual_evidence_path: $($state.latest_visual_evidence_path)"
+  } else {
+    "- visual_evidence_hash: (none recorded)"
+  }
+  $attachmentPolicy = if ($AttachVisualEvidence) {
+    "Visual attachment requested for this browser send. If this hash was already sent in the same ChatGPT conversation, cite the hash instead of re-uploading."
+  } else {
+    "No image attachment is requested by default. Use paths and hashes unless a visual gate needs the image."
+  }
+  $modeInstruction = if ($settings.mode -eq "deep") {
+    "Detailed review is acceptable, but keep findings actionable and do not restate all supplied material."
+  } else {
+    "Economy review: be concise. Do not restate the dossier. Return verdict, blockers, risks, evidence gaps, and the next narrow question."
+  }
   $prompt = @"
 You are GPT Pro reviewing a Codex project through an offline review loop.
 
 Use only the project baseline and round material in this ChatGPT conversation. Ask Codex for missing snippets or command output.
 
 Codex will also run a local Codex efficiency auditor review. Your feedback and the efficiency review will be merged into a local assessment and next decision.
+
+## Quota Mode
+
+- quota_mode: $($settings.mode)
+- max_prompt_chars: $($settings.prompt_max_chars)
+- instruction: $modeInstruction
 
 ## Round
 
@@ -735,6 +934,12 @@ $RoundId
 - baseline_hash: $BaselineHash
 - target_chatgpt_url: $target
 - baseline_mode: $baselineNote
+
+## Visual Evidence
+
+$visualEvidence
+
+Attachment policy: $attachmentPolicy
 
 ## Baseline Dossier
 
@@ -747,13 +952,27 @@ $codeMap
 ## Round Request
 
 $request
+
+## Required Response Shape
+
+- verdict: PASS | NEEDS_EVIDENCE | NEEDS_PROCESS_FIX | NEEDS_HUMAN_DECISION | BLOCKED
+- blockers:
+- risks:
+- local evidence GPT wants Codex to verify:
+- next narrow question:
 "@
+  $prompt = Limit-Text -Text $prompt -MaxChars $settings.prompt_max_chars
   $promptOutputPath = [System.IO.Path]::Combine([string]$paths.Prompts, "$RoundId-review-prompt.md")
   if (-not $promptOutputPath) { throw "Could not build review prompt output path." }
-  Set-Content -LiteralPath $promptOutputPath -Encoding UTF8 -Value $prompt
+  Set-Content -LiteralPath $promptOutputPath -Encoding UTF8 -NoNewline -Value $prompt
+  $storedPrompt = Get-Content -Raw -LiteralPath $promptOutputPath
   $rel = Get-RelativePath -Root $ProjectRoot -Path $promptOutputPath
-  Set-ObjectProperty $state "latest_prompt" $rel
   Add-StateItem -ProjectRoot $ProjectRoot -Field "pending_prompts" -Value $rel
+  $state = Get-State -ProjectRoot $ProjectRoot
+  Set-ObjectProperty $state "latest_prompt" $rel
+  Set-ObjectProperty $state "attach_visual_evidence_requested" ([bool]$AttachVisualEvidence)
+  Set-PromptStats -State $state -PromptText $storedPrompt -Mode $settings.mode
+  Save-State $ProjectRoot $state
   return $promptOutputPath
 }
 
@@ -761,7 +980,9 @@ function New-ReviewPackage {
   param(
     [Parameter(Mandatory = $true)][string]$ProjectRoot,
     [Parameter(Mandatory = $true)][string]$ScanPath,
-    [switch]$ForceFullBaseline
+    [switch]$ForceFullBaseline,
+    [string]$Mode = "economy",
+    [int]$PromptLimit = 0
   )
   $state = Get-State -ProjectRoot $ProjectRoot
   $roundNumber = [int]$state.round_counter + 1
@@ -771,7 +992,7 @@ function New-ReviewPackage {
   $codeMapPath = New-CodeMap -ProjectRoot $ProjectRoot -RoundId $roundId
   $requestPath = New-RoundRequest -ProjectRoot $ProjectRoot -RoundId $roundId -ScanPath $ScanPath
   $baselineHash = Get-FileHashText -Paths @($dossierPath, $codeMapPath)
-  $promptPath = New-ReviewPrompt -ProjectRoot $ProjectRoot -RoundId $roundId -DossierPath $dossierPath -CodeMapPath $codeMapPath -RequestPath $requestPath -BaselineHash $baselineHash -ForceFullBaseline:$ForceFullBaseline
+  $promptPath = New-ReviewPrompt -ProjectRoot $ProjectRoot -RoundId $roundId -DossierPath $dossierPath -CodeMapPath $codeMapPath -RequestPath $requestPath -BaselineHash $baselineHash -ForceFullBaseline:$ForceFullBaseline -Mode $Mode -PromptLimit $PromptLimit
   $state = Get-State -ProjectRoot $ProjectRoot
   Set-ObjectProperty $state "round_counter" $roundNumber
   Set-ObjectProperty $state "iteration_counter" $iterationNumber
@@ -782,7 +1003,11 @@ function New-ReviewPackage {
   Set-ObjectProperty $state "latest_prompt" (Get-RelativePath -Root $ProjectRoot -Path $promptPath)
   Set-ObjectProperty $state "loop_status" "running"
   Set-ObjectProperty $state "next_action" "send_or_capture_review"
+  Set-ObjectProperty $state "should_send_to_gpt" $true
+  Set-ObjectProperty $state "send_reason" "review_package_created"
+  Set-ObjectProperty $state "local_only_next_action" $null
   Save-State $ProjectRoot $state
+  New-RuntimeBrief -ProjectRoot $ProjectRoot -Reason "review_package_created" | Out-Null
   Write-Host "Review package created:" -ForegroundColor Green
   Write-Host "  Dossier: $dossierPath"
   Write-Host "  Code map: $codeMapPath"
@@ -811,8 +1036,14 @@ function Complete-PromptSend {
   Set-ObjectProperty $state "latest_prompt_target_url" $target
   Set-ObjectProperty $state "latest_prompt_opened_tab_url" $ActualTabUrl
   Set-ObjectProperty $state "latest_prompt_sent_at" (Get-Date).ToString("o")
+  $externalCount = if ($state.external_review_count) { [int]$state.external_review_count } else { 0 }
+  Set-ObjectProperty $state "external_review_count" ($externalCount + 1)
+  if ($AttachVisualEvidence -and $state.latest_visual_evidence_hash) {
+    Set-ObjectProperty $state "last_visual_evidence_sent_hash" $state.latest_visual_evidence_hash
+  }
   Set-ObjectProperty $state "next_action" "capture_gpt_pro_review"
   Save-State $ProjectRoot $state
+  New-RuntimeBrief -ProjectRoot $ProjectRoot -Reason "prompt_sent" | Out-Null
 }
 
 function Show-PromptHandoff {
@@ -989,10 +1220,15 @@ $assessmentText
 }
 
 function New-AssessmentPrompt {
-  param([Parameter(Mandatory = $true)][string]$ProjectRoot)
+  param(
+    [Parameter(Mandatory = $true)][string]$ProjectRoot,
+    [string]$Mode = "economy",
+    [int]$PromptLimit = 0
+  )
   $paths = Get-ReviewPaths $ProjectRoot
   $config = Get-Config $ProjectRoot
   $state = Get-State $ProjectRoot
+  $settings = Get-QuotaSettings -Mode $Mode -PromptLimit $PromptLimit
   if (-not $state.latest_assessment) { throw "No assessment found. Run -Action AssessFeedback first." }
   $assessmentPath = Join-Path $ProjectRoot ($state.latest_assessment -replace "/", "\")
   if (-not (Test-Path -LiteralPath $assessmentPath)) { throw "Assessment file does not exist: $assessmentPath" }
@@ -1002,19 +1238,51 @@ function New-AssessmentPrompt {
   $round = if ($state.round_counter) { "round-{0:000}" -f [int]$state.round_counter } else { "round-000" }
   $iteration = if ($state.iteration_counter) { "iter-{0:000}" -f [int]$state.iteration_counter } else { "iter-000" }
   $promptPath = Join-Path $paths.Prompts ("{0}-{1}-assessment-return-prompt.md" -f $round, $iteration)
-  $assessment = Get-ContentExcerpt $assessmentPath 24000
+  $assessment = Get-ContentExcerpt $assessmentPath $settings.assessment_max_chars
+  $reviewSummary = if ($state.latest_review) { $state.latest_review } else { "(no latest review recorded)" }
+  $visualEvidence = if ($state.latest_visual_evidence_hash) {
+    "- visual_evidence_hash: $($state.latest_visual_evidence_hash)`n- visual_evidence_path: $($state.latest_visual_evidence_path)"
+  } else {
+    "- visual_evidence_hash: (none recorded)"
+  }
   $prompt = @"
 Codex has merged project review, local evidence, and Codex efficiency review into one assessment.
 
-Please recheck this assessment, correct any recommendation that no longer fits, and identify the next narrow review question if another loop iteration is useful.
+Please recheck this compact assessment. Correct any recommendation that no longer fits local facts, and identify only the next narrow review question if another loop iteration is useful.
+
+## Quota Mode
+
+- quota_mode: $($settings.mode)
+- max_prompt_chars: $($settings.assessment_max_chars)
+- latest_review: $reviewSummary
+- goal_verdict: $($state.goal_verdict)
+- next_action: $($state.next_action)
+
+## Visual Evidence
+
+$visualEvidence
 
 ## Combined Assessment
 
 $assessment
+
+## Required Response Shape
+
+- verdict:
+- corrections:
+- evidence still needed:
+- next narrow question:
 "@
-  Set-Content -LiteralPath $promptPath -Encoding UTF8 -Value $prompt
+  $prompt = Limit-Text -Text $prompt -MaxChars $settings.assessment_max_chars
+  Set-Content -LiteralPath $promptPath -Encoding UTF8 -NoNewline -Value $prompt
+  $storedPrompt = Get-Content -Raw -LiteralPath $promptPath
+  $rel = Get-RelativePath -Root $ProjectRoot -Path $promptPath
+  Add-StateItem -ProjectRoot $ProjectRoot -Field "pending_prompts" -Value $rel
+  $state = Get-State $ProjectRoot
   Set-ObjectProperty $state "latest_assessment_prompt" (Get-RelativePath -Root $ProjectRoot -Path $promptPath)
+  Set-PromptStats -State $state -PromptText $storedPrompt -Mode $settings.mode
   Save-State $ProjectRoot $state
+  New-RuntimeBrief -ProjectRoot $ProjectRoot -Reason "assessment_prompt_created" | Out-Null
   Write-Host "Open this ChatGPT target with the edge-browser-control skill:" -ForegroundColor Cyan
   Write-Host $target
   Write-Host "Use the official Codex Edge/Chrome extension backend from edge-browser-control; do not substitute a generic Playwright browser or in-app browser for logged-in ChatGPT." -ForegroundColor Yellow
@@ -1025,11 +1293,15 @@ $assessment
     if ($OpenedTabUrl -and -not (Test-ChatGptUrl $OpenedTabUrl)) {
       throw "-OpenedTabUrl must be a https://chatgpt.com/... URL."
     }
+    $state = Get-State $ProjectRoot
     Set-ObjectProperty $state "latest_assessment_sent_at" (Get-Date).ToString("o")
     Set-ObjectProperty $state "latest_assessment_target_url" $target
     Set-ObjectProperty $state "latest_assessment_opened_tab_url" $OpenedTabUrl
+    $externalCount = if ($state.external_review_count) { [int]$state.external_review_count } else { 0 }
+    Set-ObjectProperty $state "external_review_count" ($externalCount + 1)
     Set-ObjectProperty $state "next_action" "capture_gpt_pro_recheck"
     Save-State $ProjectRoot $state
+    New-RuntimeBrief -ProjectRoot $ProjectRoot -Reason "assessment_sent" | Out-Null
     Write-Host "Marked assessment as sent." -ForegroundColor Green
   } else {
     Write-Host "After Edge submits it, rerun SendAssessment with -Send to mark it as sent. Add -OpenedTabUrl <actual-chatgpt-tab-url> when available." -ForegroundColor Yellow
@@ -1052,6 +1324,27 @@ function Invoke-NextDecision {
   Set-ObjectProperty $state "loop_status" $status
   Set-ObjectProperty $state "stop_reason" $stopReason
   Set-ObjectProperty $state "continuation_required" ($status -eq "running")
+  $nextActionText = if ($state.next_action) { [string]$state.next_action } else { "" }
+  $shouldSend = $false
+  $sendReason = "terminal_or_paused"
+  $localOnlyNextAction = $null
+  if ($status -eq "running") {
+    if ($ForceExternalReview) {
+      $shouldSend = $true
+      $sendReason = "force_external_review"
+    } elseif ($nextActionText -match "(?i)(gpt|pro|external|review|recheck|send)") {
+      $shouldSend = $true
+      $sendReason = "next_action_requests_external_review"
+    } else {
+      $sendReason = "local_only_continue"
+      $localOnlyNextAction = $nextActionText
+      $localCount = if ($state.local_only_iteration_count) { [int]$state.local_only_iteration_count } else { 0 }
+      Set-ObjectProperty $state "local_only_iteration_count" ($localCount + 1)
+    }
+  }
+  Set-ObjectProperty $state "should_send_to_gpt" $shouldSend
+  Set-ObjectProperty $state "send_reason" $sendReason
+  Set-ObjectProperty $state "local_only_next_action" $localOnlyNextAction
   Save-State $ProjectRoot $state
   $iteration = if ($state.iteration_counter) { "iter-{0:000}" -f [int]$state.iteration_counter } else { "iter-000" }
   $runPath = Join-Path $paths.LoopRuns ("{0}-{1}-loop-run.json" -f (Get-Date -Format "yyyyMMdd-HHmmss"), $iteration)
@@ -1063,15 +1356,25 @@ function Invoke-NextDecision {
     next_action = $state.next_action
     stop_reason = $stopReason
     continuation_required = ($status -eq "running")
+    should_send_to_gpt = $shouldSend
+    send_reason = $sendReason
+    local_only_next_action = $localOnlyNextAction
     latest_prompt = $state.latest_prompt
     latest_review = $state.latest_review
     latest_assessment = $state.latest_assessment
   }
   ConvertTo-JsonFile $summary $runPath
+  New-RuntimeBrief -ProjectRoot $ProjectRoot -Reason "next_decision" | Out-Null
   Write-Host "Next decision: $verdict" -ForegroundColor Green
   Write-Host "Loop status: $status"
+  Write-Host "should_send_to_gpt: $shouldSend"
+  Write-Host "send_reason: $sendReason"
   if ($status -eq "running") {
-    Write-Host "Continuation required: do not stop the review loop here. Execute next_action, then prepare/send the next review event unless the user stops the session or a hard blocker appears." -ForegroundColor Yellow
+    if ($shouldSend) {
+      Write-Host "Continuation required: prepare or send the external review handoff unless the user stops the session or a hard blocker appears." -ForegroundColor Yellow
+    } else {
+      Write-Host "Continuation required: continue local next_action without sending another GPT prompt yet." -ForegroundColor Yellow
+    }
   }
   Write-Host "Loop run record: $runPath"
 }
@@ -1139,6 +1442,18 @@ function Show-Status {
     latest_assessment_target_url = if ($state) { $state.latest_assessment_target_url } else { $null }
     latest_assessment_opened_tab_url = if ($state) { $state.latest_assessment_opened_tab_url } else { $null }
     continuation_required = if ($state) { $state.continuation_required } else { $false }
+    quota_mode = if ($state) { $state.quota_mode } else { $null }
+    runtime_brief = if ($state) { $state.runtime_brief } else { $null }
+    browser_preflight_status = if ($state) { $state.browser_preflight_status } else { $null }
+    browser_backend_type = if ($state) { $state.browser_backend_type } else { $null }
+    browser_target_tab_id = if ($state) { $state.browser_target_tab_id } else { $null }
+    latest_visual_evidence_hash = if ($state) { $state.latest_visual_evidence_hash } else { $null }
+    last_visual_evidence_sent_hash = if ($state) { $state.last_visual_evidence_sent_hash } else { $null }
+    last_prompt_chars = if ($state) { $state.last_prompt_chars } else { 0 }
+    cumulative_prompt_chars = if ($state) { $state.cumulative_prompt_chars } else { 0 }
+    should_send_to_gpt = if ($state) { $state.should_send_to_gpt } else { $null }
+    send_reason = if ($state) { $state.send_reason } else { $null }
+    local_only_next_action = if ($state) { $state.local_only_next_action } else { $null }
     url_confirmation_required = if ($state) { $state.url_confirmation_required } else { $null }
     url_confirmation_reason = if ($state) { $state.url_confirmation_reason } else { $null }
     pending_prompt_count = if ($state -and $state.pending_prompts) { @($state.pending_prompts).Count } else { 0 }
@@ -1162,11 +1477,23 @@ switch ($Action) {
     Ensure-ReviewLoop -ProjectRoot $ProjectRoot -ChatUrl $TargetChatGptUrl | Out-Null
     Assert-TargetChatGptUrl -ProjectRoot $ProjectRoot | Out-Null
     $scan = Invoke-SensitiveScan -ProjectRoot $ProjectRoot -Allow:$AllowSensitive
-    New-ReviewPackage -ProjectRoot $ProjectRoot -ScanPath $scan -ForceFullBaseline:$ForceBaseline | Out-Null
+    New-ReviewPackage -ProjectRoot $ProjectRoot -ScanPath $scan -ForceFullBaseline:$ForceBaseline -Mode $QuotaMode -PromptLimit $MaxPromptChars | Out-Null
+  }
+  "PrepareCompactReview" {
+    Ensure-ReviewLoop -ProjectRoot $ProjectRoot -ChatUrl $TargetChatGptUrl | Out-Null
+    Assert-TargetChatGptUrl -ProjectRoot $ProjectRoot | Out-Null
+    $scan = Invoke-SensitiveScan -ProjectRoot $ProjectRoot -Allow:$AllowSensitive
+    New-ReviewPackage -ProjectRoot $ProjectRoot -ScanPath $scan -ForceFullBaseline:$ForceBaseline -Mode $QuotaMode -PromptLimit $MaxPromptChars | Out-Null
+  }
+  "PreflightBrowser" {
+    Ensure-ReviewLoop -ProjectRoot $ProjectRoot -ChatUrl $TargetChatGptUrl | Out-Null
+    Assert-TargetChatGptUrl -ProjectRoot $ProjectRoot | Out-Null
+    Invoke-BrowserPreflight -ProjectRoot $ProjectRoot
   }
   "SendPrompt" {
     Ensure-ReviewLoop -ProjectRoot $ProjectRoot -ChatUrl $TargetChatGptUrl | Out-Null
     Assert-TargetChatGptUrl -ProjectRoot $ProjectRoot | Out-Null
+    if ($PreflightBrowser) { Invoke-BrowserPreflight -ProjectRoot $ProjectRoot }
     Show-PromptHandoff -ProjectRoot $ProjectRoot -MarkSent:$Send
   }
   "CaptureFeedback" {
@@ -1193,7 +1520,8 @@ switch ($Action) {
   "SendAssessment" {
     Ensure-ReviewLoop -ProjectRoot $ProjectRoot -ChatUrl $TargetChatGptUrl | Out-Null
     Assert-TargetChatGptUrl -ProjectRoot $ProjectRoot | Out-Null
-    New-AssessmentPrompt -ProjectRoot $ProjectRoot
+    if ($PreflightBrowser) { Invoke-BrowserPreflight -ProjectRoot $ProjectRoot }
+    New-AssessmentPrompt -ProjectRoot $ProjectRoot -Mode $QuotaMode -PromptLimit $MaxPromptChars
   }
   "NextDecision" {
     Ensure-ReviewLoop -ProjectRoot $ProjectRoot -ChatUrl $TargetChatGptUrl | Out-Null
@@ -1203,7 +1531,8 @@ switch ($Action) {
     Ensure-ReviewLoop -ProjectRoot $ProjectRoot -ChatUrl $TargetChatGptUrl | Out-Null
     Assert-TargetChatGptUrl -ProjectRoot $ProjectRoot | Out-Null
     $scan = Invoke-SensitiveScan -ProjectRoot $ProjectRoot -Allow:$AllowSensitive
-    New-ReviewPackage -ProjectRoot $ProjectRoot -ScanPath $scan -ForceFullBaseline:$ForceBaseline | Out-Null
+    New-ReviewPackage -ProjectRoot $ProjectRoot -ScanPath $scan -ForceFullBaseline:$ForceBaseline -Mode $QuotaMode -PromptLimit $MaxPromptChars | Out-Null
+    if ($PreflightBrowser) { Invoke-BrowserPreflight -ProjectRoot $ProjectRoot }
     Show-PromptHandoff -ProjectRoot $ProjectRoot -MarkSent:$Send
   }
   "RecordExperience" {
@@ -1216,7 +1545,8 @@ switch ($Action) {
     Ensure-ReviewLoop -ProjectRoot $ProjectRoot -ChatUrl $TargetChatGptUrl | Out-Null
     Assert-TargetChatGptUrl -ProjectRoot $ProjectRoot | Out-Null
     $scan = Invoke-SensitiveScan -ProjectRoot $ProjectRoot -Allow:$AllowSensitive
-    New-ReviewPackage -ProjectRoot $ProjectRoot -ScanPath $scan -ForceFullBaseline:$ForceBaseline | Out-Null
+    New-ReviewPackage -ProjectRoot $ProjectRoot -ScanPath $scan -ForceFullBaseline:$ForceBaseline -Mode $QuotaMode -PromptLimit $MaxPromptChars | Out-Null
+    if ($PreflightBrowser) { Invoke-BrowserPreflight -ProjectRoot $ProjectRoot }
     Show-PromptHandoff -ProjectRoot $ProjectRoot -MarkSent:$Send
   }
 }
