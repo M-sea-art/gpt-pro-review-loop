@@ -4422,7 +4422,8 @@ switch ($Action) {
     $nextActionText = if ($state.next_action) { [string]$state.next_action } else { "" }
     $needsExternal = $ForceExternalReview -or $config.pro_review_mode -eq "required" -or ($nextActionText -match "(?i)(^|[_\-\s])(gpt|pro|external|review|recheck|send)([_\-\s]|$)")
     $targetUrl = if ($config.target_chatgpt_conversation_url) { $config.target_chatgpt_conversation_url } else { $config.target_chatgpt_url }
-    $missingOptionalProUrl = ($config.pro_review_mode -eq "optional" -and $needsExternal -and -not (Test-ChatGptUrl $targetUrl))
+    $urlConfirmationOnly = ($nextActionText -eq "confirm_target_chatgpt_url" -or ($state.url_confirmation_reason -eq "missing_target_chatgpt_url" -and [bool]$state.url_confirmation_required))
+    $missingOptionalProUrl = ($config.pro_review_mode -eq "optional" -and ($needsExternal -or $urlConfirmationOnly) -and -not (Test-ChatGptUrl $targetUrl))
     if ($config.pro_review_mode -eq "required" -and $needsExternal) { Assert-TargetChatGptUrl -ProjectRoot $ProjectRoot | Out-Null }
     if ($missingOptionalProUrl) {
       $needsExternal = $false
@@ -4493,7 +4494,8 @@ switch ($Action) {
     $nextActionText = if ($state.next_action) { [string]$state.next_action } else { "" }
     $needsExternal = $ForceExternalReview -or $config.pro_review_mode -eq "required" -or ($nextActionText -match "(?i)(^|[_\-\s])(gpt|pro|external|review|recheck|send)([_\-\s]|$)")
     $targetUrl = if ($config.target_chatgpt_conversation_url) { $config.target_chatgpt_conversation_url } else { $config.target_chatgpt_url }
-    $missingOptionalProUrl = ($config.pro_review_mode -eq "optional" -and $needsExternal -and -not (Test-ChatGptUrl $targetUrl))
+    $urlConfirmationOnly = ($nextActionText -eq "confirm_target_chatgpt_url" -or ($state.url_confirmation_reason -eq "missing_target_chatgpt_url" -and [bool]$state.url_confirmation_required))
+    $missingOptionalProUrl = ($config.pro_review_mode -eq "optional" -and ($needsExternal -or $urlConfirmationOnly) -and -not (Test-ChatGptUrl $targetUrl))
     if ($config.pro_review_mode -eq "required" -and $needsExternal) { Assert-TargetChatGptUrl -ProjectRoot $ProjectRoot | Out-Null }
     if ($missingOptionalProUrl) {
       $needsExternal = $false

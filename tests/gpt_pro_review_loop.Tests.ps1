@@ -172,6 +172,21 @@ Describe "gpt-pro-review-loop state machine" {
     $experience | Should -Match "Missing optional GPT Pro URL"
   }
 
+  It "does not preserve confirm target URL as the local next action in optional RunLoop" {
+    $project = New-TestProject "optional-runloop-no-url"
+    Set-Content -LiteralPath (Join-Path $project "AGENTS.md") -Encoding UTF8 -Value "# Project`n`nProject Identity`nContinue locally when Pro is optional.`n`nAcceptance gate: local verifier pass."
+    & $script:Skill -Action Init -Root $project
+    & $script:Skill -Action RunLoop -Root $project
+
+    $state = Read-State $project
+    $state.loop_status | Should -Be "running"
+    $state.should_send_to_gpt | Should -BeFalse
+    $state.send_reason | Should -Be "pro_url_missing_local_loop"
+    $state.next_action | Should -Be "capture_or_run_local_review"
+    $state.local_only_next_action | Should -Be "capture_or_run_local_review"
+    $state.next_action | Should -Not -Be "confirm_target_chatgpt_url"
+  }
+
   It "recommends local RunLoop continuation from Status when optional Pro URL is missing" {
     $project = New-TestProject "status-optional-pro-url-missing"
     & $script:Skill -Action Init -Root $project
