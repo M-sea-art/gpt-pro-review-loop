@@ -704,4 +704,92 @@ Human Gate: manual visual signoff required
     $browserFlow | Should -Match "not necessarily a same-named callable tool"
     $browserFlow | Should -Match "Do not.*generic Playwright browser"
   }
+
+  It "refreshes project understanding files for a new project" {
+    $project = New-TestProject "understanding"
+    New-Item -ItemType Directory -Path (Join-Path $project "docs") -Force | Out-Null
+    Set-Content -LiteralPath (Join-Path $project "AGENTS.md") -Encoding UTF8 -Value "# Agents`n`nProject Identity`nBuild a small browser game prototype.`n`nVerification gate: npm test must pass."
+    Set-Content -LiteralPath (Join-Path $project "package.json") -Encoding UTF8 -Value '{"scripts":{"test":"echo ok"}}'
+    & $script:Skill -Action Init -Root $project -TargetChatGptUrl "https://chatgpt.com/g/test-project"
+    & $script:Skill -Action RefreshProjectUnderstanding -Root $project
+
+    $base = Join-Path $project "docs/ai-review-loop"
+    Test-Path -LiteralPath (Join-Path $base "project-goal-model.md") | Should -BeTrue
+    Test-Path -LiteralPath (Join-Path $base "project-architecture.md") | Should -BeTrue
+    Test-Path -LiteralPath (Join-Path $base "architecture-brief.md") | Should -BeTrue
+    Test-Path -LiteralPath (Join-Path $base "goal-slices.md") | Should -BeTrue
+
+    $state = Read-State $project
+    $state.latest_goal_model | Should -Be "docs/ai-review-loop/project-goal-model.md"
+    $state.latest_architecture_snapshot | Should -Be "docs/ai-review-loop/project-architecture.md"
+    $state.latest_architecture_brief | Should -Be "docs/ai-review-loop/architecture-brief.md"
+    $state.latest_goal_slices | Should -Be "docs/ai-review-loop/goal-slices.md"
+    $state.project_total_goal | Should -Match "Agents|Test Project|Build"
+  }
+
+  It "keeps compressed architecture brief within the requested limit and includes required sections" {
+    $project = New-TestProject "brief"
+    Set-Content -LiteralPath (Join-Path $project "AGENTS.md") -Encoding UTF8 -Value "# Project`n`nProject Identity`nA focused prototype.`n`nAcceptance gate: verifier pass.`nHuman Gate: required before release."
+    & $script:Skill -Action Init -Root $project -TargetChatGptUrl "https://chatgpt.com/g/test-project"
+    & $script:Skill -Action RefreshProjectUnderstanding -Root $project -ArchitectureBriefMaxChars 8000
+
+    $briefPath = Join-Path $project "docs/ai-review-loop/architecture-brief.md"
+    $brief = Get-Content -Raw -LiteralPath $briefPath
+    $brief.Length | Should -BeLessOrEqual 8000
+    $brief | Should -Match "## Goal"
+    $brief | Should -Match "## Architecture"
+    $brief | Should -Match "## Verification"
+    $brief | Should -Match "## Risk"
+    $brief | Should -Match "## Questions For GPT Pro"
+  }
+
+  It "does not resend unchanged architecture brief after the first sent prompt" {
+    $project = New-TestProject "brief-hash"
+    & $script:Skill -Action Init -Root $project -TargetChatGptUrl "https://chatgpt.com/g/test-project"
+    & $script:Skill -Action Prepare -Root $project
+    $state = Read-State $project
+    $firstPrompt = Join-Path $project ($state.latest_prompt -replace "/", "\")
+    (Get-Content -Raw -LiteralPath $firstPrompt) | Should -Match "architecture_brief_mode: included"
+
+    & $script:Skill -Action SendPrompt -Root $project -Send
+    $sentState = Read-State $project
+    $sentState.architecture_brief_sent_hash | Should -Be $sentState.architecture_brief_hash
+
+    & $script:Skill -Action Prepare -Root $project
+    $state2 = Read-State $project
+    $secondPrompt = Join-Path $project ($state2.latest_prompt -replace "/", "\")
+    $second = Get-Content -Raw -LiteralPath $secondPrompt
+    $second | Should -Match "architecture_brief_mode: hash_only_unchanged"
+    $second | Should -Match "Architecture brief unchanged"
+  }
+
+  It "pauses when project total goal confidence is low" {
+    $project = New-TestProject "goal-conflict"
+    Set-Content -LiteralPath (Join-Path $project "AGENTS.md") -Encoding UTF8 -Value "# Project A`nGOAL_CONFLICT: two incompatible total goals."
+    & $script:Skill -Action Init -Root $project -TargetChatGptUrl "https://chatgpt.com/g/test-project"
+    & $script:Skill -Action RefreshProjectUnderstanding -Root $project
+
+    $state = Read-State $project
+    $state.goal_confidence | Should -Be "low"
+    $state.loop_status | Should -Be "paused"
+    $state.goal_verdict | Should -Be "NEEDS_HUMAN_DECISION"
+    $state.next_action | Should -Be "clarify_project_total_goal"
+  }
+
+  It "treats goal slice completion as non-terminal for project total" {
+    $project = New-TestProject "slice-subgoal"
+    New-Item -ItemType Directory -Path (Join-Path $project "docs/project") -Force | Out-Null
+    Set-Content -LiteralPath (Join-Path $project "docs/project/ROADMAP.md") -Encoding UTF8 -Value "Remaining P0: demo readiness NOT_READY."
+    & $script:Skill -Action Init -Root $project -TargetChatGptUrl "https://chatgpt.com/g/test-project" -GoalScope test_line
+    & $script:Skill -Action Prepare -Root $project
+    & $script:Skill -Action CaptureReview -Root $project -Reviewer codex-efficiency-auditor -Phase goal-audit -ReviewText "test line accepted"
+    & $script:Skill -Action AssessFeedback -Root $project -GoalVerdict GOAL_ACHIEVED -NextAction "slice_done"
+    & $script:Skill -Action NextDecision -Root $project
+
+    $state = Read-State $project
+    $state.loop_status | Should -Be "running"
+    $state.project_goal_verdict | Should -Be "CONTINUE"
+    $state.goal_achieved_is_terminal | Should -BeFalse
+    $state.latest_goal_slices | Should -Be "docs/ai-review-loop/goal-slices.md"
+  }
 }

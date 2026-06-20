@@ -21,6 +21,8 @@ review package -> external/internal review -> local assessment -> next decision
 - Each loop run stores a compact `runtime-brief.json` so Codex can reuse target URL, prompt path, evidence hash, browser route status, and latest state without repeatedly rereading large files.
 - Completion is guarded at the project-total level. A task, milestone, or test-line can be accepted without stopping the continuous loop.
 - Project blockers are normalized into a queue so a running loop gets a concrete local next action instead of stopping at a generic blocker label.
+- Before review, the loop builds a project understanding layer: a project goal model, an architecture snapshot, a compressed architecture brief, and a goal-slice queue.
+- GPT Pro receives the compressed architecture brief on the first baseline or when its hash changes. Later rounds send only the hash and delta unless broader context is requested.
 - GPT Pro is optional by default. Local-only progress, local evidence, and local expert council planning happen without opening ChatGPT unless the next decision actually needs external review.
 - The local expert council runs as `reviewer=local-expert-council`: brainstorm first, post-evaluate later, then place candidate new goals into backlog.
 - Codex efficiency audit is the process supervisor, not a plain extra reviewer. It supplies capability routing, periodic audit, stall/pivot status, Done Gate, and final closure evidence.
@@ -100,6 +102,11 @@ Modes:
 Useful explicit actions:
 
 ```powershell
+& "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action RefreshProjectUnderstanding -Root "<project-root>"
+& "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action BuildGoalModel -Root "<project-root>"
+& "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action AnalyzeArchitecture -Root "<project-root>"
+& "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action BuildArchitectureBrief -Root "<project-root>" -ArchitectureBriefMaxChars 8000
+& "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action BuildGoalSlices -Root "<project-root>"
 & "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action RunCapabilityScan -Root "<project-root>" -AuditContext "game Godot browser playtest"
 & "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action RunEfficiencyAudit -Root "<project-root>" -PeriodicAudit
 & "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action RunDoneGate -Root "<project-root>"
@@ -131,7 +138,10 @@ Use larger handoffs only when needed:
 ```powershell
 & "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action Prepare -Root "<project-root>" -QuotaMode balanced
 & "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action Prepare -Root "<project-root>" -QuotaMode deep
+& "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action BuildArchitectureBrief -Root "<project-root>" -ArchitectureBriefMaxChars 12000
 ```
+
+If GPT Pro says context is insufficient, regenerate only the compressed architecture brief with a larger limit such as `12000`; do not send raw project files or the full local ledger.
 
 The script prints the ChatGPT target and prompt file. Send that prompt through Edge, then mark it sent:
 
@@ -215,6 +225,10 @@ docs/ai-review-loop/
   project-config.json
   review-state.json
   decisions.md
+  project-goal-model.md
+  project-architecture.md
+  architecture-brief.md
+  goal-slices.md
   dossiers/
   code-maps/
   round-requests/

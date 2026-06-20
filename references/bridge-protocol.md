@@ -20,6 +20,10 @@ docs/ai-review-loop/
   loop-runs/
   security-scans/
   project-goal-plan.md
+  project-goal-model.md
+  project-architecture.md
+  architecture-brief.md
+  goal-slices.md
   local-council.md
   goal-backlog.md
   experience-log.md
@@ -55,7 +59,12 @@ docs/ai-review-loop/
   "efficiency_audit_policy": "capability_scan_goal_supervision_periodic_done_gate_final_closure",
   "pro_tab_close_policy": "target_conversation",
   "local_council_mode": "enabled",
-  "local_council_policy": "brainstorm_then_post_evaluation"
+  "local_council_policy": "brainstorm_then_post_evaluation",
+  "goal_discovery_mode": "auto",
+  "architecture_analysis_mode": "standard",
+  "architecture_brief_max_chars": 8000,
+  "architecture_brief_policy": "first_baseline_or_architecture_hash_change",
+  "pro_role_policy": "external_expert_advisory_only"
 }
 ```
 
@@ -129,6 +138,17 @@ docs/ai-review-loop/
 - `progress_artifacts`: progress update artifacts that should trigger local council planning.
 - `goal_backlog`: candidate goals proposed by post-evaluation.
 - `active_generated_goal_id`: promoted generated goal id, if any.
+- `project_total_goal`: current inferred total project goal.
+- `goal_confidence`: `high`, `medium`, `low`, or `unknown`.
+- `goal_sources`: project files used to infer the total goal and completion boundaries.
+- `latest_goal_model`: latest `project-goal-model.md`.
+- `latest_architecture_snapshot`: latest `project-architecture.md`.
+- `latest_architecture_brief`: latest compressed brief for GPT Pro.
+- `architecture_brief_hash`: hash of the latest compressed architecture brief.
+- `architecture_brief_sent_hash`: hash last sent to the configured ChatGPT conversation.
+- `latest_goal_slices`: latest `goal-slices.md`.
+- `current_goal_slice_id`: selected small goal slice for local progress.
+- `goal_slice_status`: `open`, `no_open_slices`, `human_or_future_only`, or `not_built`.
 
 ## URL Confirmation
 
@@ -150,6 +170,26 @@ Review material files should use project-relative paths and avoid local absolute
 - `project-goal-plan.md`: compact local plan generated from `project_blocker_queue`.
 - `local-council.md`: pointer and summary for the latest local expert council meeting.
 - `goal-backlog.md`: Markdown rendering of candidate generated goals.
+- `project-goal-model.md`: project total goal, confidence, sources, completion gates, and non-completion boundaries.
+- `project-architecture.md`: read-only architecture snapshot from CodeGraph-aware outer analysis or deterministic filesystem/config fallback.
+- `architecture-brief.md`: compressed Pro-readable architecture brief, normally 4k-8k characters.
+- `goal-slices.md`: small goal queue binding blockers to gates, evidence needs, capability routes, Human Gate status, and current progress.
+
+## Project Understanding Layer
+
+Each loop starts with `RefreshProjectUnderstanding`:
+
+```text
+BuildGoalModel -> AnalyzeArchitecture -> BuildArchitectureBrief -> BuildGoalSlices
+```
+
+`BuildGoalModel` reads user/project governance files such as `AGENTS.md`, README, roadmap, acceptance docs, Human Gate docs, completion reports, and verifier output. If the total goal is missing or contradictory, the loop records low confidence and pauses for `NEEDS_HUMAN_DECISION`.
+
+`AnalyzeArchitecture` is read-only. The outer Codex agent should use CodeGraph for structural questions when it is available, but the PowerShell ledger uses a deterministic filesystem/config fallback so the action is portable.
+
+`BuildArchitectureBrief` compresses the goal model and architecture snapshot for GPT Pro. The first baseline, forced baseline, or changed `architecture_brief_hash` includes the brief; unchanged rounds send only the hash. If GPT Pro asks for more context, regenerate with a larger bound such as `-ArchitectureBriefMaxChars 12000`; do not send raw project files.
+
+`BuildGoalSlices` decomposes total-goal blockers into small slices. A slice can be closed without making `project_total` complete. Project completion still requires no unresolved slice blockers, project-total guard PASS, and Done Gate PASS.
 
 ## Review Capture
 

@@ -25,6 +25,15 @@ Every continuous loop can also run a local expert council review. The council is
 
 Codex efficiency audit is the loop's process supervisor. It is not just another advisory reviewer: it provides read-only capability scan input, periodic audit, stall/pivot status, Done Gate, and final closure checks. The loop stores those events in the same `reviews/` stream, but `NextDecision` treats Done Gate and stall/pivot fields as control evidence.
 
+v1.7 adds a project understanding layer before review:
+
+- `project-goal-model.md`: project total goal, subgoal/gate sources, completion gates, and non-completion boundaries.
+- `project-architecture.md`: read-only architecture snapshot covering project type, stack, entry points, key modules, verification commands, and protected boundaries.
+- `architecture-brief.md`: compressed 4k-8k character brief for GPT Pro, sent on the first baseline or when the architecture hash changes.
+- `goal-slices.md`: small goal queue where each slice has acceptance evidence, recommended capability route, Human Gate status, and current progress.
+
+GPT Pro is an external expert in the review panel, not the final judge. Its comments must flow through local assessment, efficiency audit, expert council, project-total guard, and Done Gate before Codex acts or claims completion.
+
 The mental model is:
 
 ```text
@@ -74,13 +83,36 @@ GPT Pro, Codex efficiency review, and the local expert council are `reviewer` va
    - `standard`: capability scan, periodic audit after progress, Done Gate, final closure.
    - `strict`: also run preflight/process checks around repeated failure, subgoal/project completion, and Human Gate boundaries.
 
+   Project understanding controls:
+
+   ```powershell
+   -GoalDiscoveryMode auto|docs_first|explicit_only
+   -ArchitectureAnalysisMode light|standard|deep
+   -ArchitectureBriefMaxChars 8000
+   -IncludeArchitectureBriefForPro
+   ```
+
+   `auto` reads user/project docs such as `AGENTS.md`, README, roadmap, acceptance docs, Human Gate docs, completion reports, and verifier output. `explicit_only` pauses with `NEEDS_HUMAN_DECISION` if the project total goal cannot be established from an explicit existing state.
+
 3. Prepare the offline review package:
 
    ```powershell
    & "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action PrepareCompactReview -Root "<project-root>"
    ```
 
-   This writes under `docs/ai-review-loop/`, runs the sensitive-data scan, creates a project dossier, creates a code map, creates a round request, assembles a compact ChatGPT prompt, and writes a runtime brief. Use `-ForceBaseline` when the ChatGPT conversation lost context or the user explicitly wants a full baseline resend. Use `-QuotaMode balanced` or `-QuotaMode deep` only when the compact prompt is insufficient.
+   This writes under `docs/ai-review-loop/`, refreshes project understanding, runs the sensitive-data scan, creates a project dossier, creates a code map, creates a round request, assembles a compact ChatGPT prompt, and writes a runtime brief. Use `-ForceBaseline` when the ChatGPT conversation lost context or the user explicitly wants a full baseline resend. Use `-QuotaMode balanced` or `-QuotaMode deep` only when the compact prompt is insufficient.
+
+   Explicit understanding actions:
+
+   ```powershell
+   & "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action RefreshProjectUnderstanding -Root "<project-root>"
+   & "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action BuildGoalModel -Root "<project-root>"
+   & "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action AnalyzeArchitecture -Root "<project-root>"
+   & "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action BuildArchitectureBrief -Root "<project-root>" -ArchitectureBriefMaxChars 8000
+   & "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action BuildGoalSlices -Root "<project-root>"
+   ```
+
+   The complete architecture snapshot stays local. GPT Pro receives only `architecture-brief.md` when it is new or changed. If GPT Pro says context is insufficient, regenerate the brief with a larger bound such as `-ArchitectureBriefMaxChars 12000` instead of sending the whole project.
 
    Use `-GoalScope task|milestone|test_line|project_total` to label the current review target. Keep `project_total` as the terminal scope unless the user explicitly changes the project governance model. Compact prompts include `Goal Context` so GPT Pro and Codex efficiency review can distinguish a subgoal from total project completion.
 

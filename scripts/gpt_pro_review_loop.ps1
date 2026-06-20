@@ -1,6 +1,6 @@
 [CmdletBinding()]
 param(
-  [ValidateSet("Init", "Prepare", "PrepareCompactReview", "PreflightBrowser", "SendPrompt", "CaptureFeedback", "CaptureReview", "WaitFeedback", "AssessFeedback", "SendAssessment", "NextDecision", "BuildProjectGoalPlan", "NextLocalAction", "RunCapabilityScan", "RunEfficiencyAudit", "RunDoneGate", "RunFinalClosure", "RunLocalCouncil", "CloseProTab", "RecordProgress", "PromoteGoal", "RunLoop", "RecordExperience", "Status", "Run")]
+  [ValidateSet("Init", "Prepare", "PrepareCompactReview", "PreflightBrowser", "SendPrompt", "CaptureFeedback", "CaptureReview", "WaitFeedback", "AssessFeedback", "SendAssessment", "NextDecision", "BuildProjectGoalPlan", "NextLocalAction", "RunCapabilityScan", "RunEfficiencyAudit", "RunDoneGate", "RunFinalClosure", "RunLocalCouncil", "CloseProTab", "RecordProgress", "PromoteGoal", "BuildGoalModel", "AnalyzeArchitecture", "BuildArchitectureBrief", "BuildGoalSlices", "RefreshProjectUnderstanding", "RunLoop", "RecordExperience", "Status", "Run")]
   [string]$Action = "Run",
   [string]$Root,
   [string]$TargetChatGptUrl,
@@ -31,6 +31,12 @@ param(
   [ValidateSet("project_total")]
   [string]$TerminalGoalScope = "project_total",
   [switch]$ForceCompleteProjectGoal,
+  [ValidateSet("auto", "docs_first", "explicit_only")]
+  [string]$GoalDiscoveryMode = "auto",
+  [ValidateSet("light", "standard", "deep")]
+  [string]$ArchitectureAnalysisMode = "standard",
+  [int]$ArchitectureBriefMaxChars = 8000,
+  [switch]$IncludeArchitectureBriefForPro,
   [ValidateSet("gpt-pro", "codex-efficiency-auditor", "local-expert-council")]
   [string]$Reviewer = "gpt-pro",
   [ValidateSet("initial", "recheck", "process-audit", "goal-audit", "brainstorm", "post-evaluation", "capability-scan", "preflight-audit", "periodic-audit", "done-gate", "final-closure", "stall-pivot")]
@@ -56,6 +62,8 @@ $GoalScopeProvided = $PSBoundParameters.ContainsKey("GoalScope")
 $TerminalGoalScopeProvided = $PSBoundParameters.ContainsKey("TerminalGoalScope")
 $ProReviewModeProvided = $PSBoundParameters.ContainsKey("ProReviewMode")
 $EfficiencyAuditModeProvided = $PSBoundParameters.ContainsKey("EfficiencyAuditMode")
+$GoalDiscoveryModeProvided = $PSBoundParameters.ContainsKey("GoalDiscoveryMode")
+$ArchitectureAnalysisModeProvided = $PSBoundParameters.ContainsKey("ArchitectureAnalysisMode")
 
 if ($PSVersionTable.PSVersion.Major -lt 7) {
   throw "gpt_pro_review_loop.ps1 requires PowerShell 7+ because it uses .NET path APIs such as System.IO.Path.GetRelativePath."
@@ -137,6 +145,10 @@ function Get-ReviewPaths {
     LoopRuns = Join-Path $base "loop-runs"
     SecurityScans = Join-Path $base "security-scans"
     ProjectGoalPlan = Join-Path $base "project-goal-plan.md"
+    ProjectGoalModel = Join-Path $base "project-goal-model.md"
+    ProjectArchitecture = Join-Path $base "project-architecture.md"
+    ArchitectureBrief = Join-Path $base "architecture-brief.md"
+    GoalSlices = Join-Path $base "goal-slices.md"
     LocalCouncil = Join-Path $base "local-council.md"
     GoalBacklog = Join-Path $base "goal-backlog.md"
     ExperienceLog = Join-Path $base "experience-log.md"
@@ -620,13 +632,17 @@ function New-LocalCouncilReview {
     Update-ProjectBlockerQueue -ProjectRoot $ProjectRoot -State $state -Blockers @($guard.blockers) | Out-Null
   }
   $queue = @($state.project_blocker_queue)
-  $routeText = if ($state.recommended_capability_routes) { (@($state.recommended_capability_routes | Select-Object -First 8) -join ", ") } else { "(no capability scan yet)" }
+  $routeText = if ($state.recommended_capability_routes) { [string]::Join(", ", [string[]]@($state.recommended_capability_routes | Select-Object -First 8)) } else { "(no capability scan yet)" }
+  $goalModelText = if ($state.latest_goal_model) { $state.latest_goal_model } else { "(no project goal model yet)" }
+  $architectureText = if ($state.latest_architecture_snapshot) { $state.latest_architecture_snapshot } else { "(no architecture snapshot yet)" }
+  $goalSliceText = if ($state.current_goal_slice_id) { $state.current_goal_slice_id } else { "(no current goal slice yet)" }
   $ideaLines = New-Object System.Collections.Generic.List[string]
   $ideaLines.Add("- 产品目标专家：把项目总目标拆成下一条用户可感知的完成信号。") | Out-Null
   $ideaLines.Add("- 实现路线专家：围绕 current_blocker_id 设计一个最小本地产物，而不是扩大系统范围。") | Out-Null
   $ideaLines.Add("- 验证专家：为下一步行动配一个可重复命令、截图、哈希或文档证据。") | Out-Null
   $ideaLines.Add("- 流程效率专家：先推进 should_send_to_gpt=false 的本地项，只有新问题再外部复核。") | Out-Null
   $ideaLines.Add("- 能力路线观察：可参考 $routeText，但推荐能力不等于授权。") | Out-Null
+  $ideaLines.Add("- 项目理解观察：目标模型 $goalModelText，架构画像 $architectureText，当前切片 $goalSliceText。") | Out-Null
   foreach ($item in @($queue | Select-Object -First 8)) {
     $ideaLines.Add("- 相互激发：围绕 $($item.id) 产生候选推进点：$($item.raw_text)") | Out-Null
   }
@@ -668,6 +684,9 @@ function New-LocalCouncilReview {
     "- participants: 产品目标专家, 实现路线专家, 验证专家, 流程效率专家",
     "- latest_capability_scan: $($state.latest_capability_scan)",
     "- latest_efficiency_audit: $($state.latest_efficiency_audit)",
+    "- latest_goal_model: $goalModelText",
+    "- latest_architecture_snapshot: $architectureText",
+    "- current_goal_slice_id: $goalSliceText",
     "- stall_pivot_status: $($state.stall_pivot_status)",
     "- capability_routes: $routeText",
     "",
@@ -936,7 +955,7 @@ function New-EfficiencyAuditReview {
   $staleCount = if ($state.stale_count) { [int]$state.stale_count } elseif ($state.stalled_local_action_count) { [int]$state.stalled_local_action_count } else { 0 }
   $stallVerdict = Get-StallPivotVerdict -StaleCount $staleCount
   $scopeDrift = if ($state.next_action -match "(?i)(push|publish|deploy|merge|delete|reset|credential|billing|external account)") { "POSSIBLE_SCOPE_DRIFT_OR_HUMAN_GATE" } else { "none_detected" }
-  $routeText = if ($state.recommended_capability_routes) { (@($state.recommended_capability_routes) -join ", ") } else { "(run capability scan for route recommendations)" }
+  $routeText = if ($state.recommended_capability_routes) { [string]::Join(", ", [string[]]@($state.recommended_capability_routes)) } else { "(run capability scan for route recommendations)" }
   $audit = @"
 # Codex Efficiency Audit
 
@@ -1464,6 +1483,11 @@ function Ensure-ReviewLoop {
   if ($effectiveProReviewMode -notin @("optional", "required", "disabled")) { $effectiveProReviewMode = "optional" }
   $effectiveEfficiencyAuditMode = if ($EfficiencyAuditModeProvided) { $EfficiencyAuditMode } elseif ($config.efficiency_audit_mode) { [string]$config.efficiency_audit_mode } else { "standard" }
   if ($effectiveEfficiencyAuditMode -notin @("off", "light", "standard", "strict")) { $effectiveEfficiencyAuditMode = "standard" }
+  $effectiveGoalDiscoveryMode = if ($GoalDiscoveryModeProvided) { $GoalDiscoveryMode } elseif ($config.goal_discovery_mode) { [string]$config.goal_discovery_mode } else { "auto" }
+  if ($effectiveGoalDiscoveryMode -notin @("auto", "docs_first", "explicit_only")) { $effectiveGoalDiscoveryMode = "auto" }
+  $effectiveArchitectureAnalysisMode = if ($ArchitectureAnalysisModeProvided) { $ArchitectureAnalysisMode } elseif ($config.architecture_analysis_mode) { [string]$config.architecture_analysis_mode } else { "standard" }
+  if ($effectiveArchitectureAnalysisMode -notin @("light", "standard", "deep")) { $effectiveArchitectureAnalysisMode = "standard" }
+  $effectiveArchitectureBriefMaxChars = if ($ArchitectureBriefMaxChars -gt 0) { $ArchitectureBriefMaxChars } elseif ($config.architecture_brief_max_chars) { [int]$config.architecture_brief_max_chars } else { 8000 }
   $effectiveLocalCouncilMode = if ($config.local_council_mode) { [string]$config.local_council_mode } else { "enabled" }
   if ($LocalCouncil) { $effectiveLocalCouncilMode = "enabled" }
   $requiredConfig = [ordered]@{
@@ -1491,6 +1515,11 @@ function Ensure-ReviewLoop {
     pro_tab_close_policy = "target_conversation"
     local_council_mode = $effectiveLocalCouncilMode
     local_council_policy = "brainstorm_then_post_evaluation"
+    goal_discovery_mode = $effectiveGoalDiscoveryMode
+    architecture_analysis_mode = $effectiveArchitectureAnalysisMode
+    architecture_brief_max_chars = $effectiveArchitectureBriefMaxChars
+    architecture_brief_policy = "first_baseline_or_architecture_hash_change"
+    pro_role_policy = "external_expert_advisory_only"
   }
   foreach ($key in $requiredConfig.Keys) {
     Set-ObjectProperty $config $key $requiredConfig[$key]
@@ -1500,7 +1529,7 @@ function Ensure-ReviewLoop {
 
   if (-not (Test-Path -LiteralPath $paths.State)) {
     $state = [ordered]@{
-      version = 7
+      version = 8
       updated_at = (Get-Date).ToString("o")
       baseline_sent = $false
       baseline_hash = $null
@@ -1584,13 +1613,25 @@ function Ensure-ReviewLoop {
       stall_pivot_status = "CONTINUE"
       done_gate_verdict = $null
       final_closure_verdict = $null
+      project_total_goal = $null
+      goal_confidence = "unknown"
+      goal_sources = @()
+      latest_goal_model = $null
+      latest_architecture_snapshot = $null
+      latest_architecture_brief = $null
+      architecture_brief_hash = $null
+      architecture_brief_sent_hash = $null
+      latest_prompt_included_architecture_brief = $false
+      latest_goal_slices = $null
+      current_goal_slice_id = $null
+      goal_slice_status = "not_built"
     }
   } else {
     $state = Read-JsonFile $paths.State
-    foreach ($field in @("version", "iteration_counter", "loop_mode", "loop_status", "latest_review", "latest_assessment_prompt", "goal_verdict", "next_action", "stop_reason", "baseline_sent_to_url", "baseline_sent_hash", "latest_prompt_target_url", "latest_prompt_opened_tab_url", "latest_assessment_target_url", "latest_assessment_opened_tab_url", "continuation_required", "url_confirmation_required", "url_confirmation_reason", "quota_mode", "runtime_brief", "browser_preflight_status", "browser_backend_type", "browser_target_tab_id", "browser_preflight_iteration", "browser_preflight_checked_at", "latest_visual_evidence_hash", "latest_visual_evidence_path", "last_visual_evidence_sent_hash", "attach_visual_evidence_requested", "last_prompt_chars", "cumulative_prompt_chars", "external_review_count", "local_only_iteration_count", "should_send_to_gpt", "send_reason", "local_only_next_action", "active_goal_scope", "terminal_goal_scope", "subgoal_verdict", "project_goal_verdict", "completion_guard_status", "goal_achieved_is_terminal", "gpt_courtesy_footer_sent_count", "current_blocker_id", "current_blocker_category", "blocker_queue_updated_at", "stalled_local_action_count", "pro_review_mode", "efficiency_audit_mode", "latest_capability_scan", "latest_efficiency_audit", "latest_done_gate", "latest_final_closure", "capability_scan_basis", "top_capability_family", "top_capability_status", "stale_count", "stall_pivot_status", "done_gate_verdict", "final_closure_verdict", "pro_tab_close_policy", "pro_tab_close_status", "pro_tab_close_target_url", "pro_tab_closed_at", "local_council_mode", "latest_local_council_review", "active_generated_goal_id")) {
+    foreach ($field in @("version", "iteration_counter", "loop_mode", "loop_status", "latest_review", "latest_assessment_prompt", "goal_verdict", "next_action", "stop_reason", "baseline_sent_to_url", "baseline_sent_hash", "latest_prompt_target_url", "latest_prompt_opened_tab_url", "latest_assessment_target_url", "latest_assessment_opened_tab_url", "continuation_required", "url_confirmation_required", "url_confirmation_reason", "quota_mode", "runtime_brief", "browser_preflight_status", "browser_backend_type", "browser_target_tab_id", "browser_preflight_iteration", "browser_preflight_checked_at", "latest_visual_evidence_hash", "latest_visual_evidence_path", "last_visual_evidence_sent_hash", "attach_visual_evidence_requested", "last_prompt_chars", "cumulative_prompt_chars", "external_review_count", "local_only_iteration_count", "should_send_to_gpt", "send_reason", "local_only_next_action", "active_goal_scope", "terminal_goal_scope", "subgoal_verdict", "project_goal_verdict", "completion_guard_status", "goal_achieved_is_terminal", "gpt_courtesy_footer_sent_count", "current_blocker_id", "current_blocker_category", "blocker_queue_updated_at", "stalled_local_action_count", "pro_review_mode", "efficiency_audit_mode", "latest_capability_scan", "latest_efficiency_audit", "latest_done_gate", "latest_final_closure", "capability_scan_basis", "top_capability_family", "top_capability_status", "stale_count", "stall_pivot_status", "done_gate_verdict", "final_closure_verdict", "pro_tab_close_policy", "pro_tab_close_status", "pro_tab_close_target_url", "pro_tab_closed_at", "local_council_mode", "latest_local_council_review", "active_generated_goal_id", "project_total_goal", "goal_confidence", "latest_goal_model", "latest_architecture_snapshot", "latest_architecture_brief", "architecture_brief_hash", "architecture_brief_sent_hash", "latest_prompt_included_architecture_brief", "latest_goal_slices", "current_goal_slice_id", "goal_slice_status")) {
       if (-not ($state.PSObject.Properties.Name -contains $field)) {
         $default = $null
-        if ($field -eq "version") { $default = 7 }
+        if ($field -eq "version") { $default = 8 }
         if ($field -eq "iteration_counter") { $default = 0 }
         if ($field -eq "loop_mode") { $default = "continuous_until_stopped" }
         if ($field -eq "loop_status") { $default = "idle" }
@@ -1619,15 +1660,18 @@ function Ensure-ReviewLoop {
         if ($field -eq "stall_pivot_status") { $default = "CONTINUE" }
         if ($field -eq "pro_tab_close_policy") { $default = "target_conversation" }
         if ($field -eq "local_council_mode") { $default = $effectiveLocalCouncilMode }
+        if ($field -eq "goal_confidence") { $default = "unknown" }
+        if ($field -eq "latest_prompt_included_architecture_brief") { $default = $false }
+        if ($field -eq "goal_slice_status") { $default = "not_built" }
         Set-ObjectProperty $state $field $default
       }
     }
-    foreach ($field in @("pending_prompts", "pending_reviews", "captured_reviews", "pending_assessments", "blocking_gates", "goal_context_sources", "project_blocker_queue", "local_progress_artifacts", "progress_artifacts", "goal_backlog", "recommended_capability_routes")) {
+    foreach ($field in @("pending_prompts", "pending_reviews", "captured_reviews", "pending_assessments", "blocking_gates", "goal_context_sources", "project_blocker_queue", "local_progress_artifacts", "progress_artifacts", "goal_backlog", "recommended_capability_routes", "goal_sources")) {
       if (-not ($state.PSObject.Properties.Name -contains $field) -or $null -eq $state.$field) {
         Set-ObjectProperty $state $field @()
       }
     }
-    Set-ObjectProperty $state "version" 7
+    Set-ObjectProperty $state "version" 8
     Set-ObjectProperty $state "loop_mode" "continuous_until_stopped"
     Set-ObjectProperty $state "quota_mode" $quotaDefaults.mode
     Set-ObjectProperty $state "pro_review_mode" $effectiveProReviewMode
@@ -1647,6 +1691,7 @@ function Ensure-ReviewLoop {
       Set-ObjectProperty $state "baseline_sent" $false
       Set-ObjectProperty $state "baseline_sent_to_url" $null
       Set-ObjectProperty $state "baseline_sent_hash" $null
+      Set-ObjectProperty $state "architecture_brief_sent_hash" $null
       Set-ObjectProperty $state "next_action" "prepare_review"
       Set-ObjectProperty $state "url_confirmation_required" $true
       Set-ObjectProperty $state "url_confirmation_reason" "target_chatgpt_url_changed"
@@ -2072,6 +2117,356 @@ function Get-FileHashText {
   return [System.BitConverter]::ToString($sha.ComputeHash($bytes)).Replace("-", "").ToLowerInvariant()
 }
 
+function Get-UnderstandingSourceFiles {
+  param(
+    [Parameter(Mandatory = $true)][string]$ProjectRoot,
+    [ValidateSet("auto", "docs_first", "explicit_only")][string]$Mode = "auto",
+    [int]$MaxFiles = 40
+  )
+  $patterns = @(
+    "AGENTS.md", "README.md", "readme.md",
+    "PROJECT_SPEC.md", "PROJECT.md", "ROADMAP.md", "ACCEPTANCE.md", "HUMAN_GATE.md",
+    "completion_report.md", "COMPLETION_REPORT.md",
+    "docs/PROJECT_SPEC.md", "docs/ACCEPTANCE.md", "docs/HUMAN_GATE.md"
+  )
+  $files = New-Object System.Collections.Generic.List[string]
+  foreach ($pattern in $patterns) {
+    $candidate = Join-Path $ProjectRoot ($pattern -replace "/", "\")
+    if (Test-Path -LiteralPath $candidate) { $files.Add((Resolve-Path -LiteralPath $candidate).Path) | Out-Null }
+  }
+  if ($Mode -ne "explicit_only") {
+    foreach ($dir in @("docs", "design", "planning")) {
+      $fullDir = Join-Path $ProjectRoot $dir
+      if (-not (Test-Path -LiteralPath $fullDir)) { continue }
+      $docFiles = Get-ChildItem -LiteralPath $fullDir -Recurse -File -Include "*.md", "*.txt" -ErrorAction SilentlyContinue |
+        Where-Object {
+          -not (Test-SkippedPath -RelativePath (Get-RelativePath -Root $ProjectRoot -Path $_.FullName)) -and
+          $_.Name -match "(?i)(roadmap|acceptance|gate|goal|spec|state|supervisor|completion|verifier|architecture|plan)"
+        } |
+        Sort-Object FullName |
+        Select-Object -First $MaxFiles
+      foreach ($file in $docFiles) { $files.Add($file.FullName) | Out-Null }
+    }
+  }
+  return @($files.ToArray() | Select-Object -Unique | Select-Object -First $MaxFiles)
+}
+
+function Get-ProjectFileList {
+  param(
+    [Parameter(Mandatory = $true)][string]$ProjectRoot,
+    [int]$MaxFiles = 120
+  )
+  $items = @()
+  try {
+    $gitFiles = & git -C $ProjectRoot ls-files 2>$null
+    if ($LASTEXITCODE -eq 0 -and $gitFiles) { $items = @($gitFiles) }
+  } catch {
+  } finally {
+    $global:LASTEXITCODE = 0
+  }
+  if ($items.Count -eq 0) {
+    $items = Get-ChildItem -LiteralPath $ProjectRoot -Recurse -File -ErrorAction SilentlyContinue |
+      ForEach-Object { Get-RelativePath -Root $ProjectRoot -Path $_.FullName } |
+      Where-Object { -not (Test-SkippedPath -RelativePath $_) }
+  }
+  return @($items | Where-Object { $_ -and -not ($_ -replace "\\", "/").StartsWith("docs/ai-review-loop") } | Sort-Object | Select-Object -First $MaxFiles)
+}
+
+function New-ProjectGoalModel {
+  param(
+    [Parameter(Mandatory = $true)][string]$ProjectRoot,
+    [ValidateSet("auto", "docs_first", "explicit_only")][string]$Mode = "auto"
+  )
+  $paths = Get-ReviewPaths -ProjectRoot $ProjectRoot
+  $state = Get-State -ProjectRoot $ProjectRoot
+  $sources = Get-UnderstandingSourceFiles -ProjectRoot $ProjectRoot -Mode $Mode
+  $goalCandidates = New-Object System.Collections.Generic.List[string]
+  $gateLines = New-Object System.Collections.Generic.List[string]
+  $boundaryLines = New-Object System.Collections.Generic.List[string]
+  $sourceLines = New-Object System.Collections.Generic.List[string]
+  $conflict = $false
+  foreach ($source in $sources) {
+    $rel = Get-RelativePath -Root $ProjectRoot -Path $source
+    $sourceLines.Add("- $rel") | Out-Null
+    $text = Get-ContentExcerpt $source 3500
+    if ($text -match "(?im)^\s*#\s+(.+)$") { $goalCandidates.Add($Matches[1].Trim()) | Out-Null }
+    if ($text -match "(?im)Project Identity\s*\r?\n\s*(.+)$") { $goalCandidates.Add($Matches[1].Trim()) | Out-Null }
+    foreach ($line in @($text -split "\r?\n")) {
+      if ($line -match "(?i)(acceptance|gate|done gate|verification|验收|门禁|完成标准|verifier|test)") {
+        if ($gateLines.Count -lt 20) { $gateLines.Add("- [$rel] $($line.Trim())") | Out-Null }
+      }
+      if ($line -match "(?i)(not_ready|not complete|not_complete|human gate|protected|do not|must not|禁止|不得|人工|未完成)") {
+        if ($boundaryLines.Count -lt 20) { $boundaryLines.Add("- [$rel] $($line.Trim())") | Out-Null }
+      }
+      if ($line -match "(?i)(GOAL_CONFLICT|CONFLICTING_TOTAL_GOAL|conflicting total goal|目标冲突)") { $conflict = $true }
+    }
+  }
+  $goal = if ($state.project_total_goal) { [string]$state.project_total_goal } elseif ($goalCandidates.Count -gt 0) { [string]$goalCandidates[0] } else { "Project total goal is not explicit yet." }
+  $confidence = "medium"
+  if ($sources.Count -ge 3 -and -not $conflict) { $confidence = "high" }
+  if ($Mode -eq "explicit_only" -and -not $state.project_total_goal) { $confidence = "low" }
+  if ($conflict -or $sources.Count -eq 0) { $confidence = "low" }
+  if ($gateLines.Count -eq 0) { $gateLines.Add("- No explicit acceptance gates found yet; require local clarification before terminal completion.") | Out-Null }
+  if ($boundaryLines.Count -eq 0) { $boundaryLines.Add("- Do not treat GPT Pro approval, screenshots, or a subgoal PASS as project_total completion without Done Gate.") | Out-Null }
+  $content = @(
+    "# Project Goal Model",
+    "",
+    "- created_at: $(Get-Date -Format o)",
+    "- discovery_mode: $Mode",
+    "- goal_confidence: $confidence",
+    "- advisory_rule: GPT Pro is one expert opinion; Codex local facts, efficiency audit, expert council, Human Gate, and Done Gate decide execution.",
+    "",
+    "## Project Total Goal",
+    "",
+    $goal,
+    "",
+    "## Completion Gates",
+    "",
+    ($gateLines.ToArray() -join [Environment]::NewLine),
+    "",
+    "## Non-Completion Boundaries",
+    "",
+    ($boundaryLines.ToArray() -join [Environment]::NewLine),
+    "",
+    "## Sources",
+    "",
+    ($sourceLines.ToArray() -join [Environment]::NewLine)
+  ) -join [Environment]::NewLine
+  Set-Content -LiteralPath $paths.ProjectGoalModel -Encoding UTF8 -Value $content
+  $state = Get-State -ProjectRoot $ProjectRoot
+  Set-ObjectProperty $state "project_total_goal" $goal
+  Set-ObjectProperty $state "goal_confidence" $confidence
+  Set-ObjectProperty $state "goal_sources" @($sources | ForEach-Object { Get-RelativePath -Root $ProjectRoot -Path $_ })
+  Set-ObjectProperty $state "latest_goal_model" (Get-RelativePath -Root $ProjectRoot -Path $paths.ProjectGoalModel)
+  if ($confidence -eq "low") {
+    Set-ObjectProperty $state "goal_verdict" "NEEDS_HUMAN_DECISION"
+    Set-ObjectProperty $state "next_action" "clarify_project_total_goal"
+    Set-ObjectProperty $state "loop_status" "paused"
+    Set-ObjectProperty $state "stop_reason" "low_confidence_project_goal"
+  }
+  Save-State $ProjectRoot $state
+  return $paths.ProjectGoalModel
+}
+
+function New-ArchitectureSnapshot {
+  param(
+    [Parameter(Mandatory = $true)][string]$ProjectRoot,
+    [ValidateSet("light", "standard", "deep")][string]$Mode = "standard"
+  )
+  $paths = Get-ReviewPaths -ProjectRoot $ProjectRoot
+  $files = Get-ProjectFileList -ProjectRoot $ProjectRoot -MaxFiles $(if ($Mode -eq "deep") { 240 } elseif ($Mode -eq "light") { 60 } else { 120 })
+  $projectType = "generic"
+  $stack = New-Object System.Collections.Generic.List[string]
+  if (Test-Path -LiteralPath (Join-Path $ProjectRoot "project.godot")) { $projectType = "Godot"; $stack.Add("Godot") | Out-Null }
+  if (Test-Path -LiteralPath (Join-Path $ProjectRoot "package.json")) { if ($projectType -eq "generic") { $projectType = "JavaScript/TypeScript" }; $stack.Add("Node/package.json") | Out-Null }
+  if (Test-Path -LiteralPath (Join-Path $ProjectRoot "pyproject.toml")) { if ($projectType -eq "generic") { $projectType = "Python" }; $stack.Add("Python/pyproject") | Out-Null }
+  if (Test-Path -LiteralPath (Join-Path $ProjectRoot "Cargo.toml")) { if ($projectType -eq "generic") { $projectType = "Rust" }; $stack.Add("Rust/Cargo") | Out-Null }
+  if (Test-Path -LiteralPath (Join-Path $ProjectRoot "go.mod")) { if ($projectType -eq "generic") { $projectType = "Go" }; $stack.Add("Go module") | Out-Null }
+  if ($stack.Count -eq 0) { $stack.Add("Docs/filesystem inferred") | Out-Null }
+  $entryFiles = @($files | Where-Object { $_ -match "(?i)(^main\.|/main\.|project\.godot$|package\.json$|pyproject\.toml$|src/|app/|game/)" } | Select-Object -First 20)
+  $moduleDirs = @($files | ForEach-Object {
+      $normalized = $_ -replace "\\", "/"
+      if ($normalized.Contains("/")) { $normalized.Split("/")[0] } else { "(root)" }
+    } | Sort-Object -Unique | Select-Object -First 20)
+  $verification = New-Object System.Collections.Generic.List[string]
+  if ($projectType -eq "Godot") {
+    $verification.Add("- godot --headless --path . --editor --quit") | Out-Null
+    $verification.Add("- godot --headless --path . --script tests/run_all.gd") | Out-Null
+  }
+  if ($files -contains "package.json") { $verification.Add("- npm test / package scripts if present") | Out-Null }
+  if ($files -contains "pyproject.toml") { $verification.Add("- pytest or project-local test command") | Out-Null }
+  if ($verification.Count -eq 0) { $verification.Add("- Use project-local verifier, documented scripts, or git diff checks.") | Out-Null }
+  $goalContext = Get-GoalContextReport -ProjectRoot $ProjectRoot -MaxChars 1800
+  $architectureRel = Get-RelativePath -Root $ProjectRoot -Path $paths.ProjectArchitecture
+  $stackText = [string]::Join(", ", [string[]]@($stack))
+  $entryText = if ($entryFiles.Count -gt 0) { @($entryFiles | ForEach-Object { "- $_" }) -join [Environment]::NewLine } else { "- No explicit entry file detected." }
+  $moduleText = @($moduleDirs | ForEach-Object { "- $_" }) -join [Environment]::NewLine
+  $verificationText = $verification.ToArray() -join [Environment]::NewLine
+  $fileTreeText = @($files | Select-Object -First 80) -join [Environment]::NewLine
+  $content = @(
+    "# Project Architecture Snapshot",
+    "",
+    "- created_at: $(Get-Date -Format o)",
+    "- architecture_analysis_mode: $Mode",
+    "- codegraph_preference: outer Codex should use CodeGraph for structural questions when available; this script records a deterministic filesystem snapshot.",
+    "",
+    "## Project Type",
+    "",
+    "- inferred_type: $projectType",
+    "- stack: $stackText",
+    "",
+    "## Entry Points",
+    "",
+    $entryText,
+    "",
+    "## Key Modules",
+    "",
+    $moduleText,
+    "",
+    "## Verification",
+    "",
+    $verificationText,
+    "",
+    "## Risk Boundaries",
+    "",
+    '```text',
+    $goalContext.text,
+    '```',
+    "",
+    "## File Tree Sample",
+    "",
+    '```text',
+    $fileTreeText,
+    '```'
+  ) -join [Environment]::NewLine
+  Set-Content -LiteralPath $paths.ProjectArchitecture -Encoding UTF8 -Value $content
+  $state = Get-State -ProjectRoot $ProjectRoot
+  Set-ObjectProperty $state "latest_architecture_snapshot" $architectureRel
+  Save-State $ProjectRoot $state
+  return $paths.ProjectArchitecture
+}
+
+function New-CompressedArchitectureBrief {
+  param(
+    [Parameter(Mandatory = $true)][string]$ProjectRoot,
+    [int]$MaxChars = 8000
+  )
+  if ($MaxChars -le 0) { $MaxChars = 8000 }
+  $paths = Get-ReviewPaths -ProjectRoot $ProjectRoot
+  $state = Get-State -ProjectRoot $ProjectRoot
+  if (-not (Test-Path -LiteralPath $paths.ProjectGoalModel)) { New-ProjectGoalModel -ProjectRoot $ProjectRoot -Mode $GoalDiscoveryMode | Out-Null }
+  if (-not (Test-Path -LiteralPath $paths.ProjectArchitecture)) { New-ArchitectureSnapshot -ProjectRoot $ProjectRoot -Mode $ArchitectureAnalysisMode | Out-Null }
+  $goalExcerpt = Get-ContentExcerpt $paths.ProjectGoalModel 2600
+  $archExcerpt = Get-ContentExcerpt $paths.ProjectArchitecture 3600
+  $routeItems = @($state.recommended_capability_routes | Where-Object { $_ } | Select-Object -First 8)
+  $routes = if ($routeItems.Count -gt 0) { [string]::Join(", ", [string[]]$routeItems) } else { "(no capability scan yet)" }
+  $brief = @(
+    "# Compressed Architecture Brief",
+    "",
+    "- created_at: $(Get-Date -Format o)",
+    "- max_chars: $MaxChars",
+    "- pro_role: GPT Pro is one external expert opinion; it cannot approve completion without Codex local assessment, efficiency audit, Human Gate, and Done Gate.",
+    "",
+    "## Goal",
+    "",
+    $goalExcerpt,
+    "",
+    "## Architecture",
+    "",
+    $archExcerpt,
+    "",
+    "## Verification",
+    "",
+    "- Use project-local verifier/test commands from the architecture snapshot.",
+    "- Treat screenshots, Pro agreement, and subgoal PASS as evidence only, not project_total completion.",
+    "",
+    "## Risk",
+    "",
+    "- Preserve Human Gate, protected scope, project-total guard, and Done Gate.",
+    "- Recommended capability routes: $routes",
+    "",
+    "## Questions For GPT Pro",
+    "",
+    "1. Does this compressed architecture context expose any missing blocker for the current goal slice?",
+    "2. Is the proposed next local action coherent with the project_total goal and risk boundaries?",
+    "3. What evidence should Codex collect locally before claiming the current slice is done?"
+  ) -join [Environment]::NewLine
+  $brief = Limit-Text -Text $brief -MaxChars $MaxChars
+  Set-Content -LiteralPath $paths.ArchitectureBrief -Encoding UTF8 -NoNewline -Value $brief
+  $hashSource = (($brief -split "\r?\n") | Where-Object { $_ -notmatch "created_at:" }) -join "`n"
+  $sha = [System.Security.Cryptography.SHA256]::Create()
+  $hashBytes = [System.Text.Encoding]::UTF8.GetBytes($hashSource)
+  $hash = [System.BitConverter]::ToString($sha.ComputeHash($hashBytes)).Replace("-", "").ToLowerInvariant()
+  $briefRel = Get-RelativePath -Root $ProjectRoot -Path $paths.ArchitectureBrief
+  $state = Get-State -ProjectRoot $ProjectRoot
+  Set-ObjectProperty $state "latest_architecture_brief" $briefRel
+  Set-ObjectProperty $state "architecture_brief_hash" $hash
+  Save-State $ProjectRoot $state
+  return $paths.ArchitectureBrief
+}
+
+function New-GoalSlices {
+  param([Parameter(Mandatory = $true)][string]$ProjectRoot)
+  $paths = Get-ReviewPaths -ProjectRoot $ProjectRoot
+  $state = Get-State -ProjectRoot $ProjectRoot
+  if (-not $state.project_blocker_queue -or @($state.project_blocker_queue).Count -eq 0) {
+    $guard = Invoke-CompletionGuard -ProjectRoot $ProjectRoot -State $state -Verdict $(if ($state.goal_verdict) { [string]$state.goal_verdict } else { "CONTINUE" })
+    Set-ObjectProperty $state "blocking_gates" @($guard.blockers)
+    Set-ObjectProperty $state "goal_context_sources" @($guard.sources)
+    Set-ObjectProperty $state "completion_guard_status" $guard.status
+    Update-ProjectBlockerQueue -ProjectRoot $ProjectRoot -State $state -Blockers @($guard.blockers) | Out-Null
+  }
+  $state = Get-State -ProjectRoot $ProjectRoot
+  $queue = @($state.project_blocker_queue)
+  $lines = New-Object System.Collections.Generic.List[string]
+  $lines.Add("# Goal Slice Queue") | Out-Null
+  $lines.Add("") | Out-Null
+  $lines.Add("- created_at: $(Get-Date -Format o)") | Out-Null
+  $lines.Add("- project_total_goal: $($state.project_total_goal)") | Out-Null
+  $lines.Add("- rule: slice completion closes only the slice; project_total completion still requires guard + Done Gate.") | Out-Null
+  $lines.Add("") | Out-Null
+  $lines.Add("| ID | Parent goal | Acceptance gate | Evidence needed | Capability route | Human Gate | Status | Current progress |") | Out-Null
+  $lines.Add("|---|---|---|---|---|---|---|---|") | Out-Null
+  $sliceItems = New-Object System.Collections.Generic.List[object]
+  $index = 1
+  foreach ($item in $queue) {
+    $sliceId = "GS-{0:000}" -f $index
+    $humanRequired = $item.category -in @("human_gate", "explicit_authorization_required", "future_scope")
+    $status = if ($humanRequired) { "needs_human_decision" } else { "open" }
+    $route = Select-CapabilityRouteForBlocker -State $state -Blocker $item
+    $gate = if ($item.raw_text) { [string]$item.raw_text } else { [string]$item.recommended_next_action }
+    $sliceItems.Add([pscustomobject]@{
+        id = $sliceId
+        blocker_id = $item.id
+        parent_goal_scope = if ($item.scope) { [string]$item.scope } else { "project_total" }
+        acceptance_gate = $gate
+        evidence_needed = $item.action_kind
+        recommended_capability_route = $route
+        human_gate_required = [bool]$humanRequired
+        status = $status
+        current_progress = "not_started"
+      }) | Out-Null
+    $lines.Add("| $sliceId | $($item.scope) | $(ConvertTo-MarkdownCell $gate) | $($item.action_kind) | $(ConvertTo-MarkdownCell $route) | $humanRequired | $status | not_started |") | Out-Null
+    $index += 1
+  }
+  if ($queue.Count -eq 0) {
+    $lines.Add("| GS-000 | project_total | No blockers detected | done_gate_evidence | local-codex | False | candidate_for_done_gate | pending Done Gate |") | Out-Null
+  }
+  Set-Content -LiteralPath $paths.GoalSlices -Encoding UTF8 -Value ($lines.ToArray() -join [Environment]::NewLine)
+  $candidate = @($sliceItems.ToArray() | Where-Object { $_.status -eq "open" } | Select-Object -First 1)
+  $state = Get-State -ProjectRoot $ProjectRoot
+  Set-ObjectProperty $state "latest_goal_slices" (Get-RelativePath -Root $ProjectRoot -Path $paths.GoalSlices)
+  Set-ObjectProperty $state "current_goal_slice_id" $(if ($candidate.Count -gt 0) { $candidate[0].id } else { $null })
+  Set-ObjectProperty $state "goal_slice_status" $(if ($candidate.Count -gt 0) { "open" } elseif ($queue.Count -eq 0) { "no_open_slices" } else { "human_or_future_only" })
+  Save-State $ProjectRoot $state
+  return $paths.GoalSlices
+}
+
+function Invoke-RefreshProjectUnderstanding {
+  param(
+    [Parameter(Mandatory = $true)][string]$ProjectRoot,
+    [ValidateSet("auto", "docs_first", "explicit_only")][string]$GoalMode = "auto",
+    [ValidateSet("light", "standard", "deep")][string]$ArchitectureMode = "standard",
+    [int]$BriefMaxChars = 8000
+  )
+  $goalPath = New-ProjectGoalModel -ProjectRoot $ProjectRoot -Mode $GoalMode
+  $archPath = New-ArchitectureSnapshot -ProjectRoot $ProjectRoot -Mode $ArchitectureMode
+  $briefPath = New-CompressedArchitectureBrief -ProjectRoot $ProjectRoot -MaxChars $BriefMaxChars
+  $slicePath = New-GoalSlices -ProjectRoot $ProjectRoot
+  New-RuntimeBrief -ProjectRoot $ProjectRoot -Reason "project_understanding_refreshed" | Out-Null
+  Write-Host "Project understanding refreshed:" -ForegroundColor Green
+  Write-Host "  Goal model: $goalPath"
+  Write-Host "  Architecture: $archPath"
+  Write-Host "  Architecture brief: $briefPath"
+  Write-Host "  Goal slices: $slicePath"
+  return [pscustomobject]@{
+    goal_model = $goalPath
+    architecture_snapshot = $archPath
+    architecture_brief = $briefPath
+    goal_slices = $slicePath
+  }
+}
+
 function New-ReviewPrompt {
   param(
     [Parameter(Mandatory = $true)][string]$ProjectRoot,
@@ -2106,6 +2501,18 @@ function New-ReviewPrompt {
     "Full baseline is included because this is the first send, target/hash changed, or -ForceBaseline was requested."
   } else {
     "Baseline already sent to this ChatGPT conversation with the same baseline hash; this round is delta-only."
+  }
+  if (-not $state.latest_architecture_brief -or -not (Test-Path -LiteralPath $paths.ArchitectureBrief)) {
+    New-CompressedArchitectureBrief -ProjectRoot $ProjectRoot -MaxChars $(if ($ArchitectureBriefMaxChars -gt 0) { $ArchitectureBriefMaxChars } else { 8000 }) | Out-Null
+    $state = Get-State -ProjectRoot $ProjectRoot
+  }
+  $includeArchitectureBrief = [bool]$IncludeArchitectureBriefForPro -or
+    (-not $state.architecture_brief_sent_hash) -or
+    ($state.architecture_brief_sent_hash -ne $state.architecture_brief_hash)
+  $architectureBriefText = if ($includeArchitectureBrief) {
+    Get-ContentExcerpt $paths.ArchitectureBrief $(if ($ArchitectureBriefMaxChars -gt 0) { $ArchitectureBriefMaxChars } else { 8000 })
+  } else {
+    "Architecture brief unchanged. architecture_brief_hash: $($state.architecture_brief_hash)"
   }
   $dossier = if ($includeBaseline) { Get-ContentExcerpt $DossierPath $settings.dossier_excerpt_chars } else { "(baseline already sent in this ChatGPT conversation with matching hash)" }
   $codeMap = if ($includeBaseline) { Get-ContentExcerpt $CodeMapPath $settings.code_map_excerpt_chars } else { "(baseline code map already sent; this round is delta-only)" }
@@ -2149,6 +2556,12 @@ $RoundId
 - baseline_hash: $BaselineHash
 - target_chatgpt_url: $target
 - baseline_mode: $baselineNote
+- architecture_brief_hash: $($state.architecture_brief_hash)
+- architecture_brief_mode: $(if ($includeArchitectureBrief) { "included" } else { "hash_only_unchanged" })
+
+## Compressed Architecture Brief For Pro
+
+$architectureBriefText
 
 ## Visual Evidence
 
@@ -2188,6 +2601,7 @@ $request
   Set-ObjectProperty $state "latest_prompt" $rel
   Set-ObjectProperty $state "attach_visual_evidence_requested" ([bool]$AttachVisualEvidence)
   Set-ObjectProperty $state "goal_context_sources" @($goalContext.sources)
+  Set-ObjectProperty $state "latest_prompt_included_architecture_brief" ([bool]$includeArchitectureBrief)
   Set-PromptStats -State $state -PromptText $storedPrompt -Mode $settings.mode
   Save-State $ProjectRoot $state
   return $promptOutputPath
@@ -2205,6 +2619,7 @@ function New-ReviewPackage {
   $roundNumber = [int]$state.round_counter + 1
   $iterationNumber = [int]$state.iteration_counter + 1
   $roundId = "round-{0:000}-iter-{1:000}-{2}" -f $roundNumber, $iterationNumber, (Get-Date -Format "yyyyMMdd-HHmmss")
+  Invoke-RefreshProjectUnderstanding -ProjectRoot $ProjectRoot -GoalMode $GoalDiscoveryMode -ArchitectureMode $ArchitectureAnalysisMode -BriefMaxChars $ArchitectureBriefMaxChars | Out-Null
   $dossierPath = New-ProjectDossier -ProjectRoot $ProjectRoot -ScanPath $ScanPath -RoundId $roundId
   $codeMapPath = New-CodeMap -ProjectRoot $ProjectRoot -RoundId $roundId
   $requestPath = New-RoundRequest -ProjectRoot $ProjectRoot -RoundId $roundId -ScanPath $ScanPath
@@ -2266,6 +2681,9 @@ function Complete-PromptSend {
   Set-ObjectProperty $state "baseline_sent" $true
   Set-ObjectProperty $state "baseline_sent_to_url" $target
   Set-ObjectProperty $state "baseline_sent_hash" $state.baseline_hash
+  if ([bool]$state.latest_prompt_included_architecture_brief -and $state.architecture_brief_hash) {
+    Set-ObjectProperty $state "architecture_brief_sent_hash" $state.architecture_brief_hash
+  }
   Set-ObjectProperty $state "latest_prompt" (Get-RelativePath -Root $ProjectRoot -Path $PromptPath)
   Set-ObjectProperty $state "latest_prompt_target_url" $target
   Set-ObjectProperty $state "latest_prompt_opened_tab_url" $ActualTabUrl
@@ -2640,6 +3058,13 @@ function Invoke-NextDecision {
   Set-ObjectProperty $state "goal_context_sources" @($guard.sources)
   Set-ObjectProperty $state "goal_achieved_is_terminal" $terminalAllowed
   $selectedBlocker = Update-ProjectBlockerQueue -ProjectRoot $ProjectRoot -State $state -Blockers @($guard.blockers)
+  if ($state.goal_confidence -eq "low") {
+    $status = "paused"
+    $stopReason = "low_confidence_project_goal"
+    Set-ObjectProperty $state "goal_verdict" "NEEDS_HUMAN_DECISION"
+    Set-ObjectProperty $state "project_goal_verdict" "NEEDS_HUMAN_DECISION"
+    Set-ObjectProperty $state "next_action" "clarify_project_total_goal"
+  }
   if ($terminalAllowed) {
     Set-ObjectProperty $state "project_goal_verdict" "GOAL_ACHIEVED"
   }
@@ -2710,6 +3135,10 @@ function Invoke-NextDecision {
   Set-ObjectProperty $state "send_reason" $sendReason
   Set-ObjectProperty $state "local_only_next_action" $localOnlyNextAction
   Save-State $ProjectRoot $state
+  if (-not $state.latest_goal_slices -or -not $state.current_goal_slice_id) {
+    New-GoalSlices -ProjectRoot $ProjectRoot | Out-Null
+    $state = Get-State -ProjectRoot $ProjectRoot
+  }
   if ($status -eq "complete" -and $state.efficiency_audit_mode -ne "off") {
     if ($FinalClosure -or -not $state.latest_final_closure -or $state.final_closure_verdict -ne "VERSION_CLOSED") {
       Invoke-FinalClosureReview -ProjectRoot $ProjectRoot | Out-Null
@@ -2751,6 +3180,14 @@ function Invoke-NextDecision {
     stall_pivot_status = $state.stall_pivot_status
     done_gate_verdict = $state.done_gate_verdict
     final_closure_verdict = $state.final_closure_verdict
+    project_total_goal = $state.project_total_goal
+    goal_confidence = $state.goal_confidence
+    latest_goal_model = $state.latest_goal_model
+    latest_architecture_snapshot = $state.latest_architecture_snapshot
+    latest_architecture_brief = $state.latest_architecture_brief
+    architecture_brief_hash = $state.architecture_brief_hash
+    latest_goal_slices = $state.latest_goal_slices
+    current_goal_slice_id = $state.current_goal_slice_id
     project_goal_plan = (Get-RelativePath -Root $ProjectRoot -Path $planArtifacts.markdown)
     project_blocker_queue = @($state.project_blocker_queue)
     latest_prompt = $state.latest_prompt
@@ -2889,6 +3326,17 @@ function Show-Status {
     stall_pivot_status = if ($state) { $state.stall_pivot_status } else { $null }
     done_gate_verdict = if ($state) { $state.done_gate_verdict } else { $null }
     final_closure_verdict = if ($state) { $state.final_closure_verdict } else { $null }
+    project_total_goal = if ($state) { $state.project_total_goal } else { $null }
+    goal_confidence = if ($state) { $state.goal_confidence } else { $null }
+    goal_source_count = if ($state -and $state.goal_sources) { @($state.goal_sources).Count } else { 0 }
+    latest_goal_model = if ($state) { $state.latest_goal_model } else { $null }
+    latest_architecture_snapshot = if ($state) { $state.latest_architecture_snapshot } else { $null }
+    latest_architecture_brief = if ($state) { $state.latest_architecture_brief } else { $null }
+    architecture_brief_hash = if ($state) { $state.architecture_brief_hash } else { $null }
+    architecture_brief_sent_hash = if ($state) { $state.architecture_brief_sent_hash } else { $null }
+    latest_goal_slices = if ($state) { $state.latest_goal_slices } else { $null }
+    current_goal_slice_id = if ($state) { $state.current_goal_slice_id } else { $null }
+    goal_slice_status = if ($state) { $state.goal_slice_status } else { $null }
     pro_tab_close_policy = if ($state) { $state.pro_tab_close_policy } else { $null }
     pro_tab_close_status = if ($state) { $state.pro_tab_close_status } else { $null }
     pro_tab_closed_at = if ($state) { $state.pro_tab_closed_at } else { $null }
@@ -2974,6 +3422,26 @@ switch ($Action) {
     Ensure-ReviewLoop -ProjectRoot $ProjectRoot -ChatUrl $TargetChatGptUrl | Out-Null
     Invoke-BuildProjectGoalPlan -ProjectRoot $ProjectRoot
   }
+  "BuildGoalModel" {
+    Ensure-ReviewLoop -ProjectRoot $ProjectRoot -ChatUrl $TargetChatGptUrl | Out-Null
+    New-ProjectGoalModel -ProjectRoot $ProjectRoot -Mode $GoalDiscoveryMode | Out-Null
+  }
+  "AnalyzeArchitecture" {
+    Ensure-ReviewLoop -ProjectRoot $ProjectRoot -ChatUrl $TargetChatGptUrl | Out-Null
+    New-ArchitectureSnapshot -ProjectRoot $ProjectRoot -Mode $ArchitectureAnalysisMode | Out-Null
+  }
+  "BuildArchitectureBrief" {
+    Ensure-ReviewLoop -ProjectRoot $ProjectRoot -ChatUrl $TargetChatGptUrl | Out-Null
+    New-CompressedArchitectureBrief -ProjectRoot $ProjectRoot -MaxChars $ArchitectureBriefMaxChars | Out-Null
+  }
+  "BuildGoalSlices" {
+    Ensure-ReviewLoop -ProjectRoot $ProjectRoot -ChatUrl $TargetChatGptUrl | Out-Null
+    New-GoalSlices -ProjectRoot $ProjectRoot | Out-Null
+  }
+  "RefreshProjectUnderstanding" {
+    Ensure-ReviewLoop -ProjectRoot $ProjectRoot -ChatUrl $TargetChatGptUrl | Out-Null
+    Invoke-RefreshProjectUnderstanding -ProjectRoot $ProjectRoot -GoalMode $GoalDiscoveryMode -ArchitectureMode $ArchitectureAnalysisMode -BriefMaxChars $ArchitectureBriefMaxChars | Out-Null
+  }
   "NextLocalAction" {
     Ensure-ReviewLoop -ProjectRoot $ProjectRoot -ChatUrl $TargetChatGptUrl | Out-Null
     Invoke-NextLocalAction -ProjectRoot $ProjectRoot
@@ -2997,6 +3465,7 @@ switch ($Action) {
   }
   "RunLocalCouncil" {
     Ensure-ReviewLoop -ProjectRoot $ProjectRoot -ChatUrl $TargetChatGptUrl | Out-Null
+    Invoke-RefreshProjectUnderstanding -ProjectRoot $ProjectRoot -GoalMode $GoalDiscoveryMode -ArchitectureMode $ArchitectureAnalysisMode -BriefMaxChars $ArchitectureBriefMaxChars | Out-Null
     New-LocalCouncilReview -ProjectRoot $ProjectRoot | Out-Null
   }
   "CloseProTab" {
@@ -3006,6 +3475,7 @@ switch ($Action) {
   "RecordProgress" {
     Ensure-ReviewLoop -ProjectRoot $ProjectRoot -ChatUrl $TargetChatGptUrl | Out-Null
     Add-ProgressArtifact -ProjectRoot $ProjectRoot -Artifact $ProgressArtifact
+    Invoke-RefreshProjectUnderstanding -ProjectRoot $ProjectRoot -GoalMode $GoalDiscoveryMode -ArchitectureMode $ArchitectureAnalysisMode -BriefMaxChars $ArchitectureBriefMaxChars | Out-Null
     $state = Get-State -ProjectRoot $ProjectRoot
     if ($state.efficiency_audit_mode -ne "off" -and (-not $state.latest_capability_scan -or $CapabilityScan)) {
       Invoke-CapabilityScan -ProjectRoot $ProjectRoot -Context $AuditContext | Out-Null
@@ -3022,6 +3492,7 @@ switch ($Action) {
   }
   "RunLoop" {
     Ensure-ReviewLoop -ProjectRoot $ProjectRoot -ChatUrl $TargetChatGptUrl | Out-Null
+    Invoke-RefreshProjectUnderstanding -ProjectRoot $ProjectRoot -GoalMode $GoalDiscoveryMode -ArchitectureMode $ArchitectureAnalysisMode -BriefMaxChars $ArchitectureBriefMaxChars | Out-Null
     $config = Get-Config -ProjectRoot $ProjectRoot
     $state = Get-State -ProjectRoot $ProjectRoot
     if ($state.efficiency_audit_mode -ne "off" -and (-not $state.latest_capability_scan -or $CapabilityScan)) {
@@ -3066,6 +3537,7 @@ switch ($Action) {
   }
   "Run" {
     Ensure-ReviewLoop -ProjectRoot $ProjectRoot -ChatUrl $TargetChatGptUrl | Out-Null
+    Invoke-RefreshProjectUnderstanding -ProjectRoot $ProjectRoot -GoalMode $GoalDiscoveryMode -ArchitectureMode $ArchitectureAnalysisMode -BriefMaxChars $ArchitectureBriefMaxChars | Out-Null
     $config = Get-Config -ProjectRoot $ProjectRoot
     $state = Get-State -ProjectRoot $ProjectRoot
     if ($state.efficiency_audit_mode -ne "off" -and (-not $state.latest_capability_scan -or $CapabilityScan)) {
