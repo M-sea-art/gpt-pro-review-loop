@@ -51,6 +51,8 @@ docs/ai-review-loop/
   "gpt_courtesy_footer": "谢谢你的工作，GPT朋友。",
   "courtesy_footer_policy": "after_first_external_review_in_continuous_loop",
   "pro_review_mode": "optional",
+  "efficiency_audit_mode": "standard",
+  "efficiency_audit_policy": "capability_scan_goal_supervision_periodic_done_gate_final_closure",
   "pro_tab_close_policy": "target_conversation",
   "local_council_mode": "enabled",
   "local_council_policy": "brainstorm_then_post_evaluation"
@@ -106,6 +108,19 @@ docs/ai-review-loop/
 - `goal_achieved_is_terminal`: true only when a `GOAL_ACHIEVED` decision is allowed to stop the loop.
 - `gpt_courtesy_footer_sent_count`: count of GPT-facing prompts that included the configured courtesy footer.
 - `pro_review_mode`: `optional`, `required`, or `disabled`.
+- `efficiency_audit_mode`: `off`, `light`, `standard`, or `strict`.
+- `latest_capability_scan`: latest JSON output from `codex-efficiency-auditor/scripts/audit_codex_capabilities.py`.
+- `latest_efficiency_audit`: latest review event produced by the efficiency supervisor.
+- `latest_done_gate`: latest Done Gate review event.
+- `latest_final_closure`: latest final closure review event.
+- `capability_scan_basis`: compact description of how the capability scan was produced.
+- `top_capability_family`: top recommendation from capability scan, such as `game-studio` for game contexts.
+- `top_capability_status`: status label such as `enabled`, `available-in-session`, or `installed-not-exposed`.
+- `recommended_capability_routes`: compact route mentions for future work, such as `$game-studio:game-playtest`, `codegraph`, or browser testing.
+- `stale_count`: repeated local-only action count used by stall/pivot rules.
+- `stall_pivot_status`: `CONTINUE`, `STALE_PROGRESS`, `REPEATED_FAILURE`, `RECOVERY_NEEDED`, `SCOPE_DRIFT`, or `BLOCKED`.
+- `done_gate_verdict`: `DONE_GATE_PASS`, `READY_FOR_FINAL_AUDIT`, `NEEDS_FIX`, `NEEDS_HUMAN_DECISION`, or `BLOCKED`.
+- `final_closure_verdict`: final efficiency closure result such as `VERSION_CLOSED`, `READY_FOR_HUMAN_REVIEW`, or `NEEDS_FIX`.
 - `pro_tab_close_policy`: default `target_conversation`.
 - `pro_tab_close_status`: `closed`, `blocked_no_target_tab`, `blocked_review_still_needed`, or null.
 - `pro_tab_closed_at`: timestamp when the target tab close was recorded as complete.
@@ -193,6 +208,21 @@ Economy mode is the default. It keeps full files under `docs/ai-review-loop/` bu
 The `Brainstorm` section must record unjudged ideas first and follow the seven rules: free ideas, suspend judgment, quantity first, build on others, record all ideas, evaluate later, and maintain an open inclusive meeting.
 
 Only the later `Post-Evaluation` section classifies ideas into immediately local, needs evidence, needs external Pro, needs human decision, or future scope. Candidate goals are written to `goal_backlog` and rendered in `goal-backlog.md`; they do not expand implementation scope automatically. Human Gate, core-system, publish, push, remote authorization, or protected-scope goals are marked `needs_human_decision`.
+
+When capability scan data exists, post-evaluation adds `recommended_capability_route` to generated goals. For game contexts, Game Studio can be the top browser-prototype/playtest route, but `installed-not-exposed` remains recommendation-only and must not be treated as an active callable tool.
+
+## Codex Efficiency Supervisor
+
+`codex-efficiency-auditor` supplies process supervision for the loop:
+
+- `RunCapabilityScan` saves machine-readable scan output under `loop-runs/` and records a `reviewer=codex-efficiency-auditor`, `phase=capability-scan` event.
+- `RunEfficiencyAudit` records `phase=preflight-audit`, `periodic-audit`, or `stall-pivot`.
+- `RecordProgress` triggers `periodic-audit` in `standard` and `strict` modes.
+- `NextDecision` uses `stale_count` and `stall_pivot_status` to prevent repeated local-only spinning.
+- `RunDoneGate` records the deterministic completion gate. In default modes, project-total `GOAL_ACHIEVED` cannot become terminal completion unless `done_gate_verdict=DONE_GATE_PASS`.
+- `RunFinalClosure` records final closure after project-total guard and Done Gate pass.
+
+These events are ledger writes, so their report text uses `Audit mutation status: LEDGER_ONLY_REVIEW_EVENT`.
 
 ## Pro Tab Close
 

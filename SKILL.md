@@ -23,6 +23,8 @@ When project-total blockers remain, the skill normalizes them into a queue and c
 
 Every continuous loop can also run a local expert council review. The council is a brainstorming meeting, not a risk-only audit: it records unjudged ideas first, then performs post-evaluation and writes candidate new goals into a backlog without expanding implementation scope.
 
+Codex efficiency audit is the loop's process supervisor. It is not just another advisory reviewer: it provides read-only capability scan input, periodic audit, stall/pivot status, Done Gate, and final closure checks. The loop stores those events in the same `reviews/` stream, but `NextDecision` treats Done Gate and stall/pivot fields as control evidence.
+
 The mental model is:
 
 ```text
@@ -64,6 +66,13 @@ GPT Pro, Codex efficiency review, and the local expert council are `reviewer` va
    ```
 
    `-ProReviewMode optional|required|disabled` controls whether GPT Pro is a supplement, a required completion reviewer, or completely disabled.
+
+   `-EfficiencyAuditMode off|light|standard|strict` controls how much Codex efficiency supervision is attached. Default is `standard`.
+
+   - `off`: no efficiency audit integration.
+   - `light`: capability scan and Done Gate only.
+   - `standard`: capability scan, periodic audit after progress, Done Gate, final closure.
+   - `strict`: also run preflight/process checks around repeated failure, subgoal/project completion, and Human Gate boundaries.
 
 3. Prepare the offline review package:
 
@@ -172,6 +181,8 @@ GPT Pro, Codex efficiency review, and the local expert council are `reviewer` va
 
    Execute `local_only_next_action` before sending GPT another prompt. If only Human Gate, protected scope, or explicit authorization blockers remain, pause for the user.
 
+   In default efficiency mode, `GOAL_ACHIEVED` is still not enough for project-total completion. `NextDecision` must first have `done_gate_verdict=DONE_GATE_PASS`; otherwise it keeps the loop running or pauses for the relevant human decision.
+
 10. Run the local expert council after a progress update or when the loop needs a fresh local plan:
 
    ```powershell
@@ -181,6 +192,8 @@ GPT Pro, Codex efficiency review, and the local expert council are `reviewer` va
    ```
 
    The council writes `reviews/*local-expert-council*`, `local-council.md`, and `goal-backlog.md`. Brainstorm ideas are recorded before any judgment. Post-evaluation then classifies ideas as immediately local, evidence-needed, Pro-needed, human decision, or future scope. Generated goals stay in backlog until promoted, and human-gated goals remain marked `needs_human_decision`.
+
+   If a capability scan exists, post-evaluation must cite recommended capability routes for candidate goals. For game projects this can include `@game-studio`, `$game-studio:game-playtest`, or related Game Studio child skills. If the route status is `installed-not-exposed`, treat it as a recommendation only, not a callable active capability.
 
 11. Close the Pro tab after the target conversation no longer needs a response:
 
@@ -195,6 +208,27 @@ GPT Pro, Codex efficiency review, and the local expert council are `reviewer` va
    ```powershell
    & "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action RecordExperience -Root "<project-root>" -ExperienceOutcome "success|blocked|needs-improvement" -ExperienceLesson "<short reusable lesson>" -ExperienceNotes "<sanitized notes>"
    ```
+
+## Codex Efficiency Supervisor Actions
+
+Use these when the loop needs explicit process supervision:
+
+```powershell
+& "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action RunCapabilityScan -Root "<project-root>" -AuditContext "game Godot browser playtest"
+& "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action RunEfficiencyAudit -Root "<project-root>" -PeriodicAudit
+& "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action RunDoneGate -Root "<project-root>"
+& "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action RunFinalClosure -Root "<project-root>"
+```
+
+Rules:
+
+- `RunCapabilityScan` reuses `codex-efficiency-auditor/scripts/audit_codex_capabilities.py`; do not copy or reimplement inventory logic.
+- Capability Scan is read-only recommendation input. It does not install, expose, authenticate, or authorize tools.
+- In game/playable/Godot/Phaser/Three/WebGL/sprite/playtest contexts, Game Studio should appear as a top route when detected. Respect `installed-not-exposed`.
+- `RecordProgress` triggers `periodic-audit` in `standard` and `strict` modes.
+- `stale_count >= 2` means pivot/process fix; do not keep repeating the same `local_only_next_action`.
+- `RunDoneGate` is mandatory before default project-total terminal completion.
+- `RunFinalClosure` records final process closure after project-total guard and Done Gate pass.
 
 ## One-Command Prepare
 
@@ -214,7 +248,7 @@ When the user explicitly starts continuous review, use:
 & "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action RunLoop -Root "<project-root>" -PreflightBrowser
 ```
 
-`RunLoop` is the compact loop entry for the outer Codex agent. In optional mode it starts local-first: if the current next action does not require GPT Pro, it records runtime state and runs the local expert council instead of generating an empty GPT handoff. The PowerShell script prepares local ledger material and writes a runtime brief; it does not control Edge or wait for ChatGPT by itself. After explicit authorization, Codex must continue ordinary next rounds without confirmation until `NextDecision` reports terminal project-total completion, `NEEDS_HUMAN_DECISION`, `BLOCKED`, or the user stops the session. A `running` loop status with `continuation_required=true` is an instruction to keep working, not a final-answer point. Safety blockers, human gates, external account/login/CAPTCHA, publish/push, destructive file operations, and permission changes still pause.
+`RunLoop` is the compact loop entry for the outer Codex agent. In optional mode it starts local-first: if the current next action does not require GPT Pro, it records runtime state and runs the local expert council instead of generating an empty GPT handoff. In `standard` and `strict` efficiency modes, it ensures a capability scan exists first so the council and decision engine have capability-route context. The PowerShell script prepares local ledger material and writes a runtime brief; it does not control Edge or wait for ChatGPT by itself. After explicit authorization, Codex must continue ordinary next rounds without confirmation until `NextDecision` reports terminal project-total completion, `NEEDS_HUMAN_DECISION`, `BLOCKED`, or the user stops the session. A `running` loop status with `continuation_required=true` is an instruction to keep working, not a final-answer point. Safety blockers, human gates, external account/login/CAPTCHA, publish/push, destructive file operations, and permission changes still pause.
 
 For subgoal reviews:
 
@@ -238,6 +272,24 @@ This can mark the test-line as achieved, but it must not stop the overall loop u
 - `needs-more-info`: local evidence is insufficient; ask GPT or the user for a narrower question.
 
 Always cite local evidence. Evidence can be a file path, command result, test failure, acceptance gate, project decision, or explicit user boundary.
+
+## Efficiency Audit State Fields
+
+The loop records:
+
+- `efficiency_audit_mode`
+- `latest_capability_scan`
+- `latest_efficiency_audit`
+- `latest_done_gate`
+- `latest_final_closure`
+- `capability_scan_basis`
+- `top_capability_family`
+- `top_capability_status`
+- `recommended_capability_routes`
+- `stale_count`
+- `stall_pivot_status`
+- `done_gate_verdict`
+- `final_closure_verdict`
 
 ## Safety Checks
 

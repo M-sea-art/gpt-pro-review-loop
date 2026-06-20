@@ -1,6 +1,6 @@
 [CmdletBinding()]
 param(
-  [ValidateSet("Init", "Prepare", "PrepareCompactReview", "PreflightBrowser", "SendPrompt", "CaptureFeedback", "CaptureReview", "WaitFeedback", "AssessFeedback", "SendAssessment", "NextDecision", "BuildProjectGoalPlan", "NextLocalAction", "RunLocalCouncil", "CloseProTab", "RecordProgress", "PromoteGoal", "RunLoop", "RecordExperience", "Status", "Run")]
+  [ValidateSet("Init", "Prepare", "PrepareCompactReview", "PreflightBrowser", "SendPrompt", "CaptureFeedback", "CaptureReview", "WaitFeedback", "AssessFeedback", "SendAssessment", "NextDecision", "BuildProjectGoalPlan", "NextLocalAction", "RunCapabilityScan", "RunEfficiencyAudit", "RunDoneGate", "RunFinalClosure", "RunLocalCouncil", "CloseProTab", "RecordProgress", "PromoteGoal", "RunLoop", "RecordExperience", "Status", "Run")]
   [string]$Action = "Run",
   [string]$Root,
   [string]$TargetChatGptUrl,
@@ -16,6 +16,13 @@ param(
   [switch]$AttachVisualEvidence,
   [ValidateSet("optional", "required", "disabled")]
   [string]$ProReviewMode = "optional",
+  [ValidateSet("off", "light", "standard", "strict")]
+  [string]$EfficiencyAuditMode = "standard",
+  [switch]$CapabilityScan,
+  [switch]$PeriodicAudit,
+  [switch]$DoneGate,
+  [switch]$FinalClosure,
+  [string]$AuditContext,
   [switch]$AutoCloseProTab,
   [switch]$LocalCouncil,
   [string]$ProgressArtifact,
@@ -26,7 +33,7 @@ param(
   [switch]$ForceCompleteProjectGoal,
   [ValidateSet("gpt-pro", "codex-efficiency-auditor", "local-expert-council")]
   [string]$Reviewer = "gpt-pro",
-  [ValidateSet("initial", "recheck", "process-audit", "goal-audit", "brainstorm", "post-evaluation")]
+  [ValidateSet("initial", "recheck", "process-audit", "goal-audit", "brainstorm", "post-evaluation", "capability-scan", "preflight-audit", "periodic-audit", "done-gate", "final-closure", "stall-pivot")]
   [string]$Phase = "initial",
   [string]$ReviewText,
   [string]$ReviewFile,
@@ -48,6 +55,7 @@ $ErrorActionPreference = "Stop"
 $GoalScopeProvided = $PSBoundParameters.ContainsKey("GoalScope")
 $TerminalGoalScopeProvided = $PSBoundParameters.ContainsKey("TerminalGoalScope")
 $ProReviewModeProvided = $PSBoundParameters.ContainsKey("ProReviewMode")
+$EfficiencyAuditModeProvided = $PSBoundParameters.ContainsKey("EfficiencyAuditMode")
 
 if ($PSVersionTable.PSVersion.Major -lt 7) {
   throw "gpt_pro_review_loop.ps1 requires PowerShell 7+ because it uses .NET path APIs such as System.IO.Path.GetRelativePath."
@@ -494,10 +502,10 @@ function Write-GoalBacklog {
   $lines.Add("- updated_at: $(Get-Date -Format o)") | Out-Null
   $lines.Add("- active_generated_goal_id: $($State.active_generated_goal_id)") | Out-Null
   $lines.Add("") | Out-Null
-  $lines.Add("| ID | Priority | Status | Category | Parent scope | Title | Recommended next action | Source review |") | Out-Null
-  $lines.Add("|---|---|---|---|---|---|---|---|") | Out-Null
+  $lines.Add("| ID | Priority | Status | Category | Parent scope | Title | Recommended next action | Capability route | Source review |") | Out-Null
+  $lines.Add("|---|---|---|---|---|---|---|---|---|") | Out-Null
   foreach ($item in $items) {
-    $lines.Add("| $($item.id) | $($item.priority) | $($item.status) | $($item.category) | $($item.parent_goal_scope) | $(ConvertTo-MarkdownCell $item.title) | $(ConvertTo-MarkdownCell $item.recommended_next_action) | $(ConvertTo-MarkdownCell $item.source_review) |") | Out-Null
+    $lines.Add("| $($item.id) | $($item.priority) | $($item.status) | $($item.category) | $($item.parent_goal_scope) | $(ConvertTo-MarkdownCell $item.title) | $(ConvertTo-MarkdownCell $item.recommended_next_action) | $(ConvertTo-MarkdownCell $item.recommended_capability_route) | $(ConvertTo-MarkdownCell $item.source_review) |") | Out-Null
   }
   if ($items.Count -eq 0) {
     $lines.Add("") | Out-Null
@@ -529,6 +537,29 @@ function Write-LocalCouncilIndex {
   ) -join [Environment]::NewLine
   Set-Content -LiteralPath $paths.LocalCouncil -Encoding UTF8 -Value $content
   return $paths.LocalCouncil
+}
+
+function Select-CapabilityRouteForBlocker {
+  param(
+    [Parameter(Mandatory = $true)]$State,
+    $Blocker
+  )
+  $routes = @($State.recommended_capability_routes | Where-Object { $_ })
+  if ($routes.Count -eq 0) { return "local-codex" }
+  $text = "$($Blocker.raw_text) $($Blocker.recommended_next_action) $($Blocker.category)".ToLowerInvariant()
+  if ($text -match "playtest|game|godot|phaser|webgl|sprite|prototype|interactive|browser") {
+    $gameRoute = @($routes | Where-Object { $_ -match "game-studio" } | Select-Object -First 1)
+    if ($gameRoute.Count -gt 0) { return [string]$gameRoute[0] }
+  }
+  if ($text -match "code|symbol|call|structure|impact") {
+    $codeRoute = @($routes | Where-Object { $_ -match "codegraph" } | Select-Object -First 1)
+    if ($codeRoute.Count -gt 0) { return [string]$codeRoute[0] }
+  }
+  if ($text -match "browser|ui|screenshot|visual") {
+    $browserRoute = @($routes | Where-Object { $_ -match "browser|playwright|chrome" } | Select-Object -First 1)
+    if ($browserRoute.Count -gt 0) { return [string]$browserRoute[0] }
+  }
+  return [string]$routes[0]
 }
 
 function New-GoalBacklogItemsFromQueue {
@@ -569,6 +600,7 @@ function New-GoalBacklogItemsFromQueue {
         priority = $priority
         status = $status
         recommended_next_action = $blocker.recommended_next_action
+        recommended_capability_route = (Select-CapabilityRouteForBlocker -State $State -Blocker $blocker)
       }) | Out-Null
     $nextIndex += 1
   }
@@ -588,11 +620,13 @@ function New-LocalCouncilReview {
     Update-ProjectBlockerQueue -ProjectRoot $ProjectRoot -State $state -Blockers @($guard.blockers) | Out-Null
   }
   $queue = @($state.project_blocker_queue)
+  $routeText = if ($state.recommended_capability_routes) { (@($state.recommended_capability_routes | Select-Object -First 8) -join ", ") } else { "(no capability scan yet)" }
   $ideaLines = New-Object System.Collections.Generic.List[string]
   $ideaLines.Add("- 产品目标专家：把项目总目标拆成下一条用户可感知的完成信号。") | Out-Null
   $ideaLines.Add("- 实现路线专家：围绕 current_blocker_id 设计一个最小本地产物，而不是扩大系统范围。") | Out-Null
   $ideaLines.Add("- 验证专家：为下一步行动配一个可重复命令、截图、哈希或文档证据。") | Out-Null
   $ideaLines.Add("- 流程效率专家：先推进 should_send_to_gpt=false 的本地项，只有新问题再外部复核。") | Out-Null
+  $ideaLines.Add("- 能力路线观察：可参考 $routeText，但推荐能力不等于授权。") | Out-Null
   foreach ($item in @($queue | Select-Object -First 8)) {
     $ideaLines.Add("- 相互激发：围绕 $($item.id) 产生候选推进点：$($item.raw_text)") | Out-Null
   }
@@ -615,7 +649,8 @@ function New-LocalCouncilReview {
       $evalLines.Add("- (none)") | Out-Null
     } else {
       foreach ($item in $subset) {
-        $evalLines.Add("- $($item.id): $($item.recommended_next_action)") | Out-Null
+        $capabilityRoute = Select-CapabilityRouteForBlocker -State $state -Blocker $item
+        $evalLines.Add("- $($item.id): $($item.recommended_next_action) [capability_route: $capabilityRoute]") | Out-Null
       }
     }
     $evalLines.Add("") | Out-Null
@@ -631,6 +666,10 @@ function New-LocalCouncilReview {
     "- active_goal_scope: $($state.active_goal_scope)",
     "- terminal_goal_scope: $($state.terminal_goal_scope)",
     "- participants: 产品目标专家, 实现路线专家, 验证专家, 流程效率专家",
+    "- latest_capability_scan: $($state.latest_capability_scan)",
+    "- latest_efficiency_audit: $($state.latest_efficiency_audit)",
+    "- stall_pivot_status: $($state.stall_pivot_status)",
+    "- capability_routes: $routeText",
     "",
     "## Brainstorm",
     "",
@@ -754,6 +793,316 @@ function Invoke-PromoteGoal {
   Write-GoalBacklog -ProjectRoot $ProjectRoot -State $state | Out-Null
   New-RuntimeBrief -ProjectRoot $ProjectRoot -Reason "promote_goal" | Out-Null
   Write-Host "Promoted generated goal: $($goal.id)" -ForegroundColor Green
+}
+
+function Get-EfficiencyAuditorScript {
+  $candidate = Join-Path $env:USERPROFILE ".codex\skills\codex-efficiency-auditor\scripts\audit_codex_capabilities.py"
+  if (-not (Test-Path -LiteralPath $candidate)) {
+    throw "codex-efficiency-auditor capability scan script was not found: $candidate"
+  }
+  return $candidate
+}
+
+function Get-DefaultAuditContext {
+  param(
+    [Parameter(Mandatory = $true)][string]$ProjectRoot,
+    [string]$Override
+  )
+  if ($Override) { return $Override }
+  $parts = New-Object System.Collections.Generic.List[string]
+  $parts.Add((Split-Path -Leaf $ProjectRoot)) | Out-Null
+  foreach ($relative in @("AGENTS.md", "README.md", "docs/process/CODEX_CAPABILITY_ROUTING.md", "docs/project/FPV0_COMPLETION_ROADMAP.md")) {
+    $full = Join-Path $ProjectRoot ($relative -replace "/", "\")
+    if (Test-Path -LiteralPath $full) {
+      $parts.Add((Get-ContentExcerpt -Path $full -MaxChars 2200)) | Out-Null
+    }
+  }
+  return ($parts.ToArray() -join "`n")
+}
+
+function Get-RecommendedCapabilityRoutes {
+  param($Scan)
+  $routes = New-Object System.Collections.Generic.List[string]
+  foreach ($capability in @($Scan.best_capabilities | Select-Object -First 8)) {
+    if ($capability.mention -and $routes -notcontains [string]$capability.mention) {
+      $routes.Add([string]$capability.mention) | Out-Null
+    }
+    foreach ($child in @($capability.child_mentions | Select-Object -First 4)) {
+      if ($child -and $routes -notcontains [string]$child) {
+        $routes.Add([string]$child) | Out-Null
+      }
+    }
+  }
+  return @($routes.ToArray() | Select-Object -First 12)
+}
+
+function Invoke-CapabilityScan {
+  param(
+    [Parameter(Mandatory = $true)][string]$ProjectRoot,
+    [string]$Context
+  )
+  $paths = Get-ReviewPaths -ProjectRoot $ProjectRoot
+  $state = Get-State -ProjectRoot $ProjectRoot
+  $previousNextAction = $state.next_action
+  $previousShouldSend = $state.should_send_to_gpt
+  $previousSendReason = $state.send_reason
+  $previousLocalOnlyNextAction = $state.local_only_next_action
+  $script = Get-EfficiencyAuditorScript
+  $scanContext = Get-DefaultAuditContext -ProjectRoot $ProjectRoot -Override $Context
+  $oldPythonUtf8 = $env:PYTHONUTF8
+  $env:PYTHONUTF8 = "1"
+  try {
+    $output = & python $script --json --context $scanContext 2>&1
+    if ($LASTEXITCODE -ne 0) {
+      throw "Capability scan failed: $($output -join "`n")"
+    }
+  } finally {
+    if ($null -eq $oldPythonUtf8) { Remove-Item Env:\PYTHONUTF8 -ErrorAction SilentlyContinue } else { $env:PYTHONUTF8 = $oldPythonUtf8 }
+    $global:LASTEXITCODE = 0
+  }
+  $jsonText = $output -join "`n"
+  $scan = $jsonText | ConvertFrom-Json
+  $stamp = Get-Date -Format "yyyyMMdd-HHmmss-fff"
+  $jsonPath = Join-Path $paths.LoopRuns ("{0}-capability-scan.json" -f $stamp)
+  ConvertTo-JsonFile $scan $jsonPath
+  $routes = Get-RecommendedCapabilityRoutes -Scan $scan
+  $top = @($scan.best_capabilities | Select-Object -First 1)
+  $topName = if ($top.Count -gt 0) { [string]$top[0].name } else { $null }
+  $topStatus = if ($top.Count -gt 0) { [string]$top[0].status } else { $null }
+  $reviewLines = New-Object System.Collections.Generic.List[string]
+  $reviewLines.Add("# Codex Efficiency Capability Scan") | Out-Null
+  $reviewLines.Add("") | Out-Null
+  $reviewLines.Add("- Audit mutation status: LEDGER_ONLY_REVIEW_EVENT") | Out-Null
+  $reviewLines.Add("- Scan basis: $($scan.scan_basis)") | Out-Null
+  $reviewLines.Add("- Context: $($scan.context)") | Out-Null
+  $reviewLines.Add("- Top capability family: $topName") | Out-Null
+  $reviewLines.Add("- Top capability status: $topStatus") | Out-Null
+  $reviewLines.Add("") | Out-Null
+  $reviewLines.Add("## Recommended Capability Routes") | Out-Null
+  if ($routes.Count -eq 0) {
+    $reviewLines.Add("- (none)") | Out-Null
+  } else {
+    foreach ($route in $routes) { $reviewLines.Add("- $route") | Out-Null }
+  }
+  $reviewLines.Add("") | Out-Null
+  $reviewLines.Add("## Boundary") | Out-Null
+  $reviewLines.Add("- Capability Scan is read-only recommendation input.") | Out-Null
+  $reviewLines.Add("- `installed-not-exposed` remains non-callable until visible in the active session.") | Out-Null
+  $reviewPath = Save-Review -ProjectRoot $ProjectRoot -ReviewerName "codex-efficiency-auditor" -ReviewPhase "capability-scan" -Text ($reviewLines.ToArray() -join [Environment]::NewLine)
+  $state = Get-State -ProjectRoot $ProjectRoot
+  Set-ObjectProperty $state "next_action" $previousNextAction
+  Set-ObjectProperty $state "should_send_to_gpt" $previousShouldSend
+  Set-ObjectProperty $state "send_reason" $previousSendReason
+  Set-ObjectProperty $state "local_only_next_action" $previousLocalOnlyNextAction
+  Set-ObjectProperty $state "latest_capability_scan" (Get-RelativePath -Root $ProjectRoot -Path $jsonPath)
+  Set-ObjectProperty $state "capability_scan_basis" "$($scan.scan_basis); context=$($scan.context)"
+  Set-ObjectProperty $state "top_capability_family" $topName
+  Set-ObjectProperty $state "top_capability_status" $topStatus
+  Set-ObjectProperty $state "recommended_capability_routes" @($routes)
+  Set-ObjectProperty $state "latest_efficiency_audit" (Get-RelativePath -Root $ProjectRoot -Path $reviewPath)
+  Save-State $ProjectRoot $state
+  New-RuntimeBrief -ProjectRoot $ProjectRoot -Reason "capability_scan" | Out-Null
+  Write-Host "Capability scan saved: $jsonPath" -ForegroundColor Green
+  Write-Host "Top capability family: $topName ($topStatus)"
+  return [pscustomobject]@{
+    json = $jsonPath
+    review = $reviewPath
+    top_capability_family = $topName
+    recommended_capability_routes = @($routes)
+  }
+}
+
+function Get-StallPivotVerdict {
+  param([int]$StaleCount)
+  if ($StaleCount -ge 4) { return "BLOCKED" }
+  if ($StaleCount -eq 3) { return "RECOVERY_NEEDED" }
+  if ($StaleCount -eq 2) { return "REPEATED_FAILURE" }
+  if ($StaleCount -eq 1) { return "STALE_PROGRESS" }
+  return "CONTINUE"
+}
+
+function New-EfficiencyAuditReview {
+  param(
+    [Parameter(Mandatory = $true)][string]$ProjectRoot,
+    [ValidateSet("preflight-audit", "periodic-audit", "stall-pivot")]
+    [string]$AuditPhase = "periodic-audit"
+  )
+  $state = Get-State -ProjectRoot $ProjectRoot
+  $previousNextAction = $state.next_action
+  $previousShouldSend = $state.should_send_to_gpt
+  $previousSendReason = $state.send_reason
+  $previousLocalOnlyNextAction = $state.local_only_next_action
+  $artifactCount = if ($state.local_progress_artifacts) { @($state.local_progress_artifacts).Count } else { 0 }
+  $staleCount = if ($state.stale_count) { [int]$state.stale_count } elseif ($state.stalled_local_action_count) { [int]$state.stalled_local_action_count } else { 0 }
+  $stallVerdict = Get-StallPivotVerdict -StaleCount $staleCount
+  $scopeDrift = if ($state.next_action -match "(?i)(push|publish|deploy|merge|delete|reset|credential|billing|external account)") { "POSSIBLE_SCOPE_DRIFT_OR_HUMAN_GATE" } else { "none_detected" }
+  $routeText = if ($state.recommended_capability_routes) { (@($state.recommended_capability_routes) -join ", ") } else { "(run capability scan for route recommendations)" }
+  $audit = @"
+# Codex Efficiency Audit
+
+- phase: $AuditPhase
+- Audit mutation status: LEDGER_ONLY_REVIEW_EVENT
+- efficiency_audit_mode: $($state.efficiency_audit_mode)
+- loop_status: $($state.loop_status)
+- goal_verdict: $($state.goal_verdict)
+- next_action: $($state.next_action)
+- should_send_to_gpt: $($state.should_send_to_gpt)
+- local_only_next_action: $($state.local_only_next_action)
+
+## Capability Route Input
+
+- latest_capability_scan: $($state.latest_capability_scan)
+- top_capability_family: $($state.top_capability_family)
+- top_capability_status: $($state.top_capability_status)
+- recommended_capability_routes: $routeText
+
+## Periodic Audit
+
+- recent_progress_artifact_count: $artifactCount
+- stale_count: $staleCount
+- stall_pivot_status: $stallVerdict
+- scope_drift_check: $scopeDrift
+- done_gate_verdict: $($state.done_gate_verdict)
+
+## Decision Guidance
+
+- CONTINUE means keep executing the concrete local action.
+- STALE_PROGRESS or REPEATED_FAILURE means pivot evidence source, decomposition, test strategy, or scope.
+- SCOPE_DRIFT / Human Gate / publish / push / destructive work must pause for the user.
+"@
+  $reviewPath = Save-Review -ProjectRoot $ProjectRoot -ReviewerName "codex-efficiency-auditor" -ReviewPhase $AuditPhase -Text $audit
+  $state = Get-State -ProjectRoot $ProjectRoot
+  Set-ObjectProperty $state "next_action" $previousNextAction
+  Set-ObjectProperty $state "should_send_to_gpt" $previousShouldSend
+  Set-ObjectProperty $state "send_reason" $previousSendReason
+  Set-ObjectProperty $state "local_only_next_action" $previousLocalOnlyNextAction
+  Set-ObjectProperty $state "latest_efficiency_audit" (Get-RelativePath -Root $ProjectRoot -Path $reviewPath)
+  Set-ObjectProperty $state "stall_pivot_status" $stallVerdict
+  Set-ObjectProperty $state "stale_count" $staleCount
+  if ($scopeDrift -ne "none_detected") {
+    Set-ObjectProperty $state "stall_pivot_status" "SCOPE_DRIFT"
+  }
+  Save-State $ProjectRoot $state
+  New-RuntimeBrief -ProjectRoot $ProjectRoot -Reason $AuditPhase | Out-Null
+  Write-Host "Efficiency audit saved: $reviewPath" -ForegroundColor Green
+  Write-Host "stall_pivot_status: $($state.stall_pivot_status)"
+  return $reviewPath
+}
+
+function Invoke-DoneGateReview {
+  param(
+    [Parameter(Mandatory = $true)][string]$ProjectRoot
+  )
+  $state = Get-State -ProjectRoot $ProjectRoot
+  $previousNextAction = $state.next_action
+  $previousShouldSend = $state.should_send_to_gpt
+  $previousSendReason = $state.send_reason
+  $previousLocalOnlyNextAction = $state.local_only_next_action
+  $guard = Invoke-CompletionGuard -ProjectRoot $ProjectRoot -State $state -Verdict $(if ($state.goal_verdict) { [string]$state.goal_verdict } else { "CONTINUE" })
+  $verdict = "NEEDS_FIX"
+  if ($state.goal_verdict -ne "GOAL_ACHIEVED") {
+    $verdict = "NEEDS_FIX"
+  } elseif ($guard.status -eq "subgoal_achieved_not_terminal") {
+    $verdict = "NEEDS_FIX"
+  } elseif ($guard.status -eq "blocked_by_project_goal") {
+    $queue = New-ProjectBlockerQueue -Blockers @($guard.blockers)
+    if (Test-QueueHasOnlyHumanOrAuthorization -Queue $queue) {
+      $verdict = "NEEDS_HUMAN_DECISION"
+    } else {
+      $verdict = "NEEDS_FIX"
+    }
+  } elseif ($guard.is_terminal) {
+    $verdict = "DONE_GATE_PASS"
+  } else {
+    $verdict = "READY_FOR_FINAL_AUDIT"
+  }
+  $blockerText = if ($guard.blockers.Count -gt 0) { @($guard.blockers) -join "`n" } else { "(none)" }
+  $doneText = @"
+# Codex Efficiency Done Gate
+
+- phase: done-gate
+- Audit mutation status: LEDGER_ONLY_REVIEW_EVENT
+- Done Gate verdict: $verdict
+- active_goal_scope: $($guard.active_goal_scope)
+- terminal_goal_scope: $($guard.terminal_goal_scope)
+- completion_guard_status: $($guard.status)
+
+## Evidence Table
+
+| Requirement | Evidence | Status |
+|---|---|---|
+| Contract audit | active scope $($guard.active_goal_scope), terminal scope $($guard.terminal_goal_scope) | $(if ($guard.active_goal_scope -eq $guard.terminal_goal_scope) { "PASS" } else { "FAIL" }) |
+| Project completion blockers | $($guard.blockers.Count) blocker(s) detected | $(if ($guard.blockers.Count -eq 0) { "PASS" } else { "FAIL" }) |
+| Stop condition | goal_verdict=$($state.goal_verdict) | $(if ($state.goal_verdict -eq "GOAL_ACHIEVED") { "PASS" } else { "FAIL" }) |
+| Pause scan | Human Gate / authorization blockers stay blocking | $(if ($verdict -eq "NEEDS_HUMAN_DECISION") { "FAIL" } else { "PASS" }) |
+
+## Blocking Evidence
+
+```text
+$blockerText
+```
+
+Never mark project-total complete without `DONE_GATE_PASS`.
+"@
+  $reviewPath = Save-Review -ProjectRoot $ProjectRoot -ReviewerName "codex-efficiency-auditor" -ReviewPhase "done-gate" -Text $doneText
+  $state = Get-State -ProjectRoot $ProjectRoot
+  Set-ObjectProperty $state "next_action" $previousNextAction
+  Set-ObjectProperty $state "should_send_to_gpt" $previousShouldSend
+  Set-ObjectProperty $state "send_reason" $previousSendReason
+  Set-ObjectProperty $state "local_only_next_action" $previousLocalOnlyNextAction
+  Set-ObjectProperty $state "latest_done_gate" (Get-RelativePath -Root $ProjectRoot -Path $reviewPath)
+  Set-ObjectProperty $state "done_gate_verdict" $verdict
+  Set-ObjectProperty $state "latest_efficiency_audit" (Get-RelativePath -Root $ProjectRoot -Path $reviewPath)
+  Save-State $ProjectRoot $state
+  New-RuntimeBrief -ProjectRoot $ProjectRoot -Reason "done_gate" | Out-Null
+  Write-Host "Done Gate verdict: $verdict" -ForegroundColor Green
+  Write-Host "Done Gate review: $reviewPath"
+  return [pscustomobject]@{
+    verdict = $verdict
+    review = $reviewPath
+  }
+}
+
+function Invoke-FinalClosureReview {
+  param([Parameter(Mandatory = $true)][string]$ProjectRoot)
+  $state = Get-State -ProjectRoot $ProjectRoot
+  $previousNextAction = $state.next_action
+  $previousShouldSend = $state.should_send_to_gpt
+  $previousSendReason = $state.send_reason
+  $previousLocalOnlyNextAction = $state.local_only_next_action
+  $verdict = if ($state.done_gate_verdict -eq "DONE_GATE_PASS" -and $state.goal_achieved_is_terminal) { "VERSION_CLOSED" } elseif ($state.done_gate_verdict -eq "DONE_GATE_PASS") { "READY_FOR_HUMAN_REVIEW" } else { "NEEDS_FIX" }
+  $closure = @"
+# Codex Efficiency Final Closure
+
+- phase: final-closure
+- Audit mutation status: LEDGER_ONLY_REVIEW_EVENT
+- final_closure_verdict: $verdict
+- loop_status: $($state.loop_status)
+- goal_verdict: $($state.goal_verdict)
+- done_gate_verdict: $($state.done_gate_verdict)
+- completion_guard_status: $($state.completion_guard_status)
+
+## Closure Rule
+
+Final closure is allowed only after project_total guard passes and Done Gate is `DONE_GATE_PASS`.
+"@
+  $reviewPath = Save-Review -ProjectRoot $ProjectRoot -ReviewerName "codex-efficiency-auditor" -ReviewPhase "final-closure" -Text $closure
+  $state = Get-State -ProjectRoot $ProjectRoot
+  Set-ObjectProperty $state "next_action" $previousNextAction
+  Set-ObjectProperty $state "should_send_to_gpt" $previousShouldSend
+  Set-ObjectProperty $state "send_reason" $previousSendReason
+  Set-ObjectProperty $state "local_only_next_action" $previousLocalOnlyNextAction
+  Set-ObjectProperty $state "latest_final_closure" (Get-RelativePath -Root $ProjectRoot -Path $reviewPath)
+  Set-ObjectProperty $state "final_closure_verdict" $verdict
+  Set-ObjectProperty $state "latest_efficiency_audit" (Get-RelativePath -Root $ProjectRoot -Path $reviewPath)
+  Save-State $ProjectRoot $state
+  New-RuntimeBrief -ProjectRoot $ProjectRoot -Reason "final_closure" | Out-Null
+  Write-Host "Final closure verdict: $verdict" -ForegroundColor Green
+  Write-Host "Final closure review: $reviewPath"
+  return [pscustomobject]@{
+    verdict = $verdict
+    review = $reviewPath
+  }
 }
 
 function Update-ProjectBlockerQueue {
@@ -1007,6 +1356,19 @@ function New-RuntimeBrief {
     last_prompt_chars = $state.last_prompt_chars
     cumulative_prompt_chars = $state.cumulative_prompt_chars
     pro_review_mode = $state.pro_review_mode
+    efficiency_audit_mode = $state.efficiency_audit_mode
+    latest_capability_scan = $state.latest_capability_scan
+    latest_efficiency_audit = $state.latest_efficiency_audit
+    latest_done_gate = $state.latest_done_gate
+    latest_final_closure = $state.latest_final_closure
+    capability_scan_basis = $state.capability_scan_basis
+    top_capability_family = $state.top_capability_family
+    top_capability_status = $state.top_capability_status
+    recommended_capability_routes = $state.recommended_capability_routes
+    stale_count = $state.stale_count
+    stall_pivot_status = $state.stall_pivot_status
+    done_gate_verdict = $state.done_gate_verdict
+    final_closure_verdict = $state.final_closure_verdict
     pro_tab_close_policy = $state.pro_tab_close_policy
     pro_tab_close_status = $state.pro_tab_close_status
     pro_tab_closed_at = $state.pro_tab_closed_at
@@ -1100,6 +1462,8 @@ function Ensure-ReviewLoop {
   $effectiveTerminalGoalScope = if ($TerminalGoalScopeProvided) { $TerminalGoalScope } elseif ($config.terminal_goal_scope) { [string]$config.terminal_goal_scope } else { "project_total" }
   $effectiveProReviewMode = if ($ProReviewModeProvided) { $ProReviewMode } elseif ($config.pro_review_mode) { [string]$config.pro_review_mode } else { "optional" }
   if ($effectiveProReviewMode -notin @("optional", "required", "disabled")) { $effectiveProReviewMode = "optional" }
+  $effectiveEfficiencyAuditMode = if ($EfficiencyAuditModeProvided) { $EfficiencyAuditMode } elseif ($config.efficiency_audit_mode) { [string]$config.efficiency_audit_mode } else { "standard" }
+  if ($effectiveEfficiencyAuditMode -notin @("off", "light", "standard", "strict")) { $effectiveEfficiencyAuditMode = "standard" }
   $effectiveLocalCouncilMode = if ($config.local_council_mode) { [string]$config.local_council_mode } else { "enabled" }
   if ($LocalCouncil) { $effectiveLocalCouncilMode = "enabled" }
   $requiredConfig = [ordered]@{
@@ -1122,6 +1486,8 @@ function Ensure-ReviewLoop {
     gpt_courtesy_footer = "谢谢你的工作，GPT朋友。"
     courtesy_footer_policy = "after_first_external_review_in_continuous_loop"
     pro_review_mode = $effectiveProReviewMode
+    efficiency_audit_mode = $effectiveEfficiencyAuditMode
+    efficiency_audit_policy = "capability_scan_goal_supervision_periodic_done_gate_final_closure"
     pro_tab_close_policy = "target_conversation"
     local_council_mode = $effectiveLocalCouncilMode
     local_council_policy = "brainstorm_then_post_evaluation"
@@ -1134,7 +1500,7 @@ function Ensure-ReviewLoop {
 
   if (-not (Test-Path -LiteralPath $paths.State)) {
     $state = [ordered]@{
-      version = 6
+      version = 7
       updated_at = (Get-Date).ToString("o")
       baseline_sent = $false
       baseline_hash = $null
@@ -1205,13 +1571,26 @@ function Ensure-ReviewLoop {
       progress_artifacts = @()
       goal_backlog = @()
       active_generated_goal_id = $null
+      efficiency_audit_mode = $effectiveEfficiencyAuditMode
+      latest_capability_scan = $null
+      latest_efficiency_audit = $null
+      latest_done_gate = $null
+      latest_final_closure = $null
+      capability_scan_basis = $null
+      top_capability_family = $null
+      top_capability_status = $null
+      recommended_capability_routes = @()
+      stale_count = 0
+      stall_pivot_status = "CONTINUE"
+      done_gate_verdict = $null
+      final_closure_verdict = $null
     }
   } else {
     $state = Read-JsonFile $paths.State
-    foreach ($field in @("version", "iteration_counter", "loop_mode", "loop_status", "latest_review", "latest_assessment_prompt", "goal_verdict", "next_action", "stop_reason", "baseline_sent_to_url", "baseline_sent_hash", "latest_prompt_target_url", "latest_prompt_opened_tab_url", "latest_assessment_target_url", "latest_assessment_opened_tab_url", "continuation_required", "url_confirmation_required", "url_confirmation_reason", "quota_mode", "runtime_brief", "browser_preflight_status", "browser_backend_type", "browser_target_tab_id", "browser_preflight_iteration", "browser_preflight_checked_at", "latest_visual_evidence_hash", "latest_visual_evidence_path", "last_visual_evidence_sent_hash", "attach_visual_evidence_requested", "last_prompt_chars", "cumulative_prompt_chars", "external_review_count", "local_only_iteration_count", "should_send_to_gpt", "send_reason", "local_only_next_action", "active_goal_scope", "terminal_goal_scope", "subgoal_verdict", "project_goal_verdict", "completion_guard_status", "goal_achieved_is_terminal", "gpt_courtesy_footer_sent_count", "current_blocker_id", "current_blocker_category", "blocker_queue_updated_at", "stalled_local_action_count", "pro_review_mode", "pro_tab_close_policy", "pro_tab_close_status", "pro_tab_close_target_url", "pro_tab_closed_at", "local_council_mode", "latest_local_council_review", "active_generated_goal_id")) {
+    foreach ($field in @("version", "iteration_counter", "loop_mode", "loop_status", "latest_review", "latest_assessment_prompt", "goal_verdict", "next_action", "stop_reason", "baseline_sent_to_url", "baseline_sent_hash", "latest_prompt_target_url", "latest_prompt_opened_tab_url", "latest_assessment_target_url", "latest_assessment_opened_tab_url", "continuation_required", "url_confirmation_required", "url_confirmation_reason", "quota_mode", "runtime_brief", "browser_preflight_status", "browser_backend_type", "browser_target_tab_id", "browser_preflight_iteration", "browser_preflight_checked_at", "latest_visual_evidence_hash", "latest_visual_evidence_path", "last_visual_evidence_sent_hash", "attach_visual_evidence_requested", "last_prompt_chars", "cumulative_prompt_chars", "external_review_count", "local_only_iteration_count", "should_send_to_gpt", "send_reason", "local_only_next_action", "active_goal_scope", "terminal_goal_scope", "subgoal_verdict", "project_goal_verdict", "completion_guard_status", "goal_achieved_is_terminal", "gpt_courtesy_footer_sent_count", "current_blocker_id", "current_blocker_category", "blocker_queue_updated_at", "stalled_local_action_count", "pro_review_mode", "efficiency_audit_mode", "latest_capability_scan", "latest_efficiency_audit", "latest_done_gate", "latest_final_closure", "capability_scan_basis", "top_capability_family", "top_capability_status", "stale_count", "stall_pivot_status", "done_gate_verdict", "final_closure_verdict", "pro_tab_close_policy", "pro_tab_close_status", "pro_tab_close_target_url", "pro_tab_closed_at", "local_council_mode", "latest_local_council_review", "active_generated_goal_id")) {
       if (-not ($state.PSObject.Properties.Name -contains $field)) {
         $default = $null
-        if ($field -eq "version") { $default = 6 }
+        if ($field -eq "version") { $default = 7 }
         if ($field -eq "iteration_counter") { $default = 0 }
         if ($field -eq "loop_mode") { $default = "continuous_until_stopped" }
         if ($field -eq "loop_status") { $default = "idle" }
@@ -1235,20 +1614,24 @@ function Ensure-ReviewLoop {
         if ($field -eq "gpt_courtesy_footer_sent_count") { $default = 0 }
         if ($field -eq "stalled_local_action_count") { $default = 0 }
         if ($field -eq "pro_review_mode") { $default = $effectiveProReviewMode }
+        if ($field -eq "efficiency_audit_mode") { $default = $effectiveEfficiencyAuditMode }
+        if ($field -eq "stale_count") { $default = 0 }
+        if ($field -eq "stall_pivot_status") { $default = "CONTINUE" }
         if ($field -eq "pro_tab_close_policy") { $default = "target_conversation" }
         if ($field -eq "local_council_mode") { $default = $effectiveLocalCouncilMode }
         Set-ObjectProperty $state $field $default
       }
     }
-    foreach ($field in @("pending_prompts", "pending_reviews", "captured_reviews", "pending_assessments", "blocking_gates", "goal_context_sources", "project_blocker_queue", "local_progress_artifacts", "progress_artifacts", "goal_backlog")) {
+    foreach ($field in @("pending_prompts", "pending_reviews", "captured_reviews", "pending_assessments", "blocking_gates", "goal_context_sources", "project_blocker_queue", "local_progress_artifacts", "progress_artifacts", "goal_backlog", "recommended_capability_routes")) {
       if (-not ($state.PSObject.Properties.Name -contains $field) -or $null -eq $state.$field) {
         Set-ObjectProperty $state $field @()
       }
     }
-    Set-ObjectProperty $state "version" 6
+    Set-ObjectProperty $state "version" 7
     Set-ObjectProperty $state "loop_mode" "continuous_until_stopped"
     Set-ObjectProperty $state "quota_mode" $quotaDefaults.mode
     Set-ObjectProperty $state "pro_review_mode" $effectiveProReviewMode
+    Set-ObjectProperty $state "efficiency_audit_mode" $effectiveEfficiencyAuditMode
     Set-ObjectProperty $state "pro_tab_close_policy" "target_conversation"
     Set-ObjectProperty $state "local_council_mode" $effectiveLocalCouncilMode
     if ($GoalScopeProvided) { Set-ObjectProperty $state "active_goal_scope" $effectiveGoalScope }
@@ -2210,7 +2593,21 @@ function Invoke-NextDecision {
   switch ($verdict) {
     "GOAL_ACHIEVED" {
       if ($guard.is_terminal) {
-        if ($effectiveProMode -eq "required" -and -not (Test-GptProReviewCaptured -State $state)) {
+        $doneGatePass = $true
+        if ($state.efficiency_audit_mode -ne "off") {
+          if ($DoneGate -or -not $state.latest_done_gate -or $state.done_gate_verdict -ne "DONE_GATE_PASS") {
+            Invoke-DoneGateReview -ProjectRoot $ProjectRoot | Out-Null
+            $state = Get-State -ProjectRoot $ProjectRoot
+          }
+          $doneGatePass = ($state.done_gate_verdict -eq "DONE_GATE_PASS")
+        }
+        if (-not $doneGatePass) {
+          $status = if ($state.done_gate_verdict -eq "NEEDS_HUMAN_DECISION") { "paused" } else { "running" }
+          $stopReason = if ($status -eq "paused") { "done_gate_needs_human_decision" } else { $null }
+          $terminalAllowed = $false
+          Set-ObjectProperty $state "project_goal_verdict" "CONTINUE"
+          Set-ObjectProperty $state "next_action" $(if ($state.done_gate_verdict -eq "NEEDS_HUMAN_DECISION") { "request_human_decision_for_done_gate" } else { "resolve_done_gate_findings" })
+        } elseif ($effectiveProMode -eq "required" -and -not (Test-GptProReviewCaptured -State $state)) {
           $status = "running"
           $stopReason = $null
           $terminalAllowed = $false
@@ -2294,6 +2691,8 @@ function Invoke-NextDecision {
       $stalledCount = 0
     }
     Set-ObjectProperty $state "stalled_local_action_count" $stalledCount
+    Set-ObjectProperty $state "stale_count" $stalledCount
+    Set-ObjectProperty $state "stall_pivot_status" (Get-StallPivotVerdict -StaleCount $stalledCount)
     if ($stalledCount -ge 2) {
       Set-ObjectProperty $state "goal_verdict" "NEEDS_PROCESS_FIX"
       Set-ObjectProperty $state "next_action" "split_or_update_project_goal_plan"
@@ -2304,11 +2703,19 @@ function Invoke-NextDecision {
     }
   } elseif ($status -ne "running") {
     Set-ObjectProperty $state "stalled_local_action_count" 0
+    Set-ObjectProperty $state "stale_count" 0
+    Set-ObjectProperty $state "stall_pivot_status" "CONTINUE"
   }
   Set-ObjectProperty $state "should_send_to_gpt" $shouldSend
   Set-ObjectProperty $state "send_reason" $sendReason
   Set-ObjectProperty $state "local_only_next_action" $localOnlyNextAction
   Save-State $ProjectRoot $state
+  if ($status -eq "complete" -and $state.efficiency_audit_mode -ne "off") {
+    if ($FinalClosure -or -not $state.latest_final_closure -or $state.final_closure_verdict -ne "VERSION_CLOSED") {
+      Invoke-FinalClosureReview -ProjectRoot $ProjectRoot | Out-Null
+      $state = Get-State -ProjectRoot $ProjectRoot
+    }
+  }
   if ($AutoCloseProTab -and (-not $shouldSend -or $status -in @("complete", "paused", "blocked"))) {
     Update-ProTabCloseState -ProjectRoot $ProjectRoot | Out-Null
     $state = Get-State -ProjectRoot $ProjectRoot
@@ -2334,6 +2741,16 @@ function Invoke-NextDecision {
     local_only_next_action = $localOnlyNextAction
     current_blocker_id = $state.current_blocker_id
     current_blocker_category = $state.current_blocker_category
+    efficiency_audit_mode = $state.efficiency_audit_mode
+    latest_capability_scan = $state.latest_capability_scan
+    latest_efficiency_audit = $state.latest_efficiency_audit
+    latest_done_gate = $state.latest_done_gate
+    latest_final_closure = $state.latest_final_closure
+    recommended_capability_routes = @($state.recommended_capability_routes)
+    stale_count = $state.stale_count
+    stall_pivot_status = $state.stall_pivot_status
+    done_gate_verdict = $state.done_gate_verdict
+    final_closure_verdict = $state.final_closure_verdict
     project_goal_plan = (Get-RelativePath -Root $ProjectRoot -Path $planArtifacts.markdown)
     project_blocker_queue = @($state.project_blocker_queue)
     latest_prompt = $state.latest_prompt
@@ -2459,6 +2876,19 @@ function Show-Status {
     goal_achieved_is_terminal = if ($state) { $state.goal_achieved_is_terminal } else { $null }
     gpt_courtesy_footer_sent_count = if ($state) { $state.gpt_courtesy_footer_sent_count } else { 0 }
     pro_review_mode = if ($state) { $state.pro_review_mode } else { $null }
+    efficiency_audit_mode = if ($state) { $state.efficiency_audit_mode } else { $null }
+    latest_capability_scan = if ($state) { $state.latest_capability_scan } else { $null }
+    latest_efficiency_audit = if ($state) { $state.latest_efficiency_audit } else { $null }
+    latest_done_gate = if ($state) { $state.latest_done_gate } else { $null }
+    latest_final_closure = if ($state) { $state.latest_final_closure } else { $null }
+    capability_scan_basis = if ($state) { $state.capability_scan_basis } else { $null }
+    top_capability_family = if ($state) { $state.top_capability_family } else { $null }
+    top_capability_status = if ($state) { $state.top_capability_status } else { $null }
+    recommended_capability_route_count = if ($state -and $state.recommended_capability_routes) { @($state.recommended_capability_routes).Count } else { 0 }
+    stale_count = if ($state) { $state.stale_count } else { 0 }
+    stall_pivot_status = if ($state) { $state.stall_pivot_status } else { $null }
+    done_gate_verdict = if ($state) { $state.done_gate_verdict } else { $null }
+    final_closure_verdict = if ($state) { $state.final_closure_verdict } else { $null }
     pro_tab_close_policy = if ($state) { $state.pro_tab_close_policy } else { $null }
     pro_tab_close_status = if ($state) { $state.pro_tab_close_status } else { $null }
     pro_tab_closed_at = if ($state) { $state.pro_tab_closed_at } else { $null }
@@ -2548,6 +2978,23 @@ switch ($Action) {
     Ensure-ReviewLoop -ProjectRoot $ProjectRoot -ChatUrl $TargetChatGptUrl | Out-Null
     Invoke-NextLocalAction -ProjectRoot $ProjectRoot
   }
+  "RunCapabilityScan" {
+    Ensure-ReviewLoop -ProjectRoot $ProjectRoot -ChatUrl $TargetChatGptUrl | Out-Null
+    Invoke-CapabilityScan -ProjectRoot $ProjectRoot -Context $AuditContext | Out-Null
+  }
+  "RunEfficiencyAudit" {
+    Ensure-ReviewLoop -ProjectRoot $ProjectRoot -ChatUrl $TargetChatGptUrl | Out-Null
+    $auditPhase = if ($PeriodicAudit) { "periodic-audit" } elseif ($CapabilityScan) { "preflight-audit" } else { "periodic-audit" }
+    New-EfficiencyAuditReview -ProjectRoot $ProjectRoot -AuditPhase $auditPhase | Out-Null
+  }
+  "RunDoneGate" {
+    Ensure-ReviewLoop -ProjectRoot $ProjectRoot -ChatUrl $TargetChatGptUrl | Out-Null
+    Invoke-DoneGateReview -ProjectRoot $ProjectRoot | Out-Null
+  }
+  "RunFinalClosure" {
+    Ensure-ReviewLoop -ProjectRoot $ProjectRoot -ChatUrl $TargetChatGptUrl | Out-Null
+    Invoke-FinalClosureReview -ProjectRoot $ProjectRoot | Out-Null
+  }
   "RunLocalCouncil" {
     Ensure-ReviewLoop -ProjectRoot $ProjectRoot -ChatUrl $TargetChatGptUrl | Out-Null
     New-LocalCouncilReview -ProjectRoot $ProjectRoot | Out-Null
@@ -2559,6 +3006,14 @@ switch ($Action) {
   "RecordProgress" {
     Ensure-ReviewLoop -ProjectRoot $ProjectRoot -ChatUrl $TargetChatGptUrl | Out-Null
     Add-ProgressArtifact -ProjectRoot $ProjectRoot -Artifact $ProgressArtifact
+    $state = Get-State -ProjectRoot $ProjectRoot
+    if ($state.efficiency_audit_mode -ne "off" -and (-not $state.latest_capability_scan -or $CapabilityScan)) {
+      Invoke-CapabilityScan -ProjectRoot $ProjectRoot -Context $AuditContext | Out-Null
+    }
+    $state = Get-State -ProjectRoot $ProjectRoot
+    if ($state.efficiency_audit_mode -in @("standard", "strict") -or $PeriodicAudit) {
+      New-EfficiencyAuditReview -ProjectRoot $ProjectRoot -AuditPhase "periodic-audit" | Out-Null
+    }
     New-LocalCouncilReview -ProjectRoot $ProjectRoot | Out-Null
   }
   "PromoteGoal" {
@@ -2569,6 +3024,14 @@ switch ($Action) {
     Ensure-ReviewLoop -ProjectRoot $ProjectRoot -ChatUrl $TargetChatGptUrl | Out-Null
     $config = Get-Config -ProjectRoot $ProjectRoot
     $state = Get-State -ProjectRoot $ProjectRoot
+    if ($state.efficiency_audit_mode -ne "off" -and (-not $state.latest_capability_scan -or $CapabilityScan)) {
+      Invoke-CapabilityScan -ProjectRoot $ProjectRoot -Context $AuditContext | Out-Null
+      $state = Get-State -ProjectRoot $ProjectRoot
+    }
+    if ($state.efficiency_audit_mode -eq "strict") {
+      New-EfficiencyAuditReview -ProjectRoot $ProjectRoot -AuditPhase "preflight-audit" | Out-Null
+      $state = Get-State -ProjectRoot $ProjectRoot
+    }
     $nextActionText = if ($state.next_action) { [string]$state.next_action } else { "" }
     $needsExternal = $ForceExternalReview -or $config.pro_review_mode -eq "required" -or ($nextActionText -match "(?i)(^|[_\-\s])(gpt|pro|external|review|recheck|send)([_\-\s]|$)")
     if ($config.pro_review_mode -ne "disabled" -and $needsExternal) { Assert-TargetChatGptUrl -ProjectRoot $ProjectRoot | Out-Null }
@@ -2605,6 +3068,10 @@ switch ($Action) {
     Ensure-ReviewLoop -ProjectRoot $ProjectRoot -ChatUrl $TargetChatGptUrl | Out-Null
     $config = Get-Config -ProjectRoot $ProjectRoot
     $state = Get-State -ProjectRoot $ProjectRoot
+    if ($state.efficiency_audit_mode -ne "off" -and (-not $state.latest_capability_scan -or $CapabilityScan)) {
+      Invoke-CapabilityScan -ProjectRoot $ProjectRoot -Context $AuditContext | Out-Null
+      $state = Get-State -ProjectRoot $ProjectRoot
+    }
     $nextActionText = if ($state.next_action) { [string]$state.next_action } else { "" }
     $needsExternal = $ForceExternalReview -or $config.pro_review_mode -eq "required" -or ($nextActionText -match "(?i)(^|[_\-\s])(gpt|pro|external|review|recheck|send)([_\-\s]|$)")
     if ($config.pro_review_mode -ne "disabled" -and $needsExternal) { Assert-TargetChatGptUrl -ProjectRoot $ProjectRoot | Out-Null }

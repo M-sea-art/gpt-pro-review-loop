@@ -23,6 +23,7 @@ review package -> external/internal review -> local assessment -> next decision
 - Project blockers are normalized into a queue so a running loop gets a concrete local next action instead of stopping at a generic blocker label.
 - GPT Pro is optional by default. Local-only progress, local evidence, and local expert council planning happen without opening ChatGPT unless the next decision actually needs external review.
 - The local expert council runs as `reviewer=local-expert-council`: brainstorm first, post-evaluate later, then place candidate new goals into backlog.
+- Codex efficiency audit is the process supervisor, not a plain extra reviewer. It supplies capability routing, periodic audit, stall/pivot status, Done Gate, and final closure evidence.
 - When a Pro conversation is no longer needed, the loop can record a target-tab close request so the outer Edge control flow closes the matching ChatGPT tab.
 
 This skill sends static Markdown only. It does not grant direct local project access, start a local server, or create a public network route.
@@ -50,7 +51,7 @@ Restart the Codex session if the skill metadata is not visible immediately.
 - A ChatGPT project or conversation URL when `pro_review_mode` is `optional` or `required`.
 - Existing Edge login state for ChatGPT when GPT Pro is used.
 - `edge-browser-control` skill for browser submission, reply capture, and target tab close. This is a skill/instruction set that uses the official Codex Edge/Chrome extension backend; it may not appear as a same-named callable tool.
-- Optional: `codex-efficiency-auditor` skill for process and goal audits.
+- `codex-efficiency-auditor` skill for capability scan, periodic audit, stall/pivot checks, Done Gate, and final closure. The loop reuses its `scripts/audit_codex_capabilities.py`; it does not duplicate capability inventory logic.
 
 ## Quick Start
 
@@ -82,6 +83,30 @@ Start a continuous loop after explicit authorization:
 ```
 
 `RunLoop` marks the start of the outer Codex loop. In `optional` mode it is local-first: if the current next action does not require GPT Pro, it records a runtime brief and runs the local expert council instead of generating an empty GPT handoff. `-PreflightBrowser` records the intended Edge/Chrome extension route once for this iteration only when a Pro handoff is needed. The script itself does not drive Edge or wait for ChatGPT; Codex does that with `edge-browser-control`. Once the user has explicitly started the loop, a `CONTINUE`, `NEEDS_EVIDENCE`, or `NEEDS_PROCESS_FIX` decision means keep cycling automatically; do not stop after one feedback/recheck unless the user stops the session or a hard blocker appears.
+
+Default efficiency mode is `standard`:
+
+```powershell
+& "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action RunLoop -Root "<project-root>" -EfficiencyAuditMode standard
+```
+
+Modes:
+
+- `off`: skip efficiency audit integration.
+- `light`: capability scan and Done Gate only.
+- `standard`: capability scan, periodic audit after progress, Done Gate, final closure.
+- `strict`: also emits preflight audit and treats repeated failure/Human Gate boundaries more aggressively.
+
+Useful explicit actions:
+
+```powershell
+& "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action RunCapabilityScan -Root "<project-root>" -AuditContext "game Godot browser playtest"
+& "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action RunEfficiencyAudit -Root "<project-root>" -PeriodicAudit
+& "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action RunDoneGate -Root "<project-root>"
+& "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action RunFinalClosure -Root "<project-root>"
+```
+
+For game projects, capability scan should place Game Studio routes near the top when detected, such as `@game-studio` or `$game-studio:game-playtest`. If the scan reports `installed-not-exposed`, it remains a recommendation only; do not assume the plugin is callable in the active Codex session.
 
 By default the terminal scope is the whole project:
 
@@ -159,6 +184,8 @@ Run the local expert council after each progress update:
 & "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action RunLocalCouncil -Root "<project-root>"
 & "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action PromoteGoal -Root "<project-root>"
 ```
+
+`RecordProgress` also triggers a periodic Codex efficiency audit in `standard` and `strict` modes, then the local council consumes the capability routes and audit status during post-evaluation.
 
 Record target Pro tab close after Pro has answered and the loop no longer needs that page:
 
@@ -254,6 +281,19 @@ Generated review-loop files are excluded from later code maps and sensitive scan
   "goal_achieved_is_terminal": false,
   "gpt_courtesy_footer_sent_count": 0,
   "pro_review_mode": "optional",
+  "efficiency_audit_mode": "standard",
+  "latest_capability_scan": null,
+  "latest_efficiency_audit": null,
+  "latest_done_gate": null,
+  "latest_final_closure": null,
+  "capability_scan_basis": null,
+  "top_capability_family": null,
+  "top_capability_status": null,
+  "recommended_capability_routes": [],
+  "stale_count": 0,
+  "stall_pivot_status": "CONTINUE",
+  "done_gate_verdict": null,
+  "final_closure_verdict": null,
   "pro_tab_close_policy": "target_conversation",
   "pro_tab_close_status": null,
   "local_council_mode": "enabled",
@@ -284,7 +324,20 @@ Generated review-loop files are excluded from later code maps and sensitive scan
 1. `Brainstorm`: applies the seven rules: free ideas, suspend judgment, quantity first, build on each other, record all ideas, evaluate later, and keep the meeting open and inclusive.
 2. `Post-Evaluation`: classifies ideas as immediately local, evidence-needed, external-Pro-needed, human-decision-needed, or future scope.
 
-The council updates `local-council.md` and `goal-backlog.md`. Generated goals stay in backlog and do not expand implementation scope automatically. Human Gate, core-system, publish, push, authorization, and protected-scope goals are marked `needs_human_decision`.
+The council updates `local-council.md` and `goal-backlog.md`. Generated goals stay in backlog and do not expand implementation scope automatically. Human Gate, core-system, publish, push, authorization, and protected-scope goals are marked `needs_human_decision`. Post-evaluation includes a `recommended_capability_route` for each candidate goal when a capability scan exists.
+
+## Codex Efficiency Closed Loop
+
+`codex-efficiency-auditor` is integrated as a process supervisor:
+
+- `RunCapabilityScan` calls the auditor's read-only scan script and stores JSON in `loop-runs/`.
+- `RunEfficiencyAudit` records `preflight-audit`, `periodic-audit`, or `stall-pivot` events under `reviews/`.
+- `RecordProgress` triggers a periodic audit in `standard` and `strict` modes.
+- `NextDecision` mirrors repeated local-only actions into `stale_count` and `stall_pivot_status`.
+- `GOAL_ACHIEVED` cannot become project-total `complete` in default modes unless `RunDoneGate` or the automatic Done Gate yields `DONE_GATE_PASS`.
+- Terminal completion writes a final closure review with `final_closure_verdict`.
+
+The audit events are ledger writes, so their files say `Audit mutation status: LEDGER_ONLY_REVIEW_EVENT`. They are still supervision evidence and should be assessed alongside GPT Pro, local council, tests, and project gates.
 
 ## Auto Close Pro Tab
 

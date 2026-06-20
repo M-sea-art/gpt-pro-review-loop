@@ -44,6 +44,9 @@ Describe "gpt-pro-review-loop state machine" {
     $config.completion_guard_policy | Should -Be "project_total_only"
     $config.gpt_courtesy_footer | Should -Be "谢谢你的工作，GPT朋友。"
     $config.courtesy_footer_policy | Should -Be "after_first_external_review_in_continuous_loop"
+    $config.pro_review_mode | Should -Be "optional"
+    $config.efficiency_audit_mode | Should -Be "standard"
+    $config.efficiency_audit_policy | Should -Be "capability_scan_goal_supervision_periodic_done_gate_final_closure"
     $state.PSObject.Properties.Name | Should -Contain "pending_prompts"
     $state.PSObject.Properties.Name | Should -Contain "captured_reviews"
     $state.PSObject.Properties.Name | Should -Contain "runtime_brief"
@@ -54,6 +57,15 @@ Describe "gpt-pro-review-loop state machine" {
     $state.PSObject.Properties.Name | Should -Contain "project_blocker_queue"
     $state.PSObject.Properties.Name | Should -Contain "current_blocker_id"
     $state.PSObject.Properties.Name | Should -Contain "stalled_local_action_count"
+    $state.PSObject.Properties.Name | Should -Contain "latest_capability_scan"
+    $state.PSObject.Properties.Name | Should -Contain "latest_efficiency_audit"
+    $state.PSObject.Properties.Name | Should -Contain "latest_done_gate"
+    $state.PSObject.Properties.Name | Should -Contain "latest_final_closure"
+    $state.PSObject.Properties.Name | Should -Contain "recommended_capability_routes"
+    $state.PSObject.Properties.Name | Should -Contain "stale_count"
+    $state.PSObject.Properties.Name | Should -Contain "stall_pivot_status"
+    $state.PSObject.Properties.Name | Should -Contain "done_gate_verdict"
+    $state.PSObject.Properties.Name | Should -Contain "final_closure_verdict"
     @($state.pending_prompts).Count | Should -Be 0
     @($state.captured_reviews).Count | Should -Be 0
     $state.baseline_sent_to_url | Should -Be $null
@@ -75,6 +87,10 @@ Describe "gpt-pro-review-loop state machine" {
     $state.completion_guard_status | Should -Be "not_evaluated"
     $state.goal_achieved_is_terminal | Should -BeFalse
     $state.gpt_courtesy_footer_sent_count | Should -Be 0
+    $state.pro_review_mode | Should -Be "optional"
+    $state.efficiency_audit_mode | Should -Be "standard"
+    $state.stale_count | Should -Be 0
+    $state.stall_pivot_status | Should -Be "CONTINUE"
     @($state.project_blocker_queue).Count | Should -Be 0
     $state.current_blocker_id | Should -Be $null
     $state.stalled_local_action_count | Should -Be 0
@@ -83,6 +99,7 @@ Describe "gpt-pro-review-loop state machine" {
     $statusText | Should -Match "target_chatgpt_url"
     $statusText | Should -Match "https://chatgpt.com/g/test-project"
     $statusText | Should -Match "quota_mode"
+    $statusText | Should -Match "efficiency_audit_mode"
   }
 
   It "rejects invalid ChatGPT URLs at init" {
@@ -155,6 +172,37 @@ Describe "gpt-pro-review-loop state machine" {
     $brief = Get-Content -Raw -LiteralPath $briefPath | ConvertFrom-Json
     $brief.latest_prompt | Should -Be $state.latest_prompt
     $brief.quota_mode | Should -Be "economy"
+  }
+
+  It "runs capability scan and keeps Game Studio as a recommended game route without upgrading exposure" {
+    $project = New-TestProject "capability-scan"
+    & $script:Skill -Action Init -Root $project -TargetChatGptUrl "https://chatgpt.com/g/test-project"
+    & $script:Skill -Action RunCapabilityScan -Root $project -AuditContext "game Godot Phaser Three.js WebGL sprite playtest browser game prototype"
+
+    $state = Read-State $project
+    $state.latest_capability_scan | Should -Match "^docs/ai-review-loop/loop-runs/"
+    $state.top_capability_family | Should -Be "game-studio"
+    $state.top_capability_status | Should -Be "installed-not-exposed"
+    @($state.recommended_capability_routes | Where-Object { $_ -match "game-studio" }).Count | Should -BeGreaterThan 0
+    $scanPath = Join-Path $project ($state.latest_capability_scan -replace "/", "\")
+    $scan = Get-Content -Raw -LiteralPath $scanPath | ConvertFrom-Json
+    $scan.best_capabilities[0].name | Should -Be "game-studio"
+    $scan.best_capabilities[0].status | Should -Be "installed-not-exposed"
+  }
+
+  It "RecordProgress triggers a periodic efficiency audit in standard mode" {
+    $project = New-TestProject "progress-audit"
+    $artifact = Join-Path $project "progress.md"
+    Set-Content -LiteralPath $artifact -Encoding UTF8 -Value "# Progress"
+    & $script:Skill -Action Init -Root $project -TargetChatGptUrl "https://chatgpt.com/g/test-project"
+    & $script:Skill -Action RecordProgress -Root $project -ProgressArtifact $artifact -AuditContext "local development"
+
+    $state = Read-State $project
+    $state.latest_efficiency_audit | Should -Match "codex-efficiency-auditor-periodic-audit"
+    $state.stall_pivot_status | Should -Be "CONTINUE"
+    $reviewPath = Join-Path $project ($state.latest_efficiency_audit -replace "/", "\")
+    (Get-Content -Raw -LiteralPath $reviewPath) | Should -Match "Codex Efficiency Audit"
+    (Get-Content -Raw -LiteralPath $reviewPath) | Should -Match "periodic-audit"
   }
 
   It "records browser preflight once per iteration" {
@@ -299,9 +347,10 @@ Describe "gpt-pro-review-loop state machine" {
     Set-Content -LiteralPath (Join-Path $project "docs/project/FPV0_COMPLETION_ROADMAP.md") -Encoding UTF8 -Value @"
 Demo readiness: `NOT_READY`
 Human Gate: manual visual signoff required
-Big World runtime: Not implemented
+    Big World runtime: Not implemented
 "@
     & $script:Skill -Action Init -Root $project -TargetChatGptUrl "https://chatgpt.com/g/test-project"
+    & $script:Skill -Action RunCapabilityScan -Root $project -AuditContext "game Godot browser playtest"
     & $script:Skill -Action BuildProjectGoalPlan -Root $project
     & $script:Skill -Action RunLocalCouncil -Root $project
 
@@ -321,6 +370,8 @@ Big World runtime: Not implemented
     $reviewText | Should -Match "记录所有的想法"
     $reviewText | Should -Match "后期评估"
     $reviewText | Should -Match "开放和包容"
+    $reviewText | Should -Match "capability_route"
+    (Get-Content -Raw -LiteralPath (Join-Path $project "docs/ai-review-loop/goal-backlog.md")) | Should -Match "Capability route"
   }
 
   It "records progress artifacts and generates a council review" {
@@ -429,6 +480,10 @@ Big World runtime: Not implemented
     $state.completion_guard_status | Should -Be "project_goal_pass"
     $state.goal_achieved_is_terminal | Should -BeTrue
     $state.project_goal_verdict | Should -Be "GOAL_ACHIEVED"
+    $state.done_gate_verdict | Should -Be "DONE_GATE_PASS"
+    $state.final_closure_verdict | Should -Be "VERSION_CLOSED"
+    $state.latest_done_gate | Should -Match "codex-efficiency-auditor-done-gate"
+    $state.latest_final_closure | Should -Match "codex-efficiency-auditor-final-closure"
   }
 
   It "keeps subgoal achievement running instead of completing the total project" {
@@ -475,6 +530,20 @@ Big World runtime: Not implemented
     @($state.project_blocker_queue).Count | Should -BeGreaterThan 0
     $state.current_blocker_category | Should -Be "needs_evidence"
     Test-Path -LiteralPath (Join-Path $project "docs/ai-review-loop/project-goal-plan.md") | Should -BeTrue
+  }
+
+  It "Done Gate returns needs fix when project blockers remain" {
+    $project = New-TestProject "done-gate-blocked"
+    New-Item -ItemType Directory -Path (Join-Path $project "docs/project") -Force | Out-Null
+    Set-Content -LiteralPath (Join-Path $project "docs/project/FPV0_COMPLETION_ROADMAP.md") -Encoding UTF8 -Value 'Demo readiness: `NOT_READY`'
+    & $script:Skill -Action Init -Root $project -TargetChatGptUrl "https://chatgpt.com/g/test-project"
+    & $script:Skill -Action CaptureReview -Root $project -Reviewer codex-efficiency-auditor -Phase goal-audit -ReviewText "done"
+    & $script:Skill -Action AssessFeedback -Root $project -GoalVerdict GOAL_ACHIEVED -NextAction "final_report"
+    & $script:Skill -Action RunDoneGate -Root $project
+
+    $state = Read-State $project
+    $state.done_gate_verdict | Should -Be "NEEDS_FIX"
+    $state.latest_done_gate | Should -Match "codex-efficiency-auditor-done-gate"
   }
 
   It "migrates stale complete state back to running when project blockers exist" {
@@ -570,6 +639,8 @@ Big World runtime: Not implemented
     $state.goal_verdict | Should -Be "NEEDS_PROCESS_FIX"
     $state.local_only_next_action | Should -Be "split_or_update_project_goal_plan"
     $state.stalled_local_action_count | Should -BeGreaterOrEqual 2
+    $state.stale_count | Should -BeGreaterOrEqual 2
+    $state.stall_pivot_status | Should -Be "REPEATED_FAILURE"
   }
 
   It "requires continuation when next decision is still running" {
