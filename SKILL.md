@@ -228,6 +228,8 @@ GPT Pro, Codex efficiency review, and the local expert council are `reviewer` va
 
    Execute `local_only_next_action` before sending GPT another prompt. `ExecuteNextLocalAction` writes `action-contracts/*.json`, then records evidence in `evidence/evidence.jsonl` for safe ledger actions. If only Human Gate, protected scope, or explicit authorization blockers remain, or if the action itself is high-risk, pause for the user.
 
+   `confirm_target_chatgpt_url` is not a local action. In optional Pro mode with no ChatGPT URL, normalize it to `capture_or_run_local_review` and continue locally. Likewise, `no_project_blocker_queue_item` is not an executable action; when no blocker queue item exists, run the local council or rebuild the project goal plan to create the next concrete step.
+
    In default efficiency mode, `GOAL_ACHIEVED` is still not enough for project-total completion. `NextDecision` must first have `done_gate_verdict=DONE_GATE_PASS`; otherwise it keeps the loop running or pauses for the relevant human decision. `DONE_GATE_PASS` requires a non-low-confidence goal contract and local evidence records bound to explicit contract gates; screenshots, GPT Pro agreement, or a single subgoal PASS do not close the project.
 
 10. Run the local expert council after a progress update or when the loop needs a fresh local plan:
@@ -299,6 +301,8 @@ When the user explicitly starts continuous review, use:
 ```
 
 `RunLoop` is the compact loop entry for the outer Codex agent. In optional mode it starts local-first: if the current next action does not require GPT Pro, it records runtime state and runs the local expert council instead of generating an empty GPT handoff. If an external review would be useful but this project has no configured ChatGPT URL, optional Pro is skipped with `send_reason=pro_url_missing_local_loop`; this is not a final state and must continue locally with review capture, local assessment, `NextDecision`, and local action until the user supplies a URL or the local loop reaches a real pause/terminal gate. In `standard` and `strict` efficiency modes, it ensures a capability scan exists first so the council and decision engine have capability-route context. The PowerShell script prepares local ledger material and writes a runtime brief; it does not control Edge or wait for ChatGPT by itself. After explicit authorization, Codex must continue ordinary next rounds without confirmation until `NextDecision` reports terminal project-total completion, `NEEDS_HUMAN_DECISION`, `BLOCKED`, or the user stops the session. A `running` loop status with `continuation_required=true` is an instruction to keep working, not a final-answer point. Safety blockers, human gates, external account/login/CAPTCHA, publish/push, destructive file operations, and permission changes still pause.
+
+If the user says "reload", "resume", "rerun", "重新载入", "重新使用", or "继续" for a project that already has `loop_status=running`, do not stop after `Status`. Read `Status` only to orient, then immediately execute the recommended `RunLoop` command unless the status is `paused`, `blocked`, `complete`, `NEEDS_HUMAN_DECISION`, or the user explicitly asked for status only. If `Status` reports `optional_pro_url_missing_continue_local_loop`, continue locally with `RunLoop`; do not ask for a ChatGPT URL unless the user specifically wants external Pro review or `pro_review_mode=required`.
 
 For subgoal reviews:
 

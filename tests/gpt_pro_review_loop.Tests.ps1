@@ -194,7 +194,10 @@ Describe "gpt-pro-review-loop state machine" {
     $statusText = (& $script:Skill -Action Status -Root $project | Out-String)
 
     $statusText | Should -Match "optional_pro_url_missing_continue_local_loop"
-    $statusText | Should -Match "run_loop_local_without_pro_or_ask_once_for_target_url"
+    $statusText | Should -Match "run_loop_local_without_pro"
+    $statusText | Should -Match "next_action\s+: capture_or_run_local_review"
+    $statusText | Should -Match "local_only_next_action\s+: capture_or_run_local_review"
+    $statusText | Should -Match "raw_next_action\s+: confirm_target_chatgpt_url"
     $statusText | Should -Match "RunLoop"
   }
 
@@ -790,6 +793,33 @@ Human Gate: manual visual signoff required
     @($state.local_progress_artifacts | Where-Object { $_ -eq $state.latest_evidence }).Count | Should -Be 1
     $state.continuation_required | Should -BeTrue
     $state.send_reason | Should -Be "local_action_executed"
+  }
+
+  It "normalizes optional Pro URL confirmation before executing a local action" {
+    $project = New-TestProject "execute-optional-url-confirm"
+    & $script:Skill -Action Init -Root $project
+    & $script:Skill -Action ExecuteNextLocalAction -Root $project
+
+    $state = Read-State $project
+    $contractPath = Join-Path $project ($state.latest_action_contract -replace "/", "\")
+    $contract = Get-Content -Raw -LiteralPath $contractPath | ConvertFrom-Json
+    $contract.recommended_next_action | Should -Be "capture_or_run_local_review"
+    $contract.executor | Should -Be "local-council-ledger"
+    $state.next_action | Should -Be "next_decision_after_local_action"
+    $state.latest_evidence | Should -Not -Match "confirm_target_chatgpt_url"
+    $state.send_reason | Should -Be "local_action_executed"
+  }
+
+  It "does not select no_project_blocker_queue_item as an executable local action" {
+    $project = New-TestProject "next-local-action-empty-queue"
+    & $script:Skill -Action Init -Root $project
+    & $script:Skill -Action NextLocalAction -Root $project
+
+    $state = Read-State $project
+    $state.next_action | Should -Be "run_local_council"
+    $state.local_only_next_action | Should -Be "run_local_council"
+    $state.send_reason | Should -Be "no_blocker_queue_run_local_council"
+    $state.next_action | Should -Not -Be "no_project_blocker_queue_item"
   }
 
   It "pauses a local action contract that requires explicit human authorization" {

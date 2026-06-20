@@ -841,6 +841,7 @@ function Get-ActionExecutor {
   )
   $kind = if ($Blocker -and $Blocker.action_kind) { [string]$Blocker.action_kind } else { "" }
   $text = "$kind $ActionText"
+  if ($text -match "(?i)(capture_or_run_local_review|run_local_review)") { return "local-council-ledger" }
   if ($text -match "(?i)(goal[_\-\s]?plan|split_or_update_project_goal_plan)") { return "project-goal-plan-ledger" }
   if ($text -match "(?i)(refresh_project_understanding|assess_parent_project_goal|architecture|goal_model|goal_slices)") { return "project-understanding-ledger" }
   if ($text -match "(?i)(local_council|brainstorm|council)") { return "local-council-ledger" }
@@ -851,8 +852,20 @@ function Get-ActionExecutor {
 function New-ActionContract {
   param([Parameter(Mandatory = $true)][string]$ProjectRoot)
   $paths = Get-ReviewPaths -ProjectRoot $ProjectRoot
+  $config = Get-Config -ProjectRoot $ProjectRoot
   $state = Get-State -ProjectRoot $ProjectRoot
   $actionText = if ($state.local_only_next_action) { [string]$state.local_only_next_action } elseif ($state.next_action) { [string]$state.next_action } else { "run_local_council" }
+  $targetUrl = if ($config.target_chatgpt_conversation_url) { $config.target_chatgpt_conversation_url } else { $config.target_chatgpt_url }
+  $proMode = if ($state.pro_review_mode) { [string]$state.pro_review_mode } elseif ($config.pro_review_mode) { [string]$config.pro_review_mode } else { "optional" }
+  if ($actionText -eq "confirm_target_chatgpt_url" -and $proMode -eq "optional" -and -not (Test-ChatGptUrl $targetUrl)) {
+    $actionText = "capture_or_run_local_review"
+    Set-ObjectProperty $state "next_action" $actionText
+    Set-ObjectProperty $state "local_only_next_action" $actionText
+    Set-ObjectProperty $state "should_send_to_gpt" $false
+    Set-ObjectProperty $state "send_reason" "pro_url_missing_local_loop"
+    Set-ObjectProperty $state "continuation_required" $true
+    Save-State $ProjectRoot $state
+  }
   $blocker = $null
   if ($state.current_blocker_id) {
     $blocker = @($state.project_blocker_queue | Where-Object { $_.id -eq $state.current_blocker_id } | Select-Object -First 1)
@@ -1483,10 +1496,10 @@ function Invoke-NextLocalAction {
   }
   $next = Select-NextProjectBlocker -Queue $queue
   if (-not $next) {
-    Set-ObjectProperty $state "next_action" "no_project_blocker_queue_item"
-    Set-ObjectProperty $state "local_only_next_action" "no_project_blocker_queue_item"
+    Set-ObjectProperty $state "next_action" "run_local_council"
+    Set-ObjectProperty $state "local_only_next_action" "run_local_council"
     Set-ObjectProperty $state "should_send_to_gpt" $false
-    Set-ObjectProperty $state "send_reason" "local_only_continue"
+    Set-ObjectProperty $state "send_reason" "no_blocker_queue_run_local_council"
   } else {
     Set-ObjectProperty $state "current_blocker_id" $next.id
     Set-ObjectProperty $state "current_blocker_category" $next.category
@@ -4113,12 +4126,17 @@ function Show-Status {
   $statusGuidance = $null
   $recommendedNextAction = $null
   $recommendedNextCommand = $null
+  $rawNextAction = if ($state) { $state.next_action } else { $null }
+  $effectiveNextAction = $rawNextAction
+  $effectiveLocalOnlyNextAction = if ($state) { $state.local_only_next_action } else { $null }
   $optionalProUrlMissing = $state -and $proMode -eq "optional" -and [bool]$state.url_confirmation_required -and $state.url_confirmation_reason -eq "missing_target_chatgpt_url"
   $requiredProUrlMissing = $state -and $proMode -eq "required" -and [bool]$state.url_confirmation_required -and $state.url_confirmation_reason -eq "missing_target_chatgpt_url"
   $capabilityPreview = if ($state -and $state.recommended_capability_routes) { [string]::Join(", ", [string[]]@($state.recommended_capability_routes | Select-Object -First 8)) } else { $null }
   if ($optionalProUrlMissing) {
     $statusGuidance = "optional_pro_url_missing_continue_local_loop"
-    $recommendedNextAction = "run_loop_local_without_pro_or_ask_once_for_target_url"
+    $effectiveNextAction = "capture_or_run_local_review"
+    $effectiveLocalOnlyNextAction = "capture_or_run_local_review"
+    $recommendedNextAction = "run_loop_local_without_pro"
     $recommendedNextCommand = '& "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action RunLoop -Root "{0}"' -f $ProjectRoot
   } elseif ($requiredProUrlMissing) {
     $statusGuidance = "required_pro_url_missing_ask_once_for_target_url"
@@ -4160,7 +4178,7 @@ function Show-Status {
     cumulative_prompt_chars = if ($state) { $state.cumulative_prompt_chars } else { 0 }
     should_send_to_gpt = if ($state) { $state.should_send_to_gpt } else { $null }
     send_reason = if ($state) { $state.send_reason } else { $null }
-    local_only_next_action = if ($state) { $state.local_only_next_action } else { $null }
+    local_only_next_action = $effectiveLocalOnlyNextAction
     url_confirmation_required = if ($state) { $state.url_confirmation_required } else { $null }
     url_confirmation_reason = if ($state) { $state.url_confirmation_reason } else { $null }
     pending_prompt_count = if ($state -and $state.pending_prompts) { @($state.pending_prompts).Count } else { 0 }
@@ -4228,7 +4246,8 @@ function Show-Status {
     action_executor_status = if ($state) { $state.action_executor_status } else { $null }
     goal_backlog_count = if ($state -and $state.goal_backlog) { @($state.goal_backlog).Count } else { 0 }
     active_generated_goal_id = if ($state) { $state.active_generated_goal_id } else { $null }
-    next_action = if ($state) { $state.next_action } else { $null }
+    next_action = $effectiveNextAction
+    raw_next_action = $rawNextAction
     status_guidance = $statusGuidance
     recommended_next_action = $recommendedNextAction
     recommended_next_command = $recommendedNextCommand
