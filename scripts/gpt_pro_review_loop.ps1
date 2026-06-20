@@ -1,6 +1,6 @@
 [CmdletBinding()]
 param(
-  [ValidateSet("Init", "Prepare", "PrepareCompactReview", "PreflightBrowser", "SendPrompt", "CaptureFeedback", "CaptureReview", "WaitFeedback", "ShowLatestReview", "AssessFeedback", "SendAssessment", "NextDecision", "BuildProjectGoalPlan", "NextLocalAction", "ExecuteNextLocalAction", "RunCapabilityScan", "RunEfficiencyAudit", "RunDoneGate", "RunFinalClosure", "RunLocalCouncil", "CloseProTab", "RecordProgress", "PromoteGoal", "BuildGoalModel", "AnalyzeArchitecture", "BuildArchitectureBrief", "BuildGoalSlices", "RefreshProjectUnderstanding", "RunLoop", "RecordExperience", "Status", "Run")]
+  [ValidateSet("Init", "Prepare", "PrepareCompactReview", "PreflightBrowser", "SendPrompt", "CaptureFeedback", "CaptureReview", "WaitFeedback", "ShowLatestReview", "AssessFeedback", "SendAssessment", "NextDecision", "BuildProjectGoalPlan", "NextLocalAction", "ExecuteNextLocalAction", "RunCapabilityScan", "RunEfficiencyAudit", "RunDoneGate", "RunFinalClosure", "RunLocalCouncil", "CloseProTab", "RecordProgress", "PromoteGoal", "BuildGoalContract", "BuildGoalModel", "AnalyzeArchitecture", "BuildArchitectureBrief", "BuildGoalSlices", "RefreshProjectUnderstanding", "RunLoop", "RecordExperience", "Status", "Run")]
   [string]$Action = "Run",
   [string]$Root,
   [string]$TargetChatGptUrl,
@@ -34,9 +34,12 @@ param(
   [switch]$ForceCompleteProjectGoal,
   [ValidateSet("auto", "docs_first", "explicit_only")]
   [string]$GoalDiscoveryMode = "auto",
+  [ValidateSet("auto", "strict")]
+  [string]$GoalContractMode = "auto",
   [ValidateSet("light", "standard", "deep")]
   [string]$ArchitectureAnalysisMode = "standard",
   [int]$ArchitectureBriefMaxChars = 8000,
+  [string]$ArchitectureContextFile,
   [switch]$IncludeArchitectureBriefForPro,
   [ValidateSet("gpt-pro", "codex-efficiency-auditor", "local-expert-council")]
   [string]$Reviewer = "gpt-pro",
@@ -55,7 +58,11 @@ param(
   [string]$NextAction = "collect_evidence",
   [string]$ExperienceOutcome = "unspecified",
   [string]$ExperienceLesson,
-  [string]$ExperienceNotes
+  [string]$ExperienceNotes,
+  [string]$RelatedGate,
+  [string]$RelatedBlockerId,
+  [string]$RelatedSliceId,
+  [string]$EvidenceType
 )
 
 $ErrorActionPreference = "Stop"
@@ -157,8 +164,11 @@ function Get-ReviewPaths {
     Evidence = Join-Path $base "evidence"
     EvidenceLog = Join-Path $base "evidence\evidence.jsonl"
     ProjectGoalPlan = Join-Path $base "project-goal-plan.md"
+    ProjectGoalContractJson = Join-Path $base "project-goal-contract.json"
+    ProjectGoalContract = Join-Path $base "project-goal-contract.md"
     ProjectGoalModel = Join-Path $base "project-goal-model.md"
     ProjectArchitecture = Join-Path $base "project-architecture.md"
+    ProjectArchitectureMap = Join-Path $base "project-architecture-map.json"
     ArchitectureBrief = Join-Path $base "architecture-brief.md"
     GoalSlices = Join-Path $base "goal-slices.md"
     LocalCouncil = Join-Path $base "local-council.md"
@@ -646,6 +656,7 @@ function New-LocalCouncilReview {
   $queue = @($state.project_blocker_queue)
   $routeText = if ($state.recommended_capability_routes) { [string]::Join(", ", [string[]]@($state.recommended_capability_routes | Select-Object -First 8)) } else { "(no capability scan yet)" }
   $goalModelText = if ($state.latest_goal_model) { $state.latest_goal_model } else { "(no project goal model yet)" }
+  $goalContractText = if ($state.latest_goal_contract) { "$($state.latest_goal_contract) [$($state.goal_contract_confidence)]" } else { "(no project goal contract yet)" }
   $architectureText = if ($state.latest_architecture_snapshot) { $state.latest_architecture_snapshot } else { "(no architecture snapshot yet)" }
   $goalSliceText = if ($state.current_goal_slice_id) { $state.current_goal_slice_id } else { "(no current goal slice yet)" }
   $ideaLines = New-Object System.Collections.Generic.List[string]
@@ -654,7 +665,7 @@ function New-LocalCouncilReview {
   $ideaLines.Add("- 验证专家：为下一步行动配一个可重复命令、截图、哈希或文档证据。") | Out-Null
   $ideaLines.Add("- 流程效率专家：先推进 should_send_to_gpt=false 的本地项，只有新问题再外部复核。") | Out-Null
   $ideaLines.Add("- 能力路线观察：可参考 $routeText，但推荐能力不等于授权。") | Out-Null
-  $ideaLines.Add("- 项目理解观察：目标模型 $goalModelText，架构画像 $architectureText，当前切片 $goalSliceText。") | Out-Null
+  $ideaLines.Add("- 项目理解观察：目标合同 $goalContractText，目标模型 $goalModelText，架构画像 $architectureText，当前切片 $goalSliceText。") | Out-Null
   foreach ($item in @($queue | Select-Object -First 8)) {
     $ideaLines.Add("- 相互激发：围绕 $($item.id) 产生候选推进点：$($item.raw_text)") | Out-Null
   }
@@ -697,6 +708,7 @@ function New-LocalCouncilReview {
     "- latest_capability_scan: $($state.latest_capability_scan)",
     "- latest_efficiency_audit: $($state.latest_efficiency_audit)",
     "- latest_goal_model: $goalModelText",
+    "- latest_goal_contract: $goalContractText",
     "- latest_architecture_snapshot: $architectureText",
     "- current_goal_slice_id: $goalSliceText",
     "- stall_pivot_status: $($state.stall_pivot_status)",
@@ -777,7 +789,11 @@ function Update-ProTabCloseState {
 function Add-ProgressArtifact {
   param(
     [Parameter(Mandatory = $true)][string]$ProjectRoot,
-    [string]$Artifact
+    [string]$Artifact,
+    [string]$Gate,
+    [string]$BlockerId,
+    [string]$SliceId,
+    [string]$EvidenceKind
   )
   if (-not $Artifact) { throw "RecordProgress requires -ProgressArtifact <path>." }
   $state = Get-State -ProjectRoot $ProjectRoot
@@ -792,6 +808,10 @@ function Add-ProgressArtifact {
     }
   }
   Set-ObjectProperty $state "next_action" "run_local_council_after_progress"
+  if ($Gate) { Set-ObjectProperty $state "latest_progress_related_gate" $Gate }
+  if ($BlockerId) { Set-ObjectProperty $state "latest_progress_related_blocker_id" $BlockerId }
+  if ($SliceId) { Set-ObjectProperty $state "latest_progress_related_slice_id" $SliceId }
+  if ($EvidenceKind) { Set-ObjectProperty $state "latest_progress_evidence_type" $EvidenceKind }
   Set-ObjectProperty $state "should_send_to_gpt" $false
   Set-ObjectProperty $state "send_reason" "progress_recorded_local_council_first"
   Save-State $ProjectRoot $state
@@ -845,7 +865,7 @@ function New-ActionContract {
   $executor = Get-ActionExecutor -ActionText $actionText -Blocker $blocker
   $expected = @("docs/ai-review-loop/evidence/$contractId-$safeAction.md")
   if ($executor -eq "project-goal-plan-ledger") { $expected = @("docs/ai-review-loop/project-goal-plan.md") }
-  if ($executor -eq "project-understanding-ledger") { $expected = @("docs/ai-review-loop/project-goal-model.md", "docs/ai-review-loop/project-architecture.md", "docs/ai-review-loop/architecture-brief.md", "docs/ai-review-loop/goal-slices.md") }
+  if ($executor -eq "project-understanding-ledger") { $expected = @("docs/ai-review-loop/project-goal-contract.json", "docs/ai-review-loop/project-goal-contract.md", "docs/ai-review-loop/project-goal-model.md", "docs/ai-review-loop/project-architecture.md", "docs/ai-review-loop/project-architecture-map.json", "docs/ai-review-loop/architecture-brief.md", "docs/ai-review-loop/goal-slices.md") }
   if ($executor -eq "local-council-ledger") { $expected = @("docs/ai-review-loop/local-council.md", "docs/ai-review-loop/goal-backlog.md") }
   $contract = [ordered]@{
     id = $contractId
@@ -885,7 +905,11 @@ function Add-EvidenceRecord {
     [string]$Command,
     [int]$ExitCode = 0,
     [string]$StdoutExcerpt,
-    [string]$StderrExcerpt
+    [string]$StderrExcerpt,
+    [string]$RelatedGate,
+    [string]$RelatedBlockerId,
+    [string]$RelatedSliceId,
+    [string]$EvidenceKind
   )
   $paths = Get-ReviewPaths -ProjectRoot $ProjectRoot
   $state = Get-State -ProjectRoot $ProjectRoot
@@ -908,11 +932,13 @@ function Add-EvidenceRecord {
     id = $id
     created_at = (Get-Date).ToString("o")
     type = "local_action_result"
+    evidence_type = $(if ($EvidenceKind) { $EvidenceKind } else { "local_action_result" })
     summary = $Summary
     action_contract = $ContractInfo.relative_path
     action_contract_id = $ContractInfo.contract.id
-    related_blocker_id = $ContractInfo.contract.source_blocker_id
-    related_gate = $ContractInfo.contract.source_blocker_category
+    related_blocker_id = $(if ($RelatedBlockerId) { $RelatedBlockerId } else { $ContractInfo.contract.source_blocker_id })
+    related_gate = $(if ($RelatedGate) { $RelatedGate } else { $ContractInfo.contract.source_blocker_category })
+    related_slice_id = $RelatedSliceId
     command = $Command
     exit_code = $ExitCode
     stdout_excerpt = $StdoutExcerpt
@@ -935,6 +961,10 @@ function Add-EvidenceRecord {
       Set-ObjectProperty $state $field @($progress)
     }
   }
+  if ($RelatedGate) { Set-ObjectProperty $state "latest_evidence_related_gate" $RelatedGate }
+  if ($RelatedBlockerId) { Set-ObjectProperty $state "latest_evidence_related_blocker_id" $RelatedBlockerId }
+  if ($RelatedSliceId) { Set-ObjectProperty $state "latest_evidence_related_slice_id" $RelatedSliceId }
+  if ($EvidenceKind) { Set-ObjectProperty $state "latest_evidence_type" $EvidenceKind }
   Set-ObjectProperty $state "action_executor_status" "executed"
   Save-State $ProjectRoot $state
   return [pscustomobject]@{
@@ -976,7 +1006,7 @@ function Invoke-ExecuteNextLocalAction {
     }
     "project-understanding-ledger" {
       Invoke-RefreshProjectUnderstanding -ProjectRoot $ProjectRoot -GoalMode $GoalDiscoveryMode -ArchitectureMode $ArchitectureAnalysisMode -BriefMaxChars $ArchitectureBriefMaxChars | Out-Null
-      foreach ($artifact in @($paths.ProjectGoalModel, $paths.ProjectArchitecture, $paths.ArchitectureBrief, $paths.GoalSlices)) {
+      foreach ($artifact in @($paths.ProjectGoalContractJson, $paths.ProjectGoalContract, $paths.ProjectGoalModel, $paths.ProjectArchitecture, $paths.ProjectArchitectureMap, $paths.ArchitectureBrief, $paths.GoalSlices)) {
         if (Test-Path -LiteralPath $artifact) { $artifacts.Add($artifact) | Out-Null }
       }
       $summary = "Refreshed project goal model, architecture snapshot, architecture brief, and goal slices."
@@ -1025,7 +1055,8 @@ function Invoke-ExecuteNextLocalAction {
       $stdout = "git status:`n$gitStatus`n`ngit diff --stat:`n$diffStat"
     }
   }
-  Add-EvidenceRecord -ProjectRoot $ProjectRoot -ContractInfo $contractInfo -Summary $summary -ArtifactPaths @($artifacts.ToArray()) -Command $command -ExitCode 0 -StdoutExcerpt $stdout | Out-Null
+  $stateForEvidence = Get-State -ProjectRoot $ProjectRoot
+  Add-EvidenceRecord -ProjectRoot $ProjectRoot -ContractInfo $contractInfo -Summary $summary -ArtifactPaths @($artifacts.ToArray()) -Command $command -ExitCode 0 -StdoutExcerpt $stdout -RelatedBlockerId $contractInfo.contract.source_blocker_id -RelatedSliceId $stateForEvidence.current_goal_slice_id -EvidenceKind "local_action_result" | Out-Null
   $state = Get-State -ProjectRoot $ProjectRoot
   Set-ObjectProperty $state "next_action" "next_decision_after_local_action"
   Set-ObjectProperty $state "local_only_next_action" $null
@@ -1278,6 +1309,12 @@ function Invoke-DoneGateReview {
   $previousSendReason = $state.send_reason
   $previousLocalOnlyNextAction = $state.local_only_next_action
   $guard = Invoke-CompletionGuard -ProjectRoot $ProjectRoot -State $state -Verdict $(if ($state.goal_verdict) { [string]$state.goal_verdict } else { "CONTINUE" })
+  if (-not (Test-Path -LiteralPath (Get-ReviewPaths -ProjectRoot $ProjectRoot).ProjectGoalContractJson)) {
+    New-ProjectGoalContract -ProjectRoot $ProjectRoot -Mode $GoalDiscoveryMode -ContractMode $GoalContractMode | Out-Null
+  }
+  $paths = Get-ReviewPaths -ProjectRoot $ProjectRoot
+  $contract = Read-JsonFile $paths.ProjectGoalContractJson
+  $contractEvidence = Get-GoalContractEvidenceSummary -ProjectRoot $ProjectRoot -Contract $contract
   $verdict = "NEEDS_FIX"
   if ($state.goal_verdict -ne "GOAL_ACHIEVED") {
     $verdict = "NEEDS_FIX"
@@ -1291,11 +1328,21 @@ function Invoke-DoneGateReview {
       $verdict = "NEEDS_FIX"
     }
   } elseif ($guard.is_terminal) {
-    $verdict = "DONE_GATE_PASS"
+    if ($contract.confidence -eq "low") {
+      $verdict = "NEEDS_HUMAN_DECISION"
+    } elseif (@($contractEvidence.human).Count -gt 0) {
+      $verdict = "NEEDS_HUMAN_DECISION"
+    } elseif (@($contractEvidence.missing).Count -gt 0) {
+      $verdict = "NEEDS_FIX"
+    } else {
+      $verdict = "DONE_GATE_PASS"
+    }
   } else {
     $verdict = "READY_FOR_FINAL_AUDIT"
   }
   $blockerText = if ($guard.blockers.Count -gt 0) { @($guard.blockers) -join "`n" } else { "(none)" }
+  $missingGateText = if (@($contractEvidence.missing).Count -gt 0) { @($contractEvidence.missing | ForEach-Object { "$($_.id): $($_.title)" }) -join "`n" } else { "(none)" }
+  $humanGateText = if (@($contractEvidence.human).Count -gt 0) { @($contractEvidence.human | ForEach-Object { "$($_.id): $($_.title)" }) -join "`n" } else { "(none)" }
   $doneText = @"
 # Codex Efficiency Done Gate
 
@@ -1314,11 +1361,25 @@ function Invoke-DoneGateReview {
 | Project completion blockers | $($guard.blockers.Count) blocker(s) detected | $(if ($guard.blockers.Count -eq 0) { "PASS" } else { "FAIL" }) |
 | Stop condition | goal_verdict=$($state.goal_verdict) | $(if ($state.goal_verdict -eq "GOAL_ACHIEVED") { "PASS" } else { "FAIL" }) |
 | Pause scan | Human Gate / authorization blockers stay blocking | $(if ($verdict -eq "NEEDS_HUMAN_DECISION") { "FAIL" } else { "PASS" }) |
+| Goal contract confidence | $($contract.confidence) | $(if ($contract.confidence -eq "low") { "FAIL" } else { "PASS" }) |
+| Contract evidence binding | missing=$(@($contractEvidence.missing).Count), human=$(@($contractEvidence.human).Count), records=$($contractEvidence.record_count) | $(if (@($contractEvidence.missing).Count -eq 0 -and @($contractEvidence.human).Count -eq 0) { "PASS" } else { "FAIL" }) |
 
 ## Blocking Evidence
 
 ```text
 $blockerText
+```
+
+## Missing Contract Evidence
+
+```text
+$missingGateText
+```
+
+## Human Gate Evidence
+
+```text
+$humanGateText
 ```
 
 Never mark project-total complete without `DONE_GATE_PASS`.
@@ -1648,6 +1709,10 @@ function New-RuntimeBrief {
     stall_pivot_status = $state.stall_pivot_status
     done_gate_verdict = $state.done_gate_verdict
     final_closure_verdict = $state.final_closure_verdict
+    latest_goal_contract = $state.latest_goal_contract
+    goal_contract_hash = $state.goal_contract_hash
+    goal_contract_confidence = $state.goal_contract_confidence
+    goal_contract_status = $state.goal_contract_status
     pro_tab_close_policy = $state.pro_tab_close_policy
     pro_tab_close_status = $state.pro_tab_close_status
     pro_tab_closed_at = $state.pro_tab_closed_at
@@ -1780,6 +1845,7 @@ function Ensure-ReviewLoop {
     local_council_mode = $effectiveLocalCouncilMode
     local_council_policy = "brainstorm_then_post_evaluation"
     goal_discovery_mode = $effectiveGoalDiscoveryMode
+    goal_contract_policy = "authority_ordered_completion_contract"
     architecture_analysis_mode = $effectiveArchitectureAnalysisMode
     architecture_brief_max_chars = $effectiveArchitectureBriefMaxChars
     architecture_brief_policy = "first_baseline_or_architecture_hash_change"
@@ -1880,8 +1946,14 @@ function Ensure-ReviewLoop {
       project_total_goal = $null
       goal_confidence = "unknown"
       goal_sources = @()
+      latest_goal_contract = $null
+      goal_contract_hash = $null
+      goal_contract_confidence = "unknown"
+      goal_contract_status = "not_built"
+      goal_authority_sources = @()
       latest_goal_model = $null
       latest_architecture_snapshot = $null
+      latest_architecture_map = $null
       latest_architecture_brief = $null
       architecture_brief_hash = $null
       architecture_brief_sent_hash = $null
@@ -1898,7 +1970,7 @@ function Ensure-ReviewLoop {
     }
   } else {
     $state = Read-JsonFile $paths.State
-    foreach ($field in @("version", "iteration_counter", "loop_mode", "loop_status", "latest_review", "latest_assessment_prompt", "goal_verdict", "next_action", "stop_reason", "baseline_sent_to_url", "baseline_sent_hash", "latest_prompt_target_url", "latest_prompt_opened_tab_url", "latest_assessment_target_url", "latest_assessment_opened_tab_url", "continuation_required", "url_confirmation_required", "url_confirmation_reason", "quota_mode", "runtime_brief", "browser_preflight_status", "browser_backend_type", "browser_target_tab_id", "browser_preflight_iteration", "browser_preflight_checked_at", "latest_visual_evidence_hash", "latest_visual_evidence_path", "last_visual_evidence_sent_hash", "attach_visual_evidence_requested", "last_prompt_chars", "cumulative_prompt_chars", "external_review_count", "local_only_iteration_count", "should_send_to_gpt", "send_reason", "local_only_next_action", "active_goal_scope", "terminal_goal_scope", "subgoal_verdict", "project_goal_verdict", "completion_guard_status", "goal_achieved_is_terminal", "gpt_courtesy_footer_sent_count", "current_blocker_id", "current_blocker_category", "blocker_queue_updated_at", "stalled_local_action_count", "pro_review_mode", "efficiency_audit_mode", "latest_capability_scan", "latest_efficiency_audit", "latest_done_gate", "latest_final_closure", "capability_scan_basis", "top_capability_family", "top_capability_status", "stale_count", "stall_pivot_status", "done_gate_verdict", "final_closure_verdict", "pro_tab_close_policy", "pro_tab_close_status", "pro_tab_close_target_url", "pro_tab_closed_at", "local_council_mode", "latest_local_council_review", "active_generated_goal_id", "project_total_goal", "goal_confidence", "latest_goal_model", "latest_architecture_snapshot", "latest_architecture_brief", "architecture_brief_hash", "architecture_brief_sent_hash", "latest_prompt_included_architecture_brief", "latest_goal_slices", "current_goal_slice_id", "goal_slice_status", "latest_action_contract", "latest_evidence", "latest_evidence_id", "action_executor_status")) {
+    foreach ($field in @("version", "iteration_counter", "loop_mode", "loop_status", "latest_review", "latest_assessment_prompt", "goal_verdict", "next_action", "stop_reason", "baseline_sent_to_url", "baseline_sent_hash", "latest_prompt_target_url", "latest_prompt_opened_tab_url", "latest_assessment_target_url", "latest_assessment_opened_tab_url", "continuation_required", "url_confirmation_required", "url_confirmation_reason", "quota_mode", "runtime_brief", "browser_preflight_status", "browser_backend_type", "browser_target_tab_id", "browser_preflight_iteration", "browser_preflight_checked_at", "latest_visual_evidence_hash", "latest_visual_evidence_path", "last_visual_evidence_sent_hash", "attach_visual_evidence_requested", "last_prompt_chars", "cumulative_prompt_chars", "external_review_count", "local_only_iteration_count", "should_send_to_gpt", "send_reason", "local_only_next_action", "active_goal_scope", "terminal_goal_scope", "subgoal_verdict", "project_goal_verdict", "completion_guard_status", "goal_achieved_is_terminal", "gpt_courtesy_footer_sent_count", "current_blocker_id", "current_blocker_category", "blocker_queue_updated_at", "stalled_local_action_count", "pro_review_mode", "efficiency_audit_mode", "latest_capability_scan", "latest_efficiency_audit", "latest_done_gate", "latest_final_closure", "capability_scan_basis", "top_capability_family", "top_capability_status", "stale_count", "stall_pivot_status", "done_gate_verdict", "final_closure_verdict", "pro_tab_close_policy", "pro_tab_close_status", "pro_tab_close_target_url", "pro_tab_closed_at", "local_council_mode", "latest_local_council_review", "active_generated_goal_id", "project_total_goal", "goal_confidence", "latest_goal_contract", "goal_contract_hash", "goal_contract_confidence", "goal_contract_status", "latest_goal_model", "latest_architecture_snapshot", "latest_architecture_map", "latest_architecture_brief", "architecture_brief_hash", "architecture_brief_sent_hash", "latest_prompt_included_architecture_brief", "latest_goal_slices", "current_goal_slice_id", "goal_slice_status", "latest_action_contract", "latest_evidence", "latest_evidence_id", "action_executor_status")) {
       if (-not ($state.PSObject.Properties.Name -contains $field)) {
         $default = $null
         if ($field -eq "version") { $default = 8 }
@@ -1931,12 +2003,14 @@ function Ensure-ReviewLoop {
         if ($field -eq "pro_tab_close_policy") { $default = "target_conversation" }
         if ($field -eq "local_council_mode") { $default = $effectiveLocalCouncilMode }
         if ($field -eq "goal_confidence") { $default = "unknown" }
+        if ($field -eq "goal_contract_confidence") { $default = "unknown" }
+        if ($field -eq "goal_contract_status") { $default = "not_built" }
         if ($field -eq "latest_prompt_included_architecture_brief") { $default = $false }
         if ($field -eq "goal_slice_status") { $default = "not_built" }
         Set-ObjectProperty $state $field $default
       }
     }
-    foreach ($field in @("pending_prompts", "pending_reviews", "captured_reviews", "pending_assessments", "blocking_gates", "goal_context_sources", "project_blocker_queue", "local_progress_artifacts", "progress_artifacts", "goal_backlog", "recommended_capability_routes", "goal_sources", "action_contracts", "evidence_records")) {
+    foreach ($field in @("pending_prompts", "pending_reviews", "captured_reviews", "pending_assessments", "blocking_gates", "goal_context_sources", "project_blocker_queue", "local_progress_artifacts", "progress_artifacts", "goal_backlog", "recommended_capability_routes", "goal_sources", "goal_authority_sources", "action_contracts", "evidence_records")) {
       if (-not ($state.PSObject.Properties.Name -contains $field) -or $null -eq $state.$field) {
         Set-ObjectProperty $state $field @()
       }
@@ -2467,6 +2541,287 @@ function Get-ProjectFileList {
   return @($items | Where-Object { $_ -and -not ($_ -replace "\\", "/").StartsWith("docs/ai-review-loop") } | Sort-Object | Select-Object -First $MaxFiles)
 }
 
+function Get-GoalAuthorityInfo {
+  param(
+    [Parameter(Mandatory = $true)][string]$ProjectRoot,
+    [Parameter(Mandatory = $true)][string]$Path
+  )
+  $rel = Get-RelativePath -Root $ProjectRoot -Path $Path
+  $normalized = $rel -replace "\\", "/"
+  $priority = 10
+  $role = "other"
+  if ($normalized -eq "AGENTS.md" -or $normalized -match "(?i)(^|/)(HUMAN_GATE|CODEX_CAPABILITY_ROUTING)\.md$") {
+    $priority = 100
+    $role = "policy"
+  } elseif ($normalized -match "(?i)(roadmap|completion|gate)") {
+    $priority = 90
+    $role = "roadmap_gate"
+  } elseif ($normalized -match "(?i)(acceptance|verifier|test)") {
+    $priority = 80
+    $role = "acceptance_verifier"
+  } elseif ($normalized -match "(?i)(readme|project_spec|project|spec)") {
+    $priority = 60
+    $role = "spec_readme"
+  } elseif ($normalized -match "(?i)(architecture|state|supervisor|plan)") {
+    $priority = 50
+    $role = "supporting_context"
+  }
+  return [pscustomobject]@{
+    path = $rel
+    role = $role
+    priority = $priority
+  }
+}
+
+function New-GoalContractId {
+  param([int]$Index)
+  return "GATE-{0:000}" -f $Index
+}
+
+function Convert-LineToGateStatus {
+  param([string]$Line)
+  if ($Line -match "(?i)(human gate|human visual|manual|人工|人工确认|signoff)") { return "human_gate" }
+  if ($Line -match "(?i)(not_ready|not complete|not_complete|failed|failing|missing|未完成|未通过)") { return "open" }
+  return "open"
+}
+
+function Convert-LineToEvidenceTypes {
+  param([string]$Line)
+  $types = New-Object System.Collections.Generic.List[string]
+  if ($Line -match "(?i)(test|verifier|pytest|npm test|godot|验证|测试)") { $types.Add("verification_command") | Out-Null }
+  if ($Line -match "(?i)(screenshot|contact sheet|visual|UI|视觉|截图)") { $types.Add("visual_evidence") | Out-Null }
+  if ($Line -match "(?i)(human gate|signoff|人工)") { $types.Add("human_signoff") | Out-Null }
+  if ($types.Count -eq 0) { $types.Add("local_evidence") | Out-Null }
+  return @($types.ToArray())
+}
+
+function Get-VerificationCommandFromLine {
+  param([string]$Line)
+  if ($Line -match "(?i)(godot\s+[^\r\n`]+)") { return $Matches[1].Trim() }
+  if ($Line -match "(?i)(npm\s+test[^\r\n`]*)") { return $Matches[1].Trim() }
+  if ($Line -match "(?i)(pytest[^\r\n`]*)") { return $Matches[1].Trim() }
+  if ($Line -match "(?i)(python\s+[^\r\n`]*(verify|test)[^\r\n`]*)") { return $Matches[1].Trim() }
+  return $null
+}
+
+function Get-GoalContractEvidenceSummary {
+  param(
+    [Parameter(Mandatory = $true)][string]$ProjectRoot,
+    $Contract
+  )
+  $paths = Get-ReviewPaths -ProjectRoot $ProjectRoot
+  $records = @()
+  if (Test-Path -LiteralPath $paths.EvidenceLog) {
+    foreach ($line in @(Get-Content -LiteralPath $paths.EvidenceLog -ErrorAction SilentlyContinue)) {
+      if (-not $line.Trim()) { continue }
+      try { $records += @($line | ConvertFrom-Json) } catch { }
+    }
+  }
+  $missing = New-Object System.Collections.Generic.List[object]
+  $human = New-Object System.Collections.Generic.List[object]
+  $present = New-Object System.Collections.Generic.List[object]
+  foreach ($gate in @($Contract.completion_gates)) {
+    if ($gate.status -eq "human_gate") {
+      $human.Add($gate) | Out-Null
+      continue
+    }
+    $matched = @($records | Where-Object {
+        ($_.related_gate -and $_.related_gate -eq $gate.id) -or
+        ($_.related_gate -and $_.related_gate -eq $gate.title) -or
+        ($_.related_blocker_id -and $gate.related_blocker_id -and $_.related_blocker_id -eq $gate.related_blocker_id) -or
+        ($_.related_slice_id -and $gate.related_slice_id -and $_.related_slice_id -eq $gate.related_slice_id)
+      })
+    if ($matched.Count -gt 0) {
+      $present.Add([pscustomobject]@{ gate = $gate; evidence_ids = @($matched | ForEach-Object { $_.id }) }) | Out-Null
+    } else {
+      $missing.Add($gate) | Out-Null
+    }
+  }
+  return [pscustomobject]@{
+    present = @($present.ToArray())
+    missing = @($missing.ToArray())
+    human = @($human.ToArray())
+    record_count = @($records).Count
+  }
+}
+
+function New-ProjectGoalContract {
+  param(
+    [Parameter(Mandatory = $true)][string]$ProjectRoot,
+    [ValidateSet("auto", "docs_first", "explicit_only")][string]$Mode = "auto",
+    [ValidateSet("auto", "strict")][string]$ContractMode = "auto"
+  )
+  $paths = Get-ReviewPaths -ProjectRoot $ProjectRoot
+  $state = Get-State -ProjectRoot $ProjectRoot
+  $sources = Get-UnderstandingSourceFiles -ProjectRoot $ProjectRoot -Mode $Mode -MaxFiles 60
+  $sourceInfos = @($sources | ForEach-Object { Get-GoalAuthorityInfo -ProjectRoot $ProjectRoot -Path $_ } | Sort-Object -Property @{ Expression = "priority"; Descending = $true }, path)
+  $goalCandidates = New-Object System.Collections.Generic.List[object]
+  $gates = New-Object System.Collections.Generic.List[object]
+  $boundaries = New-Object System.Collections.Generic.List[object]
+  $openQuestions = New-Object System.Collections.Generic.List[string]
+  $conflict = $false
+  $gateIndex = 1
+  foreach ($info in $sourceInfos) {
+    $sourcePath = Join-Path $ProjectRoot ($info.path -replace "/", "\")
+    if (-not (Test-Path -LiteralPath $sourcePath)) { continue }
+    $text = Get-ContentExcerpt $sourcePath 6000
+    if ($text -match "(?im)^\s*#\s+(.+)$") {
+      $goalCandidates.Add([pscustomobject]@{ text = $Matches[1].Trim(); source = $info.path; priority = $info.priority }) | Out-Null
+    }
+    if ($text -match "(?im)Project Identity\s*\r?\n\s*(.+)$") {
+      $goalCandidates.Add([pscustomobject]@{ text = $Matches[1].Trim(); source = $info.path; priority = $info.priority + 5 }) | Out-Null
+    }
+    foreach ($line in @($text -split "\r?\n")) {
+      $trimmed = $line.Trim()
+      if (-not $trimmed) { continue }
+      if ($trimmed -match "(?i)(GOAL_CONFLICT|CONFLICTING_TOTAL_GOAL|conflicting total goal|目标冲突)") { $conflict = $true }
+      if ($trimmed -match "(?i)(acceptance|gate|done gate|verification|验收|门禁|完成标准|verifier|npm\s+test|pytest|godot|tests?\s+(must|pass|passing|required|expected)|NOT_READY|NOT_COMPLETE|Remaining P0|Remaining P1|Not implemented)") {
+        if ($gates.Count -lt 40) {
+          $gateId = New-GoalContractId -Index $gateIndex
+          $gates.Add([pscustomobject]@{
+              id = $gateId
+              title = $trimmed
+              source = $info.path
+              source_role = $info.role
+              source_priority = $info.priority
+              status = Convert-LineToGateStatus -Line $trimmed
+              required_evidence = @(Convert-LineToEvidenceTypes -Line $trimmed)
+              verification_command = Get-VerificationCommandFromLine -Line $trimmed
+              closure_condition = "local evidence must satisfy this gate; GPT Pro agreement alone cannot close it"
+              evidence_ids = @()
+              evidence_status = "missing"
+            }) | Out-Null
+          $gateIndex += 1
+        }
+      }
+      if ($trimmed -match "(?i)(not_ready|not complete|not_complete|human gate|protected|do not|must not|禁止|不得|人工|未完成|不能|不可|separately authorized)") {
+        if ($boundaries.Count -lt 40) {
+          $boundaries.Add([pscustomobject]@{
+              text = $trimmed
+              source = $info.path
+              source_role = $info.role
+              priority = $info.priority
+            }) | Out-Null
+        }
+      }
+    }
+  }
+  $orderedGoals = @($goalCandidates.ToArray() | Sort-Object -Property @{ Expression = "priority"; Descending = $true }, source)
+  $goal = if ($orderedGoals.Count -gt 0) { [string]$orderedGoals[0].text } elseif ($state.project_total_goal) { [string]$state.project_total_goal } else { "Project total goal is not explicit yet." }
+  if ($gates.Count -eq 0) {
+    $openQuestions.Add("No explicit completion gate was found in authority sources.") | Out-Null
+  }
+  if ($boundaries.Count -eq 0) {
+    $boundaries.Add([pscustomobject]@{
+        text = "Do not treat GPT Pro approval, screenshots, or a subgoal PASS as project_total completion without Done Gate."
+        source = "gpt-pro-review-loop/default"
+        source_role = "safety_default"
+        priority = 1
+      }) | Out-Null
+  }
+  if ($goal -eq "Project total goal is not explicit yet.") {
+    $openQuestions.Add("Project total goal is not explicit in the scanned sources.") | Out-Null
+  }
+  $genericOnly = ($orderedGoals.Count -le 1 -and $sources.Count -le 1 -and $gates.Count -eq 0)
+  $confidence = "medium"
+  if ($sourceInfos.Count -ge 2 -and $gates.Count -gt 0 -and -not $conflict) { $confidence = "high" }
+  if ($genericOnly -or $conflict -or $sources.Count -eq 0 -or $gates.Count -eq 0 -or ($ContractMode -eq "strict" -and ($orderedGoals.Count -eq 0))) { $confidence = "low" }
+  $contractStatus = if ($confidence -eq "low") { "needs_human_decision" } else { "active" }
+  foreach ($gate in @($gates.ToArray())) {
+    if ($gate.status -eq "human_gate") {
+      $gate.evidence_status = "human_required"
+    }
+  }
+  $contract = [ordered]@{
+    created_at = (Get-Date).ToString("o")
+    schema_version = 1
+    goal_discovery_mode = $Mode
+    goal_contract_mode = $ContractMode
+    project_total_goal = $goal
+    current_goal_scope = $state.active_goal_scope
+    terminal_goal_scope = $state.terminal_goal_scope
+    confidence = $confidence
+    status = $contractStatus
+    authority_sources = @($sourceInfos | ForEach-Object {
+        [ordered]@{ path = $_.path; role = $_.role; priority = $_.priority }
+      })
+    goal_candidates = @($orderedGoals | Select-Object -First 8 | ForEach-Object {
+        [ordered]@{ text = $_.text; source = $_.source; priority = $_.priority }
+      })
+    completion_gates = @($gates.ToArray())
+    non_completion_boundaries = @($boundaries.ToArray())
+    open_questions = @($openQuestions.ToArray())
+    advisory_rule = "GPT Pro is one expert opinion; Codex local evidence, efficiency audit, expert council, Human Gate, and Done Gate decide completion."
+  }
+  $evidence = Get-GoalContractEvidenceSummary -ProjectRoot $ProjectRoot -Contract ([pscustomobject]$contract)
+  foreach ($gate in @($contract.completion_gates)) {
+    $matched = @($evidence.present | Where-Object { $_.gate.id -eq $gate.id })
+    if ($matched.Count -gt 0) {
+      $gate.evidence_ids = @($matched[0].evidence_ids)
+      $gate.evidence_status = "present"
+    }
+  }
+  ConvertTo-JsonFile $contract $paths.ProjectGoalContractJson
+  $hashText = (Get-Content -Raw -LiteralPath $paths.ProjectGoalContractJson) -replace '"created_at"\s*:\s*"[^"]+",?', ''
+  $sha = [System.Security.Cryptography.SHA256]::Create()
+  $hash = [System.BitConverter]::ToString($sha.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($hashText))).Replace("-", "").ToLowerInvariant()
+  $gateRows = @($contract.completion_gates | ForEach-Object {
+      "| $($_.id) | $(ConvertTo-MarkdownCell $_.title) | $($_.status) | $($_.evidence_status) | $(ConvertTo-MarkdownCell $_.source) |"
+    })
+  if ($gateRows.Count -eq 0) { $gateRows = @("| GATE-000 | No explicit gate found | open | missing | generated |") }
+  $boundaryText = @($contract.non_completion_boundaries | ForEach-Object { "- [$($_.source)] $($_.text)" }) -join [Environment]::NewLine
+  $sourceText = @($contract.authority_sources | ForEach-Object { "- $($_.path) ($($_.role), priority=$($_.priority))" }) -join [Environment]::NewLine
+  $md = @(
+    "# Project Goal Contract",
+    "",
+    "- created_at: $(Get-Date -Format o)",
+    "- confidence: $confidence",
+    "- status: $contractStatus",
+    "- contract_hash: $hash",
+    "",
+    "## Project Total Goal",
+    "",
+    $goal,
+    "",
+    "## Completion Gates",
+    "",
+    "| ID | Gate | Status | Evidence status | Source |",
+    "|---|---|---|---|---|",
+    ($gateRows -join [Environment]::NewLine),
+    "",
+    "## Non-Completion Boundaries",
+    "",
+    $boundaryText,
+    "",
+    "## Authority Sources",
+    "",
+    $sourceText,
+    "",
+    "## Open Questions",
+    "",
+    ($(if ($openQuestions.Count -gt 0) { @($openQuestions | ForEach-Object { "- $_" }) -join [Environment]::NewLine } else { "- None." }))
+  ) -join [Environment]::NewLine
+  Set-Content -LiteralPath $paths.ProjectGoalContract -Encoding UTF8 -Value $md
+  $state = Get-State -ProjectRoot $ProjectRoot
+  Set-ObjectProperty $state "project_total_goal" $goal
+  Set-ObjectProperty $state "goal_confidence" $confidence
+  Set-ObjectProperty $state "goal_contract_confidence" $confidence
+  Set-ObjectProperty $state "goal_contract_status" $contractStatus
+  Set-ObjectProperty $state "goal_sources" @($sourceInfos | ForEach-Object { $_.path })
+  Set-ObjectProperty $state "goal_authority_sources" @($sourceInfos | ForEach-Object { $_.path })
+  Set-ObjectProperty $state "latest_goal_contract" (Get-RelativePath -Root $ProjectRoot -Path $paths.ProjectGoalContractJson)
+  Set-ObjectProperty $state "goal_contract_hash" $hash
+  if ($confidence -eq "low") {
+    Set-ObjectProperty $state "goal_verdict" "NEEDS_HUMAN_DECISION"
+    Set-ObjectProperty $state "project_goal_verdict" "NEEDS_HUMAN_DECISION"
+    Set-ObjectProperty $state "next_action" "clarify_project_total_goal"
+    Set-ObjectProperty $state "loop_status" "paused"
+    Set-ObjectProperty $state "stop_reason" "low_confidence_project_goal"
+  }
+  Save-State $ProjectRoot $state
+  return $paths.ProjectGoalContractJson
+}
+
 function New-ProjectGoalModel {
   param(
     [Parameter(Mandatory = $true)][string]$ProjectRoot,
@@ -2571,12 +2926,65 @@ function New-ArchitectureSnapshot {
   if ($files -contains "package.json") { $verification.Add("- npm test / package scripts if present") | Out-Null }
   if ($files -contains "pyproject.toml") { $verification.Add("- pytest or project-local test command") | Out-Null }
   if ($verification.Count -eq 0) { $verification.Add("- Use project-local verifier, documented scripts, or git diff checks.") | Out-Null }
+  $packageScripts = @()
+  $packagePath = Join-Path $ProjectRoot "package.json"
+  if (Test-Path -LiteralPath $packagePath) {
+    try {
+      $pkg = Read-JsonFile $packagePath
+      if ($pkg.scripts) {
+        $packageScripts = @($pkg.scripts.PSObject.Properties | ForEach-Object { "$($_.Name): $($_.Value)" })
+        foreach ($script in @($packageScripts | Where-Object { $_ -match "(?i)(test|verify|check|lint)" } | Select-Object -First 5)) {
+          $verification.Add("- npm run $($script.Split(':')[0])") | Out-Null
+        }
+      }
+    } catch {
+    }
+  }
+  $godotAutoloads = @()
+  $godotPath = Join-Path $ProjectRoot "project.godot"
+  if (Test-Path -LiteralPath $godotPath) {
+    $inAutoload = $false
+    foreach ($line in @(Get-Content -LiteralPath $godotPath -ErrorAction SilentlyContinue)) {
+      if ($line -match "^\[autoload\]") { $inAutoload = $true; continue }
+      if ($line -match "^\[.+\]") { $inAutoload = $false }
+      if ($inAutoload -and $line -match "=") { $godotAutoloads += $line.Trim() }
+    }
+  }
+  $protectedPaths = @($files | Where-Object { $_ -match "(?i)(^\.github/|^game/autoload/|Main\.gd$|Main\.tscn$|project\.godot$|save|rng|worldstate|contentdb|effectops)" } | Select-Object -First 40)
+  $architectureContextRel = $null
+  $architectureContextText = $null
+  if ($ArchitectureContextFile) {
+    $resolvedContext = Resolve-Path -LiteralPath $ArchitectureContextFile -ErrorAction SilentlyContinue
+    if ($resolvedContext) {
+      $architectureContextRel = Get-RelativePath -Root $ProjectRoot -Path $resolvedContext.Path
+      $architectureContextText = Get-ContentExcerpt $resolvedContext.Path 3000
+    }
+  }
   $goalContext = Get-GoalContextReport -ProjectRoot $ProjectRoot -MaxChars 1800
   $architectureRel = Get-RelativePath -Root $ProjectRoot -Path $paths.ProjectArchitecture
   $stackText = [string]::Join(", ", [string[]]@($stack))
   $entryText = if ($entryFiles.Count -gt 0) { @($entryFiles | ForEach-Object { "- $_" }) -join [Environment]::NewLine } else { "- No explicit entry file detected." }
   $moduleText = @($moduleDirs | ForEach-Object { "- $_" }) -join [Environment]::NewLine
   $verificationText = $verification.ToArray() -join [Environment]::NewLine
+  $protectedText = if ($protectedPaths.Count -gt 0) { @($protectedPaths | ForEach-Object { "- $_" }) -join [Environment]::NewLine } else { "- No protected paths inferred from common patterns." }
+  $scriptText = if ($packageScripts.Count -gt 0) { @($packageScripts | ForEach-Object { "- $_" }) -join [Environment]::NewLine } else { "- No package scripts detected." }
+  $autoloadText = if ($godotAutoloads.Count -gt 0) { @($godotAutoloads | ForEach-Object { "- $_" }) -join [Environment]::NewLine } else { "- No Godot autoloads detected." }
+  $architectureMap = [ordered]@{
+    created_at = (Get-Date).ToString("o")
+    architecture_analysis_mode = $Mode
+    project_type = $projectType
+    stack = @($stack.ToArray())
+    entry_points = @($entryFiles)
+    key_modules = @($moduleDirs)
+    verification_commands = @($verification.ToArray())
+    package_scripts = @($packageScripts)
+    godot_autoloads = @($godotAutoloads)
+    protected_paths = @($protectedPaths)
+    file_sample = @($files | Select-Object -First 120)
+    architecture_context_file = $architectureContextRel
+    codegraph_note = "PowerShell does not call CodeGraph directly; pass -ArchitectureContextFile with an outer Codex CodeGraph summary when available."
+  }
+  ConvertTo-JsonFile $architectureMap $paths.ProjectArchitectureMap
   $fileTreeText = @($files | Select-Object -First 80) -join [Environment]::NewLine
   $content = @(
     "# Project Architecture Snapshot",
@@ -2602,11 +3010,27 @@ function New-ArchitectureSnapshot {
     "",
     $verificationText,
     "",
+    "## Package Scripts",
+    "",
+    $scriptText,
+    "",
+    "## Godot Autoloads",
+    "",
+    $autoloadText,
+    "",
     "## Risk Boundaries",
     "",
     '```text',
     $goalContext.text,
     '```',
+    "",
+    "## Protected Paths",
+    "",
+    $protectedText,
+    "",
+    "## Optional Architecture Context",
+    "",
+    $(if ($architectureContextText) { $architectureContextText } else { "No external architecture context file was provided." }),
     "",
     "## File Tree Sample",
     "",
@@ -2617,6 +3041,7 @@ function New-ArchitectureSnapshot {
   Set-Content -LiteralPath $paths.ProjectArchitecture -Encoding UTF8 -Value $content
   $state = Get-State -ProjectRoot $ProjectRoot
   Set-ObjectProperty $state "latest_architecture_snapshot" $architectureRel
+  Set-ObjectProperty $state "latest_architecture_map" (Get-RelativePath -Root $ProjectRoot -Path $paths.ProjectArchitectureMap)
   Save-State $ProjectRoot $state
   return $paths.ProjectArchitecture
 }
@@ -2630,7 +3055,9 @@ function New-CompressedArchitectureBrief {
   $paths = Get-ReviewPaths -ProjectRoot $ProjectRoot
   $state = Get-State -ProjectRoot $ProjectRoot
   if (-not (Test-Path -LiteralPath $paths.ProjectGoalModel)) { New-ProjectGoalModel -ProjectRoot $ProjectRoot -Mode $GoalDiscoveryMode | Out-Null }
+  if (-not (Test-Path -LiteralPath $paths.ProjectGoalContractJson)) { New-ProjectGoalContract -ProjectRoot $ProjectRoot -Mode $GoalDiscoveryMode -ContractMode $GoalContractMode | Out-Null }
   if (-not (Test-Path -LiteralPath $paths.ProjectArchitecture)) { New-ArchitectureSnapshot -ProjectRoot $ProjectRoot -Mode $ArchitectureAnalysisMode | Out-Null }
+  $contractExcerpt = Get-ContentExcerpt $paths.ProjectGoalContract 2600
   $goalExcerpt = Get-ContentExcerpt $paths.ProjectGoalModel 2600
   $archExcerpt = Get-ContentExcerpt $paths.ProjectArchitecture 3600
   $routeItems = @($state.recommended_capability_routes | Where-Object { $_ } | Select-Object -First 8)
@@ -2642,7 +3069,11 @@ function New-CompressedArchitectureBrief {
     "- max_chars: $MaxChars",
     "- pro_role: GPT Pro is one external expert opinion; it cannot approve completion without Codex local assessment, efficiency audit, Human Gate, and Done Gate.",
     "",
-    "## Goal",
+    "## Goal Contract Summary",
+    "",
+    $contractExcerpt,
+    "",
+    "## Goal Model",
     "",
     $goalExcerpt,
     "",
@@ -2700,8 +3131,8 @@ function New-GoalSlices {
   $lines.Add("- project_total_goal: $($state.project_total_goal)") | Out-Null
   $lines.Add("- rule: slice completion closes only the slice; project_total completion still requires guard + Done Gate.") | Out-Null
   $lines.Add("") | Out-Null
-  $lines.Add("| ID | Parent goal | Acceptance gate | Evidence needed | Capability route | Human Gate | Status | Current progress |") | Out-Null
-  $lines.Add("|---|---|---|---|---|---|---|---|") | Out-Null
+  $lines.Add("| ID | Parent goal | Acceptance gate | Evidence needed | Evidence status | Closure condition | Capability route | Human Gate | Status | Current progress |") | Out-Null
+  $lines.Add("|---|---|---|---|---|---|---|---|---|---|") | Out-Null
   $sliceItems = New-Object System.Collections.Generic.List[object]
   $index = 1
   foreach ($item in $queue) {
@@ -2710,22 +3141,29 @@ function New-GoalSlices {
     $status = if ($humanRequired) { "needs_human_decision" } else { "open" }
     $route = Select-CapabilityRouteForBlocker -State $state -Blocker $item
     $gate = if ($item.raw_text) { [string]$item.raw_text } else { [string]$item.recommended_next_action }
+    $requiredEvidenceType = if ($item.action_kind) { [string]$item.action_kind } else { "local_evidence" }
+    $sliceEvidenceStatus = if ($humanRequired) { "human_required" } else { "missing" }
+    $sliceClosureCondition = "record evidence for blocker $($item.id), then rerun Done Gate"
     $sliceItems.Add([pscustomobject]@{
         id = $sliceId
         blocker_id = $item.id
         parent_goal_scope = if ($item.scope) { [string]$item.scope } else { "project_total" }
         acceptance_gate = $gate
+        required_evidence_types = @($requiredEvidenceType)
         evidence_needed = $item.action_kind
+        evidence_ids = @()
+        evidence_status = $sliceEvidenceStatus
+        closure_condition = $sliceClosureCondition
         recommended_capability_route = $route
         human_gate_required = [bool]$humanRequired
         status = $status
         current_progress = "not_started"
       }) | Out-Null
-    $lines.Add("| $sliceId | $($item.scope) | $(ConvertTo-MarkdownCell $gate) | $($item.action_kind) | $(ConvertTo-MarkdownCell $route) | $humanRequired | $status | not_started |") | Out-Null
+    $lines.Add("| $sliceId | $($item.scope) | $(ConvertTo-MarkdownCell $gate) | $($item.action_kind) | $sliceEvidenceStatus | $(ConvertTo-MarkdownCell $sliceClosureCondition) | $(ConvertTo-MarkdownCell $route) | $humanRequired | $status | not_started |") | Out-Null
     $index += 1
   }
   if ($queue.Count -eq 0) {
-    $lines.Add("| GS-000 | project_total | No blockers detected | done_gate_evidence | local-codex | False | candidate_for_done_gate | pending Done Gate |") | Out-Null
+    $lines.Add("| GS-000 | project_total | No blockers detected | done_gate_evidence | missing | Done Gate must pass with contract evidence | local-codex | False | candidate_for_done_gate | pending Done Gate |") | Out-Null
   }
   Set-Content -LiteralPath $paths.GoalSlices -Encoding UTF8 -Value ($lines.ToArray() -join [Environment]::NewLine)
   $candidate = @($sliceItems.ToArray() | Where-Object { $_.status -eq "open" } | Select-Object -First 1)
@@ -2745,17 +3183,20 @@ function Invoke-RefreshProjectUnderstanding {
     [int]$BriefMaxChars = 8000
   )
   $goalPath = New-ProjectGoalModel -ProjectRoot $ProjectRoot -Mode $GoalMode
+  $contractPath = New-ProjectGoalContract -ProjectRoot $ProjectRoot -Mode $GoalMode -ContractMode $GoalContractMode
   $archPath = New-ArchitectureSnapshot -ProjectRoot $ProjectRoot -Mode $ArchitectureMode
   $briefPath = New-CompressedArchitectureBrief -ProjectRoot $ProjectRoot -MaxChars $BriefMaxChars
   $slicePath = New-GoalSlices -ProjectRoot $ProjectRoot
   New-RuntimeBrief -ProjectRoot $ProjectRoot -Reason "project_understanding_refreshed" | Out-Null
   Write-Host "Project understanding refreshed:" -ForegroundColor Green
   Write-Host "  Goal model: $goalPath"
+  Write-Host "  Goal contract: $contractPath"
   Write-Host "  Architecture: $archPath"
   Write-Host "  Architecture brief: $briefPath"
   Write-Host "  Goal slices: $slicePath"
   return [pscustomobject]@{
     goal_model = $goalPath
+    goal_contract = $contractPath
     architecture_snapshot = $archPath
     architecture_brief = $briefPath
     goal_slices = $slicePath
@@ -3477,8 +3918,13 @@ function Invoke-NextDecision {
     final_closure_verdict = $state.final_closure_verdict
     project_total_goal = $state.project_total_goal
     goal_confidence = $state.goal_confidence
+    latest_goal_contract = $state.latest_goal_contract
+    goal_contract_hash = $state.goal_contract_hash
+    goal_contract_confidence = $state.goal_contract_confidence
+    goal_contract_status = $state.goal_contract_status
     latest_goal_model = $state.latest_goal_model
     latest_architecture_snapshot = $state.latest_architecture_snapshot
+    latest_architecture_map = $state.latest_architecture_map
     latest_architecture_brief = $state.latest_architecture_brief
     architecture_brief_hash = $state.architecture_brief_hash
     latest_goal_slices = $state.latest_goal_slices
@@ -3624,8 +4070,13 @@ function Show-Status {
     project_total_goal = if ($state) { $state.project_total_goal } else { $null }
     goal_confidence = if ($state) { $state.goal_confidence } else { $null }
     goal_source_count = if ($state -and $state.goal_sources) { @($state.goal_sources).Count } else { 0 }
+    latest_goal_contract = if ($state) { $state.latest_goal_contract } else { $null }
+    goal_contract_hash = if ($state) { $state.goal_contract_hash } else { $null }
+    goal_contract_confidence = if ($state) { $state.goal_contract_confidence } else { $null }
+    goal_contract_status = if ($state) { $state.goal_contract_status } else { $null }
     latest_goal_model = if ($state) { $state.latest_goal_model } else { $null }
     latest_architecture_snapshot = if ($state) { $state.latest_architecture_snapshot } else { $null }
+    latest_architecture_map = if ($state) { $state.latest_architecture_map } else { $null }
     latest_architecture_brief = if ($state) { $state.latest_architecture_brief } else { $null }
     architecture_brief_hash = if ($state) { $state.architecture_brief_hash } else { $null }
     architecture_brief_sent_hash = if ($state) { $state.architecture_brief_sent_hash } else { $null }
@@ -3739,9 +4190,14 @@ switch ($Action) {
     Ensure-ReviewLoop -ProjectRoot $ProjectRoot -ChatUrl $TargetChatGptUrl | Out-Null
     Invoke-BuildProjectGoalPlan -ProjectRoot $ProjectRoot
   }
+  "BuildGoalContract" {
+    Ensure-ReviewLoop -ProjectRoot $ProjectRoot -ChatUrl $TargetChatGptUrl | Out-Null
+    New-ProjectGoalContract -ProjectRoot $ProjectRoot -Mode $GoalDiscoveryMode -ContractMode $GoalContractMode | Out-Null
+  }
   "BuildGoalModel" {
     Ensure-ReviewLoop -ProjectRoot $ProjectRoot -ChatUrl $TargetChatGptUrl | Out-Null
     New-ProjectGoalModel -ProjectRoot $ProjectRoot -Mode $GoalDiscoveryMode | Out-Null
+    New-ProjectGoalContract -ProjectRoot $ProjectRoot -Mode $GoalDiscoveryMode -ContractMode $GoalContractMode | Out-Null
   }
   "AnalyzeArchitecture" {
     Ensure-ReviewLoop -ProjectRoot $ProjectRoot -ChatUrl $TargetChatGptUrl | Out-Null
@@ -3795,7 +4251,9 @@ switch ($Action) {
   }
   "RecordProgress" {
     Ensure-ReviewLoop -ProjectRoot $ProjectRoot -ChatUrl $TargetChatGptUrl | Out-Null
-    Add-ProgressArtifact -ProjectRoot $ProjectRoot -Artifact $ProgressArtifact
+    Add-ProgressArtifact -ProjectRoot $ProjectRoot -Artifact $ProgressArtifact -Gate $RelatedGate -BlockerId $RelatedBlockerId -SliceId $RelatedSliceId -EvidenceKind $EvidenceType
+    $progressContract = New-ActionContract -ProjectRoot $ProjectRoot
+    Add-EvidenceRecord -ProjectRoot $ProjectRoot -ContractInfo $progressContract -Summary "Recorded progress artifact." -ArtifactPaths @($ProgressArtifact) -RelatedGate $RelatedGate -RelatedBlockerId $RelatedBlockerId -RelatedSliceId $RelatedSliceId -EvidenceKind $(if ($EvidenceType) { $EvidenceType } else { "progress_artifact" }) | Out-Null
     Invoke-RefreshProjectUnderstanding -ProjectRoot $ProjectRoot -GoalMode $GoalDiscoveryMode -ArchitectureMode $ArchitectureAnalysisMode -BriefMaxChars $ArchitectureBriefMaxChars | Out-Null
     $state = Get-State -ProjectRoot $ProjectRoot
     if ($state.efficiency_audit_mode -ne "off" -and (-not $state.latest_capability_scan -or $CapabilityScan)) {

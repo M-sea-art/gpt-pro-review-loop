@@ -80,6 +80,12 @@ Describe "gpt-pro-review-loop state machine" {
     $state.PSObject.Properties.Name | Should -Contain "stall_pivot_status"
     $state.PSObject.Properties.Name | Should -Contain "done_gate_verdict"
     $state.PSObject.Properties.Name | Should -Contain "final_closure_verdict"
+    $state.PSObject.Properties.Name | Should -Contain "latest_goal_contract"
+    $state.PSObject.Properties.Name | Should -Contain "goal_contract_hash"
+    $state.PSObject.Properties.Name | Should -Contain "goal_contract_confidence"
+    $state.PSObject.Properties.Name | Should -Contain "goal_contract_status"
+    $state.PSObject.Properties.Name | Should -Contain "goal_authority_sources"
+    $state.PSObject.Properties.Name | Should -Contain "latest_architecture_map"
     @($state.pending_prompts).Count | Should -Be 0
     @($state.captured_reviews).Count | Should -Be 0
     $state.baseline_sent_to_url | Should -Be $null
@@ -336,7 +342,12 @@ Describe "gpt-pro-review-loop state machine" {
 
   It "requires GPT Pro evidence before terminal completion when Pro mode is required" {
     $project = New-TestProject "pro-required"
+    Set-Content -LiteralPath (Join-Path $project "AGENTS.md") -Encoding UTF8 -Value "# Project`n`nProject Identity`nShip the required-review project.`n`nAcceptance gate: verifier pass."
     & $script:Skill -Action Init -Root $project -TargetChatGptUrl "https://chatgpt.com/g/test-project" -ProReviewMode required
+    & $script:Skill -Action RefreshProjectUnderstanding -Root $project
+    $evidence = Join-Path $project "verifier-pass.txt"
+    Set-Content -LiteralPath $evidence -Encoding UTF8 -Value "verifier pass"
+    & $script:Skill -Action RecordProgress -Root $project -ProgressArtifact $evidence -RelatedGate "GATE-001" -EvidenceType "verification_command"
     & $script:Skill -Action CaptureReview -Root $project -Reviewer codex-efficiency-auditor -Phase goal-audit -ReviewText "local terminal candidate"
     & $script:Skill -Action AssessFeedback -Root $project -GoalVerdict GOAL_ACHIEVED -NextAction "final_report"
     & $script:Skill -Action NextDecision -Root $project
@@ -502,8 +513,12 @@ Human Gate: manual visual signoff required
 
   It "maps terminal next decisions" {
     $project = New-TestProject "decision"
+    Set-Content -LiteralPath (Join-Path $project "AGENTS.md") -Encoding UTF8 -Value "# Project`n`nProject Identity`nShip the test project.`n`nAcceptance gate: verifier pass."
     & $script:Skill -Action Init -Root $project -TargetChatGptUrl "https://chatgpt.com/g/test-project"
-    & $script:Skill -Action Prepare -Root $project
+    & $script:Skill -Action RefreshProjectUnderstanding -Root $project
+    $evidence = Join-Path $project "verifier-pass.txt"
+    Set-Content -LiteralPath $evidence -Encoding UTF8 -Value "verifier pass"
+    & $script:Skill -Action RecordProgress -Root $project -ProgressArtifact $evidence -RelatedGate "GATE-001" -EvidenceType "verification_command"
     & $script:Skill -Action CaptureReview -Root $project -Reviewer codex-efficiency-auditor -Phase goal-audit -ReviewText "done"
     & $script:Skill -Action AssessFeedback -Root $project -GoalVerdict GOAL_ACHIEVED -NextAction "final_report"
     & $script:Skill -Action NextDecision -Root $project
@@ -523,6 +538,7 @@ Human Gate: manual visual signoff required
 
   It "keeps subgoal achievement running instead of completing the total project" {
     $project = New-TestProject "subgoal"
+    Set-Content -LiteralPath (Join-Path $project "AGENTS.md") -Encoding UTF8 -Value "# Project`n`nProject Identity`nShip total project.`n`nAcceptance gate: verifier pass."
     & $script:Skill -Action Init -Root $project -TargetChatGptUrl "https://chatgpt.com/g/test-project" -GoalScope test_line
     & $script:Skill -Action Prepare -Root $project
     & $script:Skill -Action CaptureReview -Root $project -Reviewer codex-efficiency-auditor -Phase goal-audit -ReviewText "AUTOMATED_BETA_ACCEPTED"
@@ -579,6 +595,43 @@ Human Gate: manual visual signoff required
     $state = Read-State $project
     $state.done_gate_verdict | Should -Be "NEEDS_FIX"
     $state.latest_done_gate | Should -Match "codex-efficiency-auditor-done-gate"
+  }
+
+  It "Done Gate requires local evidence for explicit contract gates" {
+    $project = New-TestProject "done-gate-missing-evidence"
+    Set-Content -LiteralPath (Join-Path $project "AGENTS.md") -Encoding UTF8 -Value "# Project`n`nProject Identity`nShip the governed project.`n`nAcceptance gate: verifier pass."
+    & $script:Skill -Action Init -Root $project -TargetChatGptUrl "https://chatgpt.com/g/test-project"
+    & $script:Skill -Action RefreshProjectUnderstanding -Root $project
+    & $script:Skill -Action CaptureReview -Root $project -Reviewer codex-efficiency-auditor -Phase goal-audit -ReviewText "done"
+    & $script:Skill -Action AssessFeedback -Root $project -GoalVerdict GOAL_ACHIEVED -NextAction "final_report"
+    & $script:Skill -Action RunDoneGate -Root $project
+
+    $state = Read-State $project
+    $state.goal_contract_confidence | Should -Be "high"
+    $state.done_gate_verdict | Should -Be "NEEDS_FIX"
+    $doneGatePath = Join-Path $project ($state.latest_done_gate -replace "/", "\")
+    (Get-Content -Raw -LiteralPath $doneGatePath) | Should -Match "Missing Contract Evidence"
+    (Get-Content -Raw -LiteralPath $doneGatePath) | Should -Match "GATE-001"
+  }
+
+  It "binds RecordProgress evidence to a goal contract gate" {
+    $project = New-TestProject "progress-evidence-binding"
+    Set-Content -LiteralPath (Join-Path $project "AGENTS.md") -Encoding UTF8 -Value "# Project`n`nProject Identity`nShip with evidence.`n`nAcceptance gate: verifier pass."
+    & $script:Skill -Action Init -Root $project -TargetChatGptUrl "https://chatgpt.com/g/test-project"
+    & $script:Skill -Action RefreshProjectUnderstanding -Root $project
+    $artifact = Join-Path $project "verifier-pass.txt"
+    Set-Content -LiteralPath $artifact -Encoding UTF8 -Value "PASS"
+    & $script:Skill -Action RecordProgress -Root $project -ProgressArtifact $artifact -RelatedGate "GATE-001" -RelatedSliceId "GS-001" -EvidenceType "verification_command"
+
+    $evidenceLog = Join-Path $project "docs/ai-review-loop/evidence/evidence.jsonl"
+    $evidence = Get-Content -LiteralPath $evidenceLog | Select-Object -Last 1 | ConvertFrom-Json
+    $evidence.related_gate | Should -Be "GATE-001"
+    $evidence.related_slice_id | Should -Be "GS-001"
+    $evidence.evidence_type | Should -Be "verification_command"
+
+    & $script:Skill -Action BuildGoalContract -Root $project
+    $contract = Get-Content -Raw -LiteralPath (Join-Path $project "docs/ai-review-loop/project-goal-contract.json") | ConvertFrom-Json
+    @($contract.completion_gates | Where-Object { $_.id -eq "GATE-001" })[0].evidence_status | Should -Be "present"
   }
 
   It "migrates stale complete state back to running when project blockers exist" {
@@ -664,6 +717,7 @@ Human Gate: manual visual signoff required
 
   It "pauses a local action contract that requires explicit human authorization" {
     $project = New-TestProject "execute-human-action"
+    Set-Content -LiteralPath (Join-Path $project "AGENTS.md") -Encoding UTF8 -Value "# Project`n`nProject Identity`nShip governed project.`n`nAcceptance gate: verifier pass."
     & $script:Skill -Action Init -Root $project -TargetChatGptUrl "https://chatgpt.com/g/test-project"
     & $script:Skill -Action Prepare -Root $project
     & $script:Skill -Action CaptureReview -Root $project -Reviewer codex-efficiency-auditor -Phase goal-audit -ReviewText "continue"
@@ -720,6 +774,7 @@ Human Gate: manual visual signoff required
 
   It "requires continuation when next decision is still running" {
     $project = New-TestProject "continue-decision"
+    Set-Content -LiteralPath (Join-Path $project "AGENTS.md") -Encoding UTF8 -Value "# Project`n`nProject Identity`nContinue governed project work.`n`nAcceptance gate: verifier pass."
     & $script:Skill -Action Init -Root $project -TargetChatGptUrl "https://chatgpt.com/g/test-project"
     & $script:Skill -Action Prepare -Root $project
     & $script:Skill -Action CaptureReview -Root $project -Reviewer codex-efficiency-auditor -Phase goal-audit -ReviewText "continue"
@@ -741,6 +796,7 @@ Human Gate: manual visual signoff required
 
   It "sends to GPT when next action explicitly requires external review" {
     $project = New-TestProject "external-decision"
+    Set-Content -LiteralPath (Join-Path $project "AGENTS.md") -Encoding UTF8 -Value "# Project`n`nProject Identity`nReview governed project work.`n`nAcceptance gate: verifier pass."
     & $script:Skill -Action Init -Root $project -TargetChatGptUrl "https://chatgpt.com/g/test-project"
     & $script:Skill -Action Prepare -Root $project
     & $script:Skill -Action CaptureReview -Root $project -Reviewer codex-efficiency-auditor -Phase goal-audit -ReviewText "continue"
@@ -790,13 +846,20 @@ Human Gate: manual visual signoff required
 
     $base = Join-Path $project "docs/ai-review-loop"
     Test-Path -LiteralPath (Join-Path $base "project-goal-model.md") | Should -BeTrue
+    Test-Path -LiteralPath (Join-Path $base "project-goal-contract.json") | Should -BeTrue
+    Test-Path -LiteralPath (Join-Path $base "project-goal-contract.md") | Should -BeTrue
     Test-Path -LiteralPath (Join-Path $base "project-architecture.md") | Should -BeTrue
+    Test-Path -LiteralPath (Join-Path $base "project-architecture-map.json") | Should -BeTrue
     Test-Path -LiteralPath (Join-Path $base "architecture-brief.md") | Should -BeTrue
     Test-Path -LiteralPath (Join-Path $base "goal-slices.md") | Should -BeTrue
 
     $state = Read-State $project
     $state.latest_goal_model | Should -Be "docs/ai-review-loop/project-goal-model.md"
+    $state.latest_goal_contract | Should -Be "docs/ai-review-loop/project-goal-contract.json"
+    $state.goal_contract_hash | Should -Not -BeNullOrEmpty
+    $state.goal_contract_confidence | Should -Be "high"
     $state.latest_architecture_snapshot | Should -Be "docs/ai-review-loop/project-architecture.md"
+    $state.latest_architecture_map | Should -Be "docs/ai-review-loop/project-architecture-map.json"
     $state.latest_architecture_brief | Should -Be "docs/ai-review-loop/architecture-brief.md"
     $state.latest_goal_slices | Should -Be "docs/ai-review-loop/goal-slices.md"
     $state.project_total_goal | Should -Match "Agents|Test Project|Build"
@@ -816,6 +879,24 @@ Human Gate: manual visual signoff required
     $brief | Should -Match "## Verification"
     $brief | Should -Match "## Risk"
     $brief | Should -Match "## Questions For GPT Pro"
+  }
+
+  It "writes a structured architecture map with scripts and protected paths" {
+    $project = New-TestProject "architecture-map"
+    New-Item -ItemType Directory -Path (Join-Path $project "game/autoload") -Force | Out-Null
+    Set-Content -LiteralPath (Join-Path $project "AGENTS.md") -Encoding UTF8 -Value "# Project`n`nProject Identity`nGodot project.`n`nAcceptance gate: godot tests pass."
+    Set-Content -LiteralPath (Join-Path $project "project.godot") -Encoding UTF8 -Value "[autoload]`nRNGService=`"res://game/autoload/RNGService.gd`""
+    Set-Content -LiteralPath (Join-Path $project "package.json") -Encoding UTF8 -Value '{"scripts":{"test":"node test.js","lint":"eslint ."}}'
+    Set-Content -LiteralPath (Join-Path $project "game/autoload/RNGService.gd") -Encoding UTF8 -Value "extends Node"
+    & $script:Skill -Action Init -Root $project -TargetChatGptUrl "https://chatgpt.com/g/test-project"
+    & $script:Skill -Action AnalyzeArchitecture -Root $project -ArchitectureAnalysisMode deep
+
+    $map = Get-Content -Raw -LiteralPath (Join-Path $project "docs/ai-review-loop/project-architecture-map.json") | ConvertFrom-Json
+    $map.project_type | Should -Be "Godot"
+    @($map.package_scripts | Where-Object { $_ -match "test:" }).Count | Should -BeGreaterThan 0
+    @($map.protected_paths | Where-Object { $_ -match "project.godot|game/autoload" }).Count | Should -BeGreaterThan 0
+    $state = Read-State $project
+    $state.latest_architecture_map | Should -Be "docs/ai-review-loop/project-architecture-map.json"
   }
 
   It "does not resend unchanged architecture brief after the first sent prompt" {
@@ -849,6 +930,24 @@ Human Gate: manual visual signoff required
     $state.loop_status | Should -Be "paused"
     $state.goal_verdict | Should -Be "NEEDS_HUMAN_DECISION"
     $state.next_action | Should -Be "clarify_project_total_goal"
+  }
+
+  It "builds an authority ordered goal contract" {
+    $project = New-TestProject "goal-contract"
+    New-Item -ItemType Directory -Path (Join-Path $project "docs/project") -Force | Out-Null
+    Set-Content -LiteralPath (Join-Path $project "AGENTS.md") -Encoding UTF8 -Value "# Agents`n`nProject Identity`nBuild governed project.`n`nDo not claim completion without Human Gate."
+    Set-Content -LiteralPath (Join-Path $project "docs/project/ROADMAP.md") -Encoding UTF8 -Value "Acceptance gate: local verifier pass.`nRemaining P0: NOT_READY until evidence exists."
+    & $script:Skill -Action Init -Root $project -TargetChatGptUrl "https://chatgpt.com/g/test-project"
+    & $script:Skill -Action BuildGoalContract -Root $project
+
+    $contractPath = Join-Path $project "docs/ai-review-loop/project-goal-contract.json"
+    $contract = Get-Content -Raw -LiteralPath $contractPath | ConvertFrom-Json
+    $contract.project_total_goal | Should -Match "Build governed project"
+    @($contract.authority_sources)[0].path | Should -Be "AGENTS.md"
+    @($contract.completion_gates).Count | Should -BeGreaterThan 0
+    @($contract.non_completion_boundaries).Count | Should -BeGreaterThan 0
+    $state = Read-State $project
+    $state.goal_contract_status | Should -Be "active"
   }
 
   It "treats goal slice completion as non-terminal for project total" {

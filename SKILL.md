@@ -29,10 +29,13 @@ Codex efficiency audit is the loop's process supervisor. It is not just another 
 
 v1.7 adds a project understanding layer before review:
 
+- `project-goal-contract.json` / `project-goal-contract.md`: authority-ordered project total goal contract with completion gates, Human Gate boundaries, evidence requirements, confidence, and open questions.
 - `project-goal-model.md`: project total goal, subgoal/gate sources, completion gates, and non-completion boundaries.
-- `project-architecture.md`: read-only architecture snapshot covering project type, stack, entry points, key modules, verification commands, and protected boundaries.
-- `architecture-brief.md`: compressed 4k-8k character brief for GPT Pro, sent on the first baseline or when the architecture hash changes.
+- `project-architecture.md` / `project-architecture-map.json`: read-only architecture snapshot covering project type, stack, entry points, key modules, verification commands, protected boundaries, package scripts, and optional outer CodeGraph context.
+- `architecture-brief.md`: compressed 4k-8k character brief for GPT Pro, sent on the first baseline or when the architecture or goal-contract hash changes.
 - `goal-slices.md`: small goal queue where each slice has acceptance evidence, recommended capability route, Human Gate status, and current progress.
+
+v1.9 makes the goal contract the strongest local completion source. A low-confidence contract pauses the loop for `NEEDS_HUMAN_DECISION`; a project-total Done Gate cannot pass unless explicit contract gates have bound local evidence or are marked as Human Gate decisions. GPT Pro can comment on the contract, but it cannot close gates by itself.
 
 GPT Pro is an external expert in the review panel, not the final judge. Its comments must flow through local assessment, efficiency audit, expert council, project-total guard, and Done Gate before Codex acts or claims completion.
 
@@ -91,12 +94,14 @@ GPT Pro, Codex efficiency review, and the local expert council are `reviewer` va
 
    ```powershell
    -GoalDiscoveryMode auto|docs_first|explicit_only
+   -GoalContractMode auto|strict
    -ArchitectureAnalysisMode light|standard|deep
    -ArchitectureBriefMaxChars 8000
+   -ArchitectureContextFile <path>
    -IncludeArchitectureBriefForPro
    ```
 
-   `auto` reads user/project docs such as `AGENTS.md`, README, roadmap, acceptance docs, Human Gate docs, completion reports, and verifier output. `explicit_only` pauses with `NEEDS_HUMAN_DECISION` if the project total goal cannot be established from an explicit existing state.
+   `auto` reads user/project docs such as `AGENTS.md`, README, roadmap, acceptance docs, Human Gate docs, completion reports, and verifier output. `explicit_only` pauses with `NEEDS_HUMAN_DECISION` if the project total goal cannot be established from an explicit existing state. `BuildGoalContract` applies the authority order `AGENTS.md`/governance > roadmap/completion/gate > acceptance/verifier > README/spec > supporting docs. If only a generic README/H1 exists, gates are missing, or goals conflict, confidence is low and terminal completion is blocked.
 
 3. Prepare the offline review package:
 
@@ -110,13 +115,14 @@ GPT Pro, Codex efficiency review, and the local expert council are `reviewer` va
 
    ```powershell
    & "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action RefreshProjectUnderstanding -Root "<project-root>"
+   & "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action BuildGoalContract -Root "<project-root>"
    & "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action BuildGoalModel -Root "<project-root>"
    & "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action AnalyzeArchitecture -Root "<project-root>"
    & "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action BuildArchitectureBrief -Root "<project-root>" -ArchitectureBriefMaxChars 8000
    & "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action BuildGoalSlices -Root "<project-root>"
    ```
 
-   The complete architecture snapshot stays local. GPT Pro receives only `architecture-brief.md` when it is new or changed. If GPT Pro says context is insufficient, regenerate the brief with a larger bound such as `-ArchitectureBriefMaxChars 12000` instead of sending the whole project.
+   The complete goal contract and architecture snapshot stay local. GPT Pro receives only the compressed contract/architecture brief when it is new or changed. If GPT Pro says context is insufficient, regenerate the brief with a larger bound such as `-ArchitectureBriefMaxChars 12000` instead of sending the whole project. If outer Codex has CodeGraph findings, write them to a file and pass `-ArchitectureContextFile <path>`; the PowerShell script stays portable and does not call MCP directly.
 
    Use `-GoalScope task|milestone|test_line|project_total` to label the current review target. Keep `project_total` as the terminal scope unless the user explicitly changes the project governance model. Compact prompts include `Goal Context` so GPT Pro and Codex efficiency review can distinguish a subgoal from total project completion.
 
@@ -218,12 +224,12 @@ GPT Pro, Codex efficiency review, and the local expert council are `reviewer` va
 
    Execute `local_only_next_action` before sending GPT another prompt. `ExecuteNextLocalAction` writes `action-contracts/*.json`, then records evidence in `evidence/evidence.jsonl` for safe ledger actions. If only Human Gate, protected scope, or explicit authorization blockers remain, or if the action itself is high-risk, pause for the user.
 
-   In default efficiency mode, `GOAL_ACHIEVED` is still not enough for project-total completion. `NextDecision` must first have `done_gate_verdict=DONE_GATE_PASS`; otherwise it keeps the loop running or pauses for the relevant human decision.
+   In default efficiency mode, `GOAL_ACHIEVED` is still not enough for project-total completion. `NextDecision` must first have `done_gate_verdict=DONE_GATE_PASS`; otherwise it keeps the loop running or pauses for the relevant human decision. `DONE_GATE_PASS` requires a non-low-confidence goal contract and local evidence records bound to explicit contract gates; screenshots, GPT Pro agreement, or a single subgoal PASS do not close the project.
 
 10. Run the local expert council after a progress update or when the loop needs a fresh local plan:
 
    ```powershell
-   & "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action RecordProgress -Root "<project-root>" -ProgressArtifact "<path>"
+   & "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action RecordProgress -Root "<project-root>" -ProgressArtifact "<path>" -RelatedGate "GATE-001" -RelatedBlockerId "PB-001" -RelatedSliceId "GS-001" -EvidenceType "verification_command"
    & "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action RunLocalCouncil -Root "<project-root>"
    & "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action PromoteGoal -Root "<project-root>"
    ```

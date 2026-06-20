@@ -22,7 +22,8 @@ review package -> external/internal review -> local assessment -> next decision
 - Completion is guarded at the project-total level. A task, milestone, or test-line can be accepted without stopping the continuous loop.
 - Project blockers are normalized into a queue so a running loop gets a concrete local next action instead of stopping at a generic blocker label.
 - Local-only next actions can be converted into action contracts and evidence records. The built-in executor is deliberately conservative: it writes ledger, plan, understanding, council, and evidence artifacts only; high-risk actions pause for a human decision.
-- Before review, the loop builds a project understanding layer: a project goal model, an architecture snapshot, a compressed architecture brief, and a goal-slice queue.
+- Before review, the loop builds a project understanding layer: an authority-ordered goal contract, a project goal model, an architecture snapshot/map, a compressed architecture brief, and a goal-slice queue.
+- The goal contract is the strongest local completion source. Low confidence pauses the loop, and project-total Done Gate cannot pass unless explicit contract gates have bound local evidence or are Human Gate decisions.
 - GPT Pro receives the compressed architecture brief on the first baseline or when its hash changes. Later rounds send only the hash and delta unless broader context is requested.
 - GPT Pro is optional by default. Local-only progress, local evidence, and local expert council planning happen without opening ChatGPT unless the next decision actually needs external review.
 - The local expert council runs as `reviewer=local-expert-council`: brainstorm first, post-evaluate later, then place candidate new goals into backlog.
@@ -105,6 +106,7 @@ Useful explicit actions:
 
 ```powershell
 & "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action RefreshProjectUnderstanding -Root "<project-root>"
+& "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action BuildGoalContract -Root "<project-root>"
 & "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action BuildGoalModel -Root "<project-root>"
 & "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action AnalyzeArchitecture -Root "<project-root>"
 & "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action BuildArchitectureBrief -Root "<project-root>" -ArchitectureBriefMaxChars 8000
@@ -144,6 +146,12 @@ Use larger handoffs only when needed:
 ```
 
 If GPT Pro says context is insufficient, regenerate only the compressed architecture brief with a larger limit such as `12000`; do not send raw project files or the full local ledger.
+
+If outer Codex has CodeGraph or architecture notes, keep them in a file and merge them into the deterministic snapshot:
+
+```powershell
+& "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action AnalyzeArchitecture -Root "<project-root>" -ArchitectureAnalysisMode deep -ArchitectureContextFile "<path-to-codegraph-summary.md>"
+```
 
 The script prints the ChatGPT target and prompt file. Send that prompt through Edge, then mark it sent:
 
@@ -195,12 +203,12 @@ When project-total blockers remain, build the local project goal plan and ask fo
 Run the local expert council after each progress update:
 
 ```powershell
-& "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action RecordProgress -Root "<project-root>" -ProgressArtifact "<path>"
+& "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action RecordProgress -Root "<project-root>" -ProgressArtifact "<path>" -RelatedGate "GATE-001" -RelatedBlockerId "PB-001" -RelatedSliceId "GS-001" -EvidenceType "verification_command"
 & "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action RunLocalCouncil -Root "<project-root>"
 & "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action PromoteGoal -Root "<project-root>"
 ```
 
-`RecordProgress` also triggers a periodic Codex efficiency audit in `standard` and `strict` modes, then the local council consumes the capability routes and audit status during post-evaluation.
+`RecordProgress` writes an `evidence/evidence.jsonl` record. When `-RelatedGate`, `-RelatedBlockerId`, or `-RelatedSliceId` is supplied, Done Gate can tie that artifact back to the goal contract instead of treating it as loose progress. It also triggers a periodic Codex efficiency audit in `standard` and `strict` modes, then the local council consumes the capability routes and audit status during post-evaluation.
 
 Record target Pro tab close after Pro has answered and the loop no longer needs that page:
 
@@ -230,8 +238,11 @@ docs/ai-review-loop/
   project-config.json
   review-state.json
   decisions.md
+  project-goal-contract.json
+  project-goal-contract.md
   project-goal-model.md
   project-architecture.md
+  project-architecture-map.json
   architecture-brief.md
   goal-slices.md
   dossiers/
@@ -324,6 +335,12 @@ Generated review-loop files are excluded from later code maps and sensitive scan
   "action_executor_status": null,
   "goal_backlog": [],
   "active_generated_goal_id": null,
+  "latest_goal_contract": "docs/ai-review-loop/project-goal-contract.json",
+  "goal_contract_hash": "...",
+  "goal_contract_confidence": "high",
+  "goal_contract_status": "active",
+  "goal_authority_sources": ["AGENTS.md"],
+  "latest_architecture_map": "docs/ai-review-loop/project-architecture-map.json",
   "pending_prompts": [],
   "pending_reviews": [],
   "captured_reviews": [],
@@ -399,10 +416,21 @@ The PowerShell script records the state only. The outer `edge-browser-control` f
 - `active_goal_scope` is `project_total`.
 - `terminal_goal_scope` is `project_total`.
 - The completion guard finds no project blockers such as `NOT_COMPLETE`, `NOT_READY`, failed gates, unfinished roadmap items, or verifier results saying the project is incomplete.
+- `goal_contract_confidence` is not `low`.
+- Explicit goal-contract gates have bound local evidence in `evidence/evidence.jsonl`, or are marked as Human Gate decisions.
+- `done_gate_verdict` is `DONE_GATE_PASS`.
 
 If a task, milestone, or test-line reaches `GOAL_ACHIEVED`, `NextDecision` records `subgoal_verdict: GOAL_ACHIEVED`, keeps `loop_status: running`, and sets `next_action: assess_parent_project_goal`. If a project-total completion claim conflicts with blocker evidence, `NextDecision` builds `project_blocker_queue`, writes `project-goal-plan.md`, and replaces the generic blocker action with a concrete `local_only_next_action` where possible.
 
 `-ForceCompleteProjectGoal` exists for explicit operator override, but it should not be used to bypass project acceptance gates or human gates.
+
+`BuildGoalContract` uses this source order: `AGENTS.md` and governance docs first, then roadmap/completion/gate docs, then acceptance/verifier docs, then README/spec, then supporting docs. If only a generic README heading exists, if there are conflicting total goals, or if no completion gate is found, the contract is low confidence and `NextDecision` pauses for human clarification instead of continuing toward a false completion.
+
+`RunDoneGate` checks the contract evidence table. A GPT Pro PASS, a screenshot, or a subgoal PASS is evidence only; it does not close a contract gate unless Codex records a related evidence entry such as:
+
+```powershell
+& "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action RecordProgress -Root "<project-root>" -ProgressArtifact "<path>" -RelatedGate "GATE-001" -EvidenceType "verification_command"
+```
 
 Blocker categories are:
 

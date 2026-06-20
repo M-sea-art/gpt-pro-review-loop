@@ -23,8 +23,11 @@ docs/ai-review-loop/
   evidence/
     evidence.jsonl
   project-goal-plan.md
+  project-goal-contract.json
+  project-goal-contract.md
   project-goal-model.md
   project-architecture.md
+  project-architecture-map.json
   architecture-brief.md
   goal-slices.md
   local-council.md
@@ -64,6 +67,7 @@ docs/ai-review-loop/
   "local_council_mode": "enabled",
   "local_council_policy": "brainstorm_then_post_evaluation",
   "goal_discovery_mode": "auto",
+  "goal_contract_policy": "authority_ordered_completion_contract",
   "architecture_analysis_mode": "standard",
   "architecture_brief_max_chars": 8000,
   "architecture_brief_policy": "first_baseline_or_architecture_hash_change",
@@ -144,8 +148,14 @@ docs/ai-review-loop/
 - `project_total_goal`: current inferred total project goal.
 - `goal_confidence`: `high`, `medium`, `low`, or `unknown`.
 - `goal_sources`: project files used to infer the total goal and completion boundaries.
+- `latest_goal_contract`: latest `project-goal-contract.json`.
+- `goal_contract_hash`: stable hash of the current goal contract.
+- `goal_contract_confidence`: `high`, `medium`, `low`, or `unknown`.
+- `goal_contract_status`: `active`, `needs_human_decision`, or `not_built`.
+- `goal_authority_sources`: authority-ordered project files used by the contract.
 - `latest_goal_model`: latest `project-goal-model.md`.
 - `latest_architecture_snapshot`: latest `project-architecture.md`.
+- `latest_architecture_map`: latest `project-architecture-map.json`.
 - `latest_architecture_brief`: latest compressed brief for GPT Pro.
 - `architecture_brief_hash`: hash of the latest compressed architecture brief.
 - `architecture_brief_sent_hash`: hash last sent to the configured ChatGPT conversation.
@@ -181,9 +191,10 @@ Review material files should use project-relative paths and avoid local absolute
 - `project-goal-plan.md`: compact local plan generated from `project_blocker_queue`.
 - `local-council.md`: pointer and summary for the latest local expert council meeting.
 - `goal-backlog.md`: Markdown rendering of candidate generated goals.
+- `project-goal-contract.json` / `project-goal-contract.md`: authority-ordered project total goal contract with completion gates, required evidence, Human Gate boundaries, confidence, and open questions.
 - `project-goal-model.md`: project total goal, confidence, sources, completion gates, and non-completion boundaries.
-- `project-architecture.md`: read-only architecture snapshot from CodeGraph-aware outer analysis or deterministic filesystem/config fallback.
-- `architecture-brief.md`: compressed Pro-readable architecture brief, normally 4k-8k characters.
+- `project-architecture.md` / `project-architecture-map.json`: read-only architecture snapshot from optional outer CodeGraph context or deterministic filesystem/config fallback.
+- `architecture-brief.md`: compressed Pro-readable goal-contract and architecture brief, normally 4k-8k characters.
 - `goal-slices.md`: small goal queue binding blockers to gates, evidence needs, capability routes, Human Gate status, and current progress.
 
 ## Project Understanding Layer
@@ -191,14 +202,16 @@ Review material files should use project-relative paths and avoid local absolute
 Each loop starts with `RefreshProjectUnderstanding`:
 
 ```text
-BuildGoalModel -> AnalyzeArchitecture -> BuildArchitectureBrief -> BuildGoalSlices
+BuildGoalModel -> BuildGoalContract -> AnalyzeArchitecture -> BuildArchitectureBrief -> BuildGoalSlices
 ```
 
 `BuildGoalModel` reads user/project governance files such as `AGENTS.md`, README, roadmap, acceptance docs, Human Gate docs, completion reports, and verifier output. If the total goal is missing or contradictory, the loop records low confidence and pauses for `NEEDS_HUMAN_DECISION`.
 
-`AnalyzeArchitecture` is read-only. The outer Codex agent should use CodeGraph for structural questions when it is available, but the PowerShell ledger uses a deterministic filesystem/config fallback so the action is portable.
+`BuildGoalContract` is the strongest local completion source. It applies this authority order: `AGENTS.md` and governance docs, roadmap/completion/gate docs, acceptance/verifier docs, README/spec, then supporting docs. If only a generic README heading exists, if the total goal conflicts, or if no explicit completion gate exists, contract confidence is low and terminal completion is blocked.
 
-`BuildArchitectureBrief` compresses the goal model and architecture snapshot for GPT Pro. The first baseline, forced baseline, or changed `architecture_brief_hash` includes the brief; unchanged rounds send only the hash. If GPT Pro asks for more context, regenerate with a larger bound such as `-ArchitectureBriefMaxChars 12000`; do not send raw project files.
+`AnalyzeArchitecture` is read-only. The outer Codex agent should use CodeGraph for structural questions when it is available, but the PowerShell ledger uses a deterministic filesystem/config fallback so the action is portable. If the outer agent has a CodeGraph summary, pass it through `-ArchitectureContextFile <path>`; the script records it in `project-architecture-map.json`.
+
+`BuildArchitectureBrief` compresses the goal contract, goal model, and architecture snapshot for GPT Pro. The first baseline, forced baseline, or changed `architecture_brief_hash` includes the brief; unchanged rounds send only the hash. If GPT Pro asks for more context, regenerate with a larger bound such as `-ArchitectureBriefMaxChars 12000`; do not send raw project files.
 
 `BuildGoalSlices` decomposes total-goal blockers into small slices. A slice can be closed without making `project_total` complete. Project completion still requires no unresolved slice blockers, project-total guard PASS, and Done Gate PASS.
 
@@ -298,7 +311,15 @@ Allowed executors are intentionally narrow: project understanding refresh, proje
 
 Any action mentioning push, publish, deploy, merge, delete, reset, credentials, permissions, Human Gate, protected scope, or explicit authorization is recorded as `paused_human_decision` and must not be executed automatically.
 
-Each executed action appends one JSON line to `evidence/evidence.jsonl` with an id, related action contract, related blocker, artifact paths, optional command, exit code, stdout hash, and excerpts. `latest_evidence_id` and `local_progress_artifacts` are updated so `NextDecision` can distinguish real progress from repeated empty loops.
+Each executed action appends one JSON line to `evidence/evidence.jsonl` with an id, related action contract, related blocker, related gate, related slice, artifact paths, optional command, exit code, stdout hash, and excerpts. `latest_evidence_id` and `local_progress_artifacts` are updated so `NextDecision` can distinguish real progress from repeated empty loops.
+
+`RecordProgress` can append bound evidence directly:
+
+```powershell
+& "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action RecordProgress -Root "<project-root>" -ProgressArtifact "<path>" -RelatedGate "GATE-001" -RelatedBlockerId "PB-001" -RelatedSliceId "GS-001" -EvidenceType "verification_command"
+```
+
+Done Gate requires explicit contract gates to have bound evidence records, unless the gate is a Human Gate. GPT Pro approval, screenshots, or a subgoal PASS are advisory evidence only until Codex records them against the relevant gate/slice/blocker.
 
 ## Pro Tab Close
 
@@ -313,6 +334,9 @@ Terminal completion requires:
 - `active_goal_scope: project_total`
 - `terminal_goal_scope: project_total`
 - no blocker evidence in the goal context
+- `goal_contract_confidence` is not `low`
+- explicit `project-goal-contract.json` gates have bound evidence or are Human Gate decisions
+- `done_gate_verdict: DONE_GATE_PASS`
 
 The goal context is a compact summary of files such as `AGENTS.md`, acceptance documents, human-gate notes, supervisor state, completion reports, roadmap files, and verifier output. If those sources contain `NOT_COMPLETE`, `NOT_READY`, failed gates, incomplete roadmap items, or equivalent blocker language, `NextDecision` must keep the loop running even if a review event says a local target is accepted.
 
