@@ -1,6 +1,6 @@
 # Autonomous Loop Goal Protocol
 
-This reference explains where a fully automatic loop goal belongs inside `gpt-pro-review-loop` and how to convert divergent candidate thinking into a bounded, evidence-producing Codex loop.
+This reference explains where a fully automatic loop goal belongs inside `gpt-pro-review-loop` and how to make Codex move faster in an explicitly isolated test line.
 
 Use this reference when the user explicitly asks for any of these patterns:
 
@@ -12,168 +12,145 @@ Use this reference when the user explicitly asks for any of these patterns:
 - keep cycling until a real blocker
 - do not wait for perfect assets or final architecture
 
-This protocol does **not** make Codex unbounded. It gives Codex a stronger local execution target while preserving the existing project-total guard, Human Gate, protected-operation pauses, and Done Gate.
+## Core Idea
+
+In a bold test line, Codex should not behave like it is preparing a formal release.
+
+It should behave like a prototype builder:
+
+```text
+pick the strongest usable candidate
+build the smallest visible slice
+capture evidence
+continue
+```
+
+The goal is not to prove the final project is complete. The goal is to create an isolated, visible, runnable candidate as fast as possible.
+
+## Only Three Hard Rails
+
+When the user has explicitly authorized a bold test line, keep only these hard rails:
+
+1. **Isolation rail**: stay in the declared test scope, branch, sandbox, or candidate path. Do not merge into formal release scope by yourself.
+2. **Irreversible-action rail**: pause for merge, publish, deploy, destructive deletion, reset, credentials, payment, permission changes, or explicit Human Gate.
+3. **Evidence rail**: leave enough proof to inspect the candidate: run path, command output, screenshot, report, asset ledger, diff summary, or failure artifact. Do not claim project-total completion unless project-total Done Gate passes.
+
+Everything else is a preference, not a blocker.
+
+If the action is reversible, isolated, and evidence-producing, prefer doing it over discussing it.
 
 ## Placement In The Skill Chain
 
-The autonomous loop goal should sit between the local expert council and the action/evidence layer:
+The autonomous loop goal sits between local brainstorming and evidence capture:
 
 ```text
 Project Understanding
 -> Capability Scan
 -> Local Expert Council Brainstorm
--> Candidate-First Rule Gate
+-> Bold Candidate Pick
 -> Goal Backlog / Goal Slices
--> NextLocalAction / Action Contract
 -> Outer Codex local implementation
 -> RecordProgress / Evidence
 -> NextDecision
 -> DoneGate / FinalClosure
 ```
 
-Do **not** place it directly inside GPT Pro review, browser automation, or final closure. GPT Pro can review candidate evidence, but it must not become the executor or final judge.
+Do **not** put this inside GPT Pro review, browser automation, or final closure. GPT Pro can review the candidate, but it is not the executor.
 
 ## Why This Position Works
 
-`Local Expert Council` is already the skill's divergent-thinking module: it records brainstorm ideas first and evaluates later. The missing link for fully automatic loops is not more brainstorming. The missing link is a rule gate that turns divergent ideas into one bold but bounded local candidate.
+`Local Expert Council` is already the divergent-thinking module. It generates possibilities.
 
-`Action Contract` and `Evidence` are already the proof layer. They are deliberately conservative and should not become an unrestricted business-code executor. The outer Codex agent may implement the selected local candidate in the project, then use `RecordProgress` to bind proof back to gates, blockers, or slices.
+The missing link for automatic loops is not more process. The missing link is permission to pick one strong candidate and build.
 
-`NextDecision` is already the continuation engine. A running loop with `continuation_required=true` must not be treated as a final answer.
+`RecordProgress`, `Evidence`, and `NextDecision` already provide the proof and continuation system. Use them after the work, not as excuses to delay the work.
 
-## Candidate-First Rule Gate
+## Bold Candidate Pick
 
-When this protocol is active, the local council's brainstorm output must be filtered through these labels:
+When this protocol is active, do not require a heavy candidate table unless the project is genuinely ambiguous.
 
-| Label | Meaning | Loop behavior |
-|---|---|---|
-| `CANDIDATE` | Usable now, not final | May be promoted into `goal_backlog` or a goal slice |
-| `PLACEHOLDER` | Temporary substitute | Allowed only with a replacement note and evidence gap |
-| `RISK` | Usable but tracked | May proceed if reversible and documented |
-| `BLOCKER` | Prevents local execution | Must become a blocker queue item or Human Gate |
-| `VERIFIED` | Tested with evidence | Can support Done Gate only when bound to a contract gate |
-| `REJECTED` | Tried and failed | Keep reason and next fallback |
-
-The gate selects the **boldest safe candidate** that satisfies all of these conditions:
-
-1. It stays inside the current declared scope, such as `test_line`, `task`, or `milestone`.
-2. It does not claim project-total completion.
-3. It is reversible or isolated.
-4. It can produce visible, runnable, or testable evidence.
-5. It can be recorded as a progress artifact.
-6. It does not require push, publish, deploy, merge, deletion, reset, credentials, payment, permission changes, or a Human Gate.
-7. It has a fallback action if the preferred route fails.
-
-If multiple candidates pass, choose the one with the highest demo/proof value, not the one with the cleanest architecture.
-
-## Module Responsibility Table
-
-| Module | Responsibility for autonomous loop goals |
-|---|---|
-| `Project Understanding` | Extract the user goal, scope, authority sources, explicit completion gates, and protected boundaries. |
-| `Capability Scan` | Recommend available tool/skill/plugin routes; do not install, expose, or authorize them. |
-| `Local Expert Council` | Generate many candidate moves without early judgment. |
-| `Candidate-First Rule Gate` | Convert ideas into `CANDIDATE`, `PLACEHOLDER`, `RISK`, `BLOCKER`, `VERIFIED`, or `REJECTED`. |
-| `Goal Backlog` | Store candidate goals without silently expanding scope. |
-| `Goal Slices` | Break the promoted candidate into the smallest evidence-producing slice. |
-| `NextLocalAction` | Select the next concrete local action from blocker/slice state. |
-| `Action Contract` | Record expected artifacts, safety status, allowed operations, forbidden operations, and evidence target. |
-| `Outer Codex local implementation` | Apply safe project changes inside the declared test line or local scope. |
-| `RecordProgress` | Bind artifacts, screenshots, commands, reports, or ledger evidence to a gate/blocker/slice. |
-| `NextDecision` | Continue, ask for evidence, pivot, pause, or escalate based on evidence and gates. |
-| `DoneGate` | Prevent false project-total completion. |
-
-## Autonomous Loop Target Contract
-
-A user can activate this mode with a goal contract like this:
+Use this lightweight decision:
 
 ```text
-Use autonomous loop goal mode.
-Scope: test_line.
-Priority: bold candidate first.
-Boundary: do not merge, publish, deploy, delete protected assets, or claim project_total complete.
-Target: produce the smallest runnable/visible/playable candidate with evidence.
-Evidence required: run command, screenshot or output artifact, asset/report ledger, known failures, next minimal action.
-Verdict vocabulary: CANDIDATE_PASS, CANDIDATE_PARTIAL, CANDIDATE_BLOCKED, CANDIDATE_REJECTED.
-Continue automatically while NextDecision is CONTINUE, NEEDS_EVIDENCE, or NEEDS_PROCESS_FIX.
-Pause only for NEEDS_HUMAN_DECISION, BLOCKED, protected operations, missing credentials/login/CAPTCHA/payment, or explicit user stop.
+Best usable candidate:
+- what will be built now
+- why it is usable now
+- what evidence it should produce
+- fallback if it fails
 ```
 
-This contract should be treated as a scoped goal, not as a project-total completion source.
+Pick the candidate with the highest demo/proof value.
 
-## Loop Execution Rule
+Prefer:
+
+- visible over abstract
+- playable over architecturally pure
+- real asset over placeholder
+- placeholder over stopping
+- screenshot over explanation
+- runnable path over long report
+- next slice over perfect plan
+
+## Fast Loop
 
 Inside an explicitly authorized autonomous loop:
 
 ```text
-If NextDecision says CONTINUE:
-  execute the selected local action or next candidate slice.
-
-If NextDecision says NEEDS_EVIDENCE:
-  collect local proof, RecordProgress, then continue.
-
-If NextDecision says NEEDS_PROCESS_FIX:
-  fix the process bottleneck, regenerate the action contract/evidence, then continue.
-
-If NextDecision says GOAL_ACHIEVED for task/milestone/test_line:
-  record subgoal achievement and assess the parent/project goal; do not stop as project_total.
-
-If NextDecision says NEEDS_HUMAN_DECISION or BLOCKED:
-  pause with exact blocker, attempted actions, missing evidence, and smallest unblock step.
+1. Pick a bold candidate.
+2. Build the smallest visible/runnable slice.
+3. Capture evidence.
+4. Record progress.
+5. Ask NextDecision.
+6. Continue unless there is a real pause condition.
 ```
 
-The operator must not stop merely because one round produced a report, a local council file, or a subgoal PASS.
+Real pause conditions:
 
-## Evidence Requirements
+- `NEEDS_HUMAN_DECISION`
+- `BLOCKED`
+- merge / publish / deploy
+- destructive deletion or reset
+- credential, payment, permission, login, CAPTCHA
+- explicit user stop
 
-Every autonomous loop iteration must try to produce at least one of these:
+Do **not** stop just because one report was written, one council file exists, one screenshot exists, or a scoped test-line candidate passes.
 
-- command output
-- smoke test result
-- screenshot/contact sheet path
-- local build/export path
-- changed-file summary
+## Minimal Evidence
+
+One strong proof is enough for an iteration.
+
+Examples:
+
+- a working local/Web run path
+- a screenshot/contact sheet
+- smoke test output
+- build/export output
 - asset ledger
-- generated report
-- action contract
-- evidence JSONL entry
-- explicit failure artifact
+- changed-file summary
+- failure artifact with fallback
 
-The preferred proof chain is:
+Preferred proof chain:
 
 ```text
-candidate decision
+candidate picked
 -> local implementation
--> screenshot/command/build artifact
--> RecordProgress with RelatedGate/RelatedBlockerId/RelatedSliceId when possible
+-> screenshot / command / build artifact
+-> RecordProgress when useful
 -> NextDecision
 ```
 
-Evidence that is not bound to a gate, blocker, or slice is still useful but weaker.
+Evidence should be useful, not ceremonial.
 
-## Forbidden Shortcuts
+## Candidate Verdicts
 
-Autonomous loop goals must not:
-
-- declare `COMPLETE`, `DONE`, `RELEASE READY`, or `PROJECT COMPLETE` unless project-total Done Gate passes.
-- treat GPT Pro approval as direct completion.
-- treat screenshots alone as project-total completion.
-- bypass Human Gate or explicit authorization.
-- convert capability recommendations into assumed callable tools.
-- keep sending GPT prompts when `should_send_to_gpt=false`.
-- stop after ordinary `CONTINUE`, `NEEDS_EVIDENCE`, or `NEEDS_PROCESS_FIX`.
-- spin on the same action without new evidence.
-
-## Recommended Verdicts
-
-For scoped autonomous loop candidates, use only:
+For scoped autonomous loop candidates, use:
 
 - `CANDIDATE_PASS`
 - `CANDIDATE_PARTIAL`
 - `CANDIDATE_BLOCKED`
 - `CANDIDATE_REJECTED`
 
-Map them into the existing local practice verdicts like this:
+Mapping:
 
 | Candidate verdict | Existing loop verdict |
 |---|---|
@@ -182,47 +159,63 @@ Map them into the existing local practice verdicts like this:
 | `CANDIDATE_BLOCKED` | `BLOCKED` or `NEEDS_HUMAN_DECISION` depending on blocker type |
 | `CANDIDATE_REJECTED` | `NEEDS_PROCESS_FIX` with fallback candidate |
 
-Do not add new project-total completion semantics for these candidate verdicts.
+Do not add new project-total completion semantics for candidate verdicts.
 
 ## Builder B Style Application
 
-For a game/visual prototype such as a Builder B test line, the autonomous loop target belongs in this chain:
+For a game/visual prototype such as a Builder B test line, use this chain:
 
 ```text
 GoalScope=test_line
 -> Capability Scan: game/playtest/browser/visual routes
 -> Local Council: generate asset/interface/playtest candidates
--> Candidate-First Rule Gate: select bold safe visual slice
--> Goal Backlog: store candidate route and fallback
+-> Bold Candidate Pick: choose the most visible safe slice
 -> Outer Codex: implement isolated test-line changes
 -> Evidence: Web/local run path, screenshots, asset ledger, build/test report
 -> NextDecision: continue until candidate pass/partial/blocker
 -> DoneGate: prevent project_total completion claim
 ```
 
-The correct final statement is a candidate verdict such as `BUILDER_B_CANDIDATE_PARTIAL`, not project completion.
+Builder B should optimize for visible playable progress:
+
+- homepage with real background beats perfect menu architecture
+- one moving character beats ten planned character systems
+- one battle screen mock with real assets beats a design essay
+- one exported Web path beats a theoretical build plan
+- one clear screenshot sequence beats a long explanation
+
+Correct final statements are candidate statements such as:
+
+```text
+BUILDER_B_CANDIDATE_PASS
+BUILDER_B_CANDIDATE_PARTIAL
+BUILDER_B_CANDIDATE_BLOCKED
+```
+
+Not:
+
+```text
+PROJECT COMPLETE
+RELEASE READY
+DONE
+```
 
 ## Minimal Report Shape
 
-Autonomous loop reports should include:
+For bold test mode, keep the report short:
 
 ```text
 - scope
-- selected candidate
-- rejected candidates
-- candidate gate result
-- exact local action performed
-- changed files or generated artifacts
-- run command / link / path
-- screenshots or output evidence
-- related gate/blocker/slice binding
-- failure and fallback
-- next narrow target
-- non-completion statement for project_total
+- built candidate
+- run path / command
+- evidence paths
+- what failed
+- next bold target
+- project_total not claimed
 ```
 
 ## Maintenance Notes
 
-This protocol is intentionally documentation-first. The PowerShell action executor remains conservative. It records ledger, plan, council, and evidence artifacts; it does not become a general-purpose project-code writer.
+This protocol is documentation-first. The PowerShell action executor remains conservative by design. The outer Codex agent performs safe local implementation in the declared test scope, then binds evidence back through `RecordProgress` and `NextDecision`.
 
-Future implementation work can add a dedicated `CandidateGate` action, but it should still write ledger artifacts first and keep business-code edits in the outer Codex execution layer.
+A future `CandidateGate` action should stay lightweight. It should not become a bureaucracy layer. Its purpose is to pick and move.
