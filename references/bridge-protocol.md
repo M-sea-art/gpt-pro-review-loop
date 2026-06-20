@@ -19,6 +19,9 @@ docs/ai-review-loop/
   assessments/
   loop-runs/
   security-scans/
+  action-contracts/
+  evidence/
+    evidence.jsonl
   project-goal-plan.md
   project-goal-model.md
   project-architecture.md
@@ -149,6 +152,12 @@ docs/ai-review-loop/
 - `latest_goal_slices`: latest `goal-slices.md`.
 - `current_goal_slice_id`: selected small goal slice for local progress.
 - `goal_slice_status`: `open`, `no_open_slices`, `human_or_future_only`, or `not_built`.
+- `latest_action_contract`: latest structured local action contract under `action-contracts/`.
+- `latest_evidence`: latest local evidence artifact path.
+- `latest_evidence_id`: latest appended record id in `evidence/evidence.jsonl`.
+- `action_executor_status`: `contract_created`, `executed`, `paused_human_decision`, or null.
+- `action_contracts`: generated action contract paths.
+- `evidence_records`: appended evidence ids.
 
 ## URL Confirmation
 
@@ -167,6 +176,8 @@ Review material files should use project-relative paths and avoid local absolute
 - `reviews/`: all external and internal review events. GPT Pro initial review, GPT Pro recheck, Codex efficiency process audit, and Codex efficiency goal audit all live here.
 - `assessments/`: local-practice and combined-next-decision assessments.
 - `loop-runs/`: small JSON records emitted by `NextDecision` and `runtime-brief.json` snapshots for low-quota reuse.
+- `action-contracts/`: structured contracts generated from `local_only_next_action` before local execution.
+- `evidence/`: local proof artifacts and `evidence.jsonl` records produced by safe ledger actions.
 - `project-goal-plan.md`: compact local plan generated from `project_blocker_queue`.
 - `local-council.md`: pointer and summary for the latest local expert council meeting.
 - `goal-backlog.md`: Markdown rendering of candidate generated goals.
@@ -263,6 +274,31 @@ When capability scan data exists, post-evaluation adds `recommended_capability_r
 - `RunFinalClosure` records final closure after project-total guard and Done Gate pass.
 
 These events are ledger writes, so their report text uses `Audit mutation status: LEDGER_ONLY_REVIEW_EVENT`.
+
+## Action Contracts And Evidence
+
+`NextDecision` chooses a `local_only_next_action`; `ExecuteNextLocalAction` turns it into a durable contract before doing any local work. The contract records:
+
+```json
+{
+  "id": "A-...",
+  "source_blocker_id": "PB-001",
+  "action_kind": "collect_evidence",
+  "recommended_next_action": "collect_evidence_for_demo_readiness_not_ready",
+  "executor": "local-evidence-ledger",
+  "safety_status": "allowed",
+  "allowed_operations": ["read", "write_ledger", "write_report"],
+  "forbidden_operations": ["push", "publish", "deploy", "merge", "delete", "reset", "credential", "permission_change"],
+  "expected_artifacts": ["docs/ai-review-loop/evidence/A-...md"],
+  "done_condition": "expected_artifacts_exist_and_evidence_record_written"
+}
+```
+
+Allowed executors are intentionally narrow: project understanding refresh, project goal plan rebuild, local council refresh, external review handoff ledger, and local evidence snapshot. Business-code implementation is still done by the outer Codex agent under normal project rules; the executor only closes the loop between a decision and local ledger evidence.
+
+Any action mentioning push, publish, deploy, merge, delete, reset, credentials, permissions, Human Gate, protected scope, or explicit authorization is recorded as `paused_human_decision` and must not be executed automatically.
+
+Each executed action appends one JSON line to `evidence/evidence.jsonl` with an id, related action contract, related blocker, artifact paths, optional command, exit code, stdout hash, and excerpts. `latest_evidence_id` and `local_progress_artifacts` are updated so `NextDecision` can distinguish real progress from repeated empty loops.
 
 ## Pro Tab Close
 

@@ -21,6 +21,7 @@ review package -> external/internal review -> local assessment -> next decision
 - Each loop run stores a compact `runtime-brief.json` so Codex can reuse target URL, prompt path, evidence hash, browser route status, and latest state without repeatedly rereading large files.
 - Completion is guarded at the project-total level. A task, milestone, or test-line can be accepted without stopping the continuous loop.
 - Project blockers are normalized into a queue so a running loop gets a concrete local next action instead of stopping at a generic blocker label.
+- Local-only next actions can be converted into action contracts and evidence records. The built-in executor is deliberately conservative: it writes ledger, plan, understanding, council, and evidence artifacts only; high-risk actions pause for a human decision.
 - Before review, the loop builds a project understanding layer: a project goal model, an architecture snapshot, a compressed architecture brief, and a goal-slice queue.
 - GPT Pro receives the compressed architecture brief on the first baseline or when its hash changes. Later rounds send only the hash and delta unless broader context is requested.
 - GPT Pro is optional by default. Local-only progress, local evidence, and local expert council planning happen without opening ChatGPT unless the next decision actually needs external review.
@@ -54,6 +55,7 @@ Restart the Codex session if the skill metadata is not visible immediately.
 - Existing Edge login state for ChatGPT when GPT Pro is used.
 - `edge-browser-control` skill for browser submission, reply capture, and target tab close. This is a skill/instruction set that uses the official Codex Edge/Chrome extension backend; it may not appear as a same-named callable tool.
 - `codex-efficiency-auditor` skill for capability scan, periodic audit, stall/pivot checks, Done Gate, and final closure. The loop reuses its `scripts/audit_codex_capabilities.py`; it does not duplicate capability inventory logic.
+- Public CI or isolated tests can inject a deterministic capability scanner with `-EfficiencyAuditorScript <path>` or `GPT_PRO_REVIEW_LOOP_AUDITOR_SCRIPT=<path>`.
 
 ## Quick Start
 
@@ -185,7 +187,10 @@ When project-total blockers remain, build the local project goal plan and ask fo
 ```powershell
 & "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action BuildProjectGoalPlan -Root "<project-root>"
 & "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action NextLocalAction -Root "<project-root>"
+& "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action ExecuteNextLocalAction -Root "<project-root>"
 ```
+
+`ExecuteNextLocalAction` writes `action-contracts/*.json` first, then executes only safe local ledger actions such as refreshing project understanding, rebuilding the project goal plan, running the local council, or recording evidence. If the action mentions push, publish, deploy, merge, delete, reset, credentials, permissions, Human Gate, or protected authorization, it pauses with `NEEDS_HUMAN_DECISION`.
 
 Run the local expert council after each progress update:
 
@@ -313,6 +318,10 @@ Generated review-loop files are excluded from later code maps and sensitive scan
   "local_council_mode": "enabled",
   "latest_local_council_review": null,
   "progress_artifacts": [],
+  "latest_action_contract": null,
+  "latest_evidence": null,
+  "latest_evidence_id": null,
+  "action_executor_status": null,
   "goal_backlog": [],
   "active_generated_goal_id": null,
   "pending_prompts": [],
@@ -352,6 +361,26 @@ The council updates `local-council.md` and `goal-backlog.md`. Generated goals st
 - Terminal completion writes a final closure review with `final_closure_verdict`.
 
 The audit events are ledger writes, so their files say `Audit mutation status: LEDGER_ONLY_REVIEW_EVENT`. They are still supervision evidence and should be assessed alongside GPT Pro, local council, tests, and project gates.
+
+## Action Contracts And Evidence
+
+`NextDecision` chooses what should happen next. `ExecuteNextLocalAction` turns that choice into a local action contract:
+
+```json
+{
+  "id": "A-20260620-010203-000",
+  "source_blocker_id": "PB-001",
+  "action_kind": "collect_evidence",
+  "recommended_next_action": "collect_evidence_for_demo_readiness_not_ready",
+  "executor": "local-evidence-ledger",
+  "safety_status": "allowed",
+  "allowed_operations": ["read", "write_ledger", "write_report"],
+  "forbidden_operations": ["push", "publish", "deploy", "merge", "delete", "reset", "credential", "permission_change"],
+  "expected_artifacts": ["docs/ai-review-loop/evidence/A-...md"]
+}
+```
+
+Each executed action appends a JSON line to `docs/ai-review-loop/evidence/evidence.jsonl` and updates `latest_evidence_id`. This is intentionally narrower than a general task runner: it closes the loop between decision and proof without taking over business-code implementation.
 
 ## Auto Close Pro Tab
 

@@ -29,7 +29,8 @@ jobs:
       - name: Run Pester
         shell: pwsh
         run: |
-          Install-Module Pester -Force -Scope CurrentUser
+          $env:GPT_PRO_REVIEW_LOOP_AUDITOR_SCRIPT = (Resolve-Path "tests/fixtures/fake_audit_codex_capabilities.py").Path
+          Install-Module Pester -RequiredVersion 5.7.1 -Force -Scope CurrentUser
           Import-Module Pester -MinimumVersion 5.0 -Force
           Invoke-Pester -CI
 

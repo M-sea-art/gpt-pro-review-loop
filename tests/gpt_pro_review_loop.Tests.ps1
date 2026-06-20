@@ -1,6 +1,8 @@
 BeforeAll {
   $script:Root = Resolve-Path (Join-Path $PSScriptRoot "..")
   $script:Skill = Join-Path $script:Root "scripts/gpt_pro_review_loop.ps1"
+  $script:PreviousAuditorScript = $env:GPT_PRO_REVIEW_LOOP_AUDITOR_SCRIPT
+  $env:GPT_PRO_REVIEW_LOOP_AUDITOR_SCRIPT = Join-Path $script:Root "tests/fixtures/fake_audit_codex_capabilities.py"
 
   function New-TestProject {
     param([string]$Name = "project")
@@ -20,6 +22,14 @@ BeforeAll {
   function Read-Config {
     param([string]$ProjectRoot)
     Get-Content -Raw -LiteralPath (Join-Path $ProjectRoot "docs/ai-review-loop/project-config.json") | ConvertFrom-Json
+  }
+}
+
+AfterAll {
+  if ($null -eq $script:PreviousAuditorScript) {
+    Remove-Item Env:\GPT_PRO_REVIEW_LOOP_AUDITOR_SCRIPT -ErrorAction SilentlyContinue
+  } else {
+    $env:GPT_PRO_REVIEW_LOOP_AUDITOR_SCRIPT = $script:PreviousAuditorScript
   }
 }
 
@@ -57,6 +67,10 @@ Describe "gpt-pro-review-loop state machine" {
     $state.PSObject.Properties.Name | Should -Contain "project_blocker_queue"
     $state.PSObject.Properties.Name | Should -Contain "current_blocker_id"
     $state.PSObject.Properties.Name | Should -Contain "stalled_local_action_count"
+    $state.PSObject.Properties.Name | Should -Contain "latest_action_contract"
+    $state.PSObject.Properties.Name | Should -Contain "latest_evidence"
+    $state.PSObject.Properties.Name | Should -Contain "latest_evidence_id"
+    $state.PSObject.Properties.Name | Should -Contain "action_executor_status"
     $state.PSObject.Properties.Name | Should -Contain "latest_capability_scan"
     $state.PSObject.Properties.Name | Should -Contain "latest_efficiency_audit"
     $state.PSObject.Properties.Name | Should -Contain "latest_done_gate"
@@ -94,6 +108,8 @@ Describe "gpt-pro-review-loop state machine" {
     @($state.project_blocker_queue).Count | Should -Be 0
     $state.current_blocker_id | Should -Be $null
     $state.stalled_local_action_count | Should -Be 0
+    @($state.action_contracts).Count | Should -Be 0
+    @($state.evidence_records).Count | Should -Be 0
 
     $statusText = (& $script:Skill -Action Status -Root $project | Out-String)
     $statusText | Should -Match "target_chatgpt_url"
@@ -234,6 +250,25 @@ Describe "gpt-pro-review-loop state machine" {
     $state.baseline_sent_hash | Should -Be $state.baseline_hash
     $state.latest_prompt_target_url | Should -Be "https://chatgpt.com/g/test-project"
     $state.latest_prompt_opened_tab_url | Should -Be "https://chatgpt.com/g/test-project/c/abc123"
+  }
+
+  It "keeps baseline hash stable when project content is unchanged" {
+    $project = New-TestProject "stable-baseline"
+    & $script:Skill -Action Init -Root $project -TargetChatGptUrl "https://chatgpt.com/g/test-project"
+    & $script:Skill -Action Prepare -Root $project
+    & $script:Skill -Action SendPrompt -Root $project -Send
+    $sentState = Read-State $project
+    $sentHash = $sentState.baseline_sent_hash
+
+    Start-Sleep -Milliseconds 1100
+    & $script:Skill -Action Prepare -Root $project
+
+    $state = Read-State $project
+    $state.baseline_hash | Should -Be $sentHash
+    $promptPath = Join-Path $project ($state.latest_prompt -replace "/", "\")
+    $prompt = Get-Content -Raw -LiteralPath $promptPath
+    $prompt | Should -Match "Baseline already sent"
+    $prompt | Should -Match "baseline code map already sent"
   }
 
   It "adds GPT courtesy footer only after the first external send" {
@@ -603,6 +638,46 @@ Human Gate: manual visual signoff required
     $state.local_only_next_action | Should -Be "collect_evidence_for_demo_readiness_not_ready"
     $state.should_send_to_gpt | Should -BeFalse
     $state.send_reason | Should -Be "local_only_continue"
+  }
+
+  It "executes a safe local action by writing an action contract and evidence record" {
+    $project = New-TestProject "execute-local-action"
+    New-Item -ItemType Directory -Path (Join-Path $project "docs/project") -Force | Out-Null
+    Set-Content -LiteralPath (Join-Path $project "docs/project/FPV0_COMPLETION_ROADMAP.md") -Encoding UTF8 -Value 'Demo readiness: `NOT_READY`'
+    & $script:Skill -Action Init -Root $project -TargetChatGptUrl "https://chatgpt.com/g/test-project"
+    & $script:Skill -Action BuildProjectGoalPlan -Root $project
+    & $script:Skill -Action NextLocalAction -Root $project
+    & $script:Skill -Action ExecuteNextLocalAction -Root $project
+
+    $state = Read-State $project
+    $state.action_executor_status | Should -Be "executed"
+    $state.latest_action_contract | Should -Match "^docs/ai-review-loop/action-contracts/"
+    $state.latest_evidence | Should -Match "^docs/ai-review-loop/evidence/"
+    $state.latest_evidence_id | Should -Match "^EV-"
+    Test-Path -LiteralPath (Join-Path $project ($state.latest_action_contract -replace "/", "\")) | Should -BeTrue
+    Test-Path -LiteralPath (Join-Path $project ($state.latest_evidence -replace "/", "\")) | Should -BeTrue
+    Test-Path -LiteralPath (Join-Path $project "docs/ai-review-loop/evidence/evidence.jsonl") | Should -BeTrue
+    @($state.local_progress_artifacts | Where-Object { $_ -eq $state.latest_evidence }).Count | Should -Be 1
+    $state.continuation_required | Should -BeTrue
+    $state.send_reason | Should -Be "local_action_executed"
+  }
+
+  It "pauses a local action contract that requires explicit human authorization" {
+    $project = New-TestProject "execute-human-action"
+    & $script:Skill -Action Init -Root $project -TargetChatGptUrl "https://chatgpt.com/g/test-project"
+    & $script:Skill -Action Prepare -Root $project
+    & $script:Skill -Action CaptureReview -Root $project -Reviewer codex-efficiency-auditor -Phase goal-audit -ReviewText "continue"
+    & $script:Skill -Action AssessFeedback -Root $project -GoalVerdict CONTINUE -NextAction "push_release_to_github"
+    & $script:Skill -Action NextDecision -Root $project
+    & $script:Skill -Action ExecuteNextLocalAction -Root $project
+
+    $state = Read-State $project
+    $state.loop_status | Should -Be "paused"
+    $state.goal_verdict | Should -Be "NEEDS_HUMAN_DECISION"
+    $state.action_executor_status | Should -Be "paused_human_decision"
+    $state.stop_reason | Should -Be "action_requires_human_decision"
+    $state.latest_action_contract | Should -Match "^docs/ai-review-loop/action-contracts/"
+    @($state.evidence_records).Count | Should -Be 0
   }
 
   It "pauses when only human or explicit authorization blockers remain" {

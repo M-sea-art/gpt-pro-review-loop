@@ -21,6 +21,8 @@ Default terminal goal scope is `project_total`. A task, milestone, or test-line 
 
 When project-total blockers remain, the skill normalizes them into a queue and chooses a concrete `local_only_next_action`. `should_send_to_gpt=false` means execute that local action; it is not a completion signal.
 
+v1.8 adds a conservative action/evidence layer. `ExecuteNextLocalAction` first writes an action contract, then performs only safe ledger actions such as refreshing project understanding, rebuilding the goal plan, running the local council, or recording local evidence. It must pause for push, publish, deploy, merge, delete, reset, credentials, permission changes, Human Gate, protected scope, or explicit authorization.
+
 Every continuous loop can also run a local expert council review. The council is a brainstorming meeting, not a risk-only audit: it records unjudged ideas first, then performs post-evaluation and writes candidate new goals into a backlog without expanding implementation scope.
 
 Codex efficiency audit is the loop's process supervisor. It is not just another advisory reviewer: it provides read-only capability scan input, periodic audit, stall/pivot status, Done Gate, and final closure checks. The loop stores those events in the same `reviews/` stream, but `NextDecision` treats Done Gate and stall/pivot fields as control evidence.
@@ -82,6 +84,8 @@ GPT Pro, Codex efficiency review, and the local expert council are `reviewer` va
    - `light`: capability scan and Done Gate only.
    - `standard`: capability scan, periodic audit after progress, Done Gate, final closure.
    - `strict`: also run preflight/process checks around repeated failure, subgoal/project completion, and Human Gate boundaries.
+
+   For CI or isolated tests where the real auditor skill is not installed, pass `-EfficiencyAuditorScript <path>` or set `GPT_PRO_REVIEW_LOOP_AUDITOR_SCRIPT`. Normal local use defaults to the installed `codex-efficiency-auditor/scripts/audit_codex_capabilities.py`.
 
    Project understanding controls:
 
@@ -209,9 +213,10 @@ GPT Pro, Codex efficiency review, and the local expert council are `reviewer` va
    ```powershell
    & "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action BuildProjectGoalPlan -Root "<project-root>"
    & "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action NextLocalAction -Root "<project-root>"
+   & "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action ExecuteNextLocalAction -Root "<project-root>"
    ```
 
-   Execute `local_only_next_action` before sending GPT another prompt. If only Human Gate, protected scope, or explicit authorization blockers remain, pause for the user.
+   Execute `local_only_next_action` before sending GPT another prompt. `ExecuteNextLocalAction` writes `action-contracts/*.json`, then records evidence in `evidence/evidence.jsonl` for safe ledger actions. If only Human Gate, protected scope, or explicit authorization blockers remain, or if the action itself is high-risk, pause for the user.
 
    In default efficiency mode, `GOAL_ACHIEVED` is still not enough for project-total completion. `NextDecision` must first have `done_gate_verdict=DONE_GATE_PASS`; otherwise it keeps the loop running or pauses for the relevant human decision.
 
