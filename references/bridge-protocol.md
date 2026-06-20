@@ -68,6 +68,8 @@ docs/ai-review-loop/
   "local_council_policy": "brainstorm_then_post_evaluation",
   "goal_discovery_mode": "auto",
   "goal_contract_policy": "authority_ordered_completion_contract",
+  "experience_collection_policy": "auto_record_key_loop_learning_events",
+  "experience_publication_policy": "project_local_private_by_default",
   "architecture_analysis_mode": "standard",
   "architecture_brief_max_chars": 8000,
   "architecture_brief_policy": "first_baseline_or_architecture_hash_change",
@@ -153,6 +155,10 @@ docs/ai-review-loop/
 - `goal_contract_confidence`: `high`, `medium`, `low`, or `unknown`.
 - `goal_contract_status`: `active`, `needs_human_decision`, or `not_built`.
 - `goal_authority_sources`: authority-ordered project files used by the contract.
+- `experience_collection_policy`: usually `auto_record_key_loop_learning_events`; set to `off` only when the project should not write automatic local lessons.
+- `latest_experience_record`: usually `docs/ai-review-loop/experience-log.md` after the first automatic or manual experience entry.
+- `latest_auto_experience_key`: dedupe key for the latest automatic experience entry.
+- `auto_experience_count`: count of automatic project-local lessons appended by the loop.
 - `latest_goal_model`: latest `project-goal-model.md`.
 - `latest_architecture_snapshot`: latest `project-architecture.md`.
 - `latest_architecture_map`: latest `project-architecture-map.json`.

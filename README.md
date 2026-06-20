@@ -66,7 +66,7 @@ Initialize a project once:
 & "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action Init -Root "<project-root>" -TargetChatGptUrl "https://chatgpt.com/..."
 ```
 
-For a new project using GPT Pro, this is the one-time URL confirmation gate. If `pro_review_mode` is `optional` or `required` and the project has no ChatGPT target URL, `Prepare`, `Run`, `RunLoop`, `SendPrompt`, and `SendAssessment` stop and require the operator to ask the user once for the target ChatGPT project or conversation URL. After `Init -TargetChatGptUrl` records it, later iterations reuse the project-local URL without asking again unless it changes or becomes invalid. `pro_review_mode=disabled` does not require a ChatGPT URL.
+For a new project using GPT Pro, this is the one-time URL confirmation gate. If `pro_review_mode=required` and the project has no ChatGPT target URL, external review actions stop and require the operator to ask the user once for the target ChatGPT project or conversation URL. If `pro_review_mode=optional`, `Prepare`, `SendPrompt`, and `SendAssessment` still require a URL, but `Run` and `RunLoop` degrade to a local review loop with `send_reason=pro_url_missing_local_loop` instead of ending the session or pretending GPT Pro reviewed it. `Status` also prints `status_guidance=optional_pro_url_missing_continue_local_loop` and a `RunLoop` command so outer Codex agents do not mistake a missing optional Pro URL for a stopping condition. After `Init -TargetChatGptUrl` records a URL, later iterations reuse the project-local URL without asking again unless it changes or becomes invalid. `pro_review_mode=disabled` does not require a ChatGPT URL.
 
 Choose Pro behavior:
 
@@ -87,7 +87,16 @@ Start a continuous loop after explicit authorization:
 & "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action RunLoop -Root "<project-root>" -PreflightBrowser
 ```
 
-`RunLoop` marks the start of the outer Codex loop. In `optional` mode it is local-first: if the current next action does not require GPT Pro, it records a runtime brief and runs the local expert council instead of generating an empty GPT handoff. `-PreflightBrowser` records the intended Edge/Chrome extension route once for this iteration only when a Pro handoff is needed. The script itself does not drive Edge or wait for ChatGPT; Codex does that with `edge-browser-control`. Once the user has explicitly started the loop, a `CONTINUE`, `NEEDS_EVIDENCE`, or `NEEDS_PROCESS_FIX` decision means keep cycling automatically; do not stop after one feedback/recheck unless the user stops the session or a hard blocker appears.
+`RunLoop` marks the start of the outer Codex loop. In `optional` mode it is local-first: if the current next action does not require GPT Pro, it records a runtime brief and runs the local expert council instead of generating an empty GPT handoff. If an external Pro review is requested but no project ChatGPT URL is configured, it records `send_reason=pro_url_missing_local_loop`, keeps `loop_status=running`, and sets `local_only_next_action=capture_or_run_local_review`; the operator must continue locally rather than final. `-PreflightBrowser` records the intended Edge/Chrome extension route once for this iteration only when a Pro handoff is needed. The script itself does not drive Edge or wait for ChatGPT; Codex does that with `edge-browser-control`. Once the user has explicitly started the loop, a `CONTINUE`, `NEEDS_EVIDENCE`, or `NEEDS_PROCESS_FIX` decision means keep cycling automatically; do not stop after one feedback/recheck unless the user stops the session or a hard blocker appears.
+
+For high-frequency Codex projects, run a one-time capability scan before the first serious loop. This aligns project goals with available plugin/skill/app/MCP routes before execution:
+
+```powershell
+& "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action RunCapabilityScan -Root "<project-root>" -AuditContext "<project goal, stack, and important constraints>"
+& "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action Status -Root "<project-root>"
+```
+
+The scan is read-only. It recommends tool families, explains whether they are directly usable, whether install/enable/exposure is needed, and whether Human Gate authorization is required before write-capable or external actions. `Status` exposes `top_capability_family`, `top_capability_status`, and `recommended_capability_routes_preview` for the outer loop.
 
 Default efficiency mode is `standard`:
 
@@ -117,7 +126,7 @@ Useful explicit actions:
 & "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action RunFinalClosure -Root "<project-root>"
 ```
 
-For game projects, capability scan should place Game Studio routes near the top when detected, such as `@game-studio` or `$game-studio:game-playtest`. If the scan reports `installed-not-exposed`, it remains a recommendation only; do not assume the plugin is callable in the active Codex session.
+For game projects, capability scan should place Game Studio routes near the top when detected, such as `@game-studio` or `$game-studio:game-playtest`. If the scan reports `installed-not-exposed`, it remains a recommendation only; do not assume the plugin is callable in the active Codex session. The capability report also states direct usability, install/enable needs, and authorization requirements.
 
 By default the terminal scope is the whole project:
 
@@ -210,6 +219,8 @@ Run the local expert council after each progress update:
 
 `RecordProgress` writes an `evidence/evidence.jsonl` record. When `-RelatedGate`, `-RelatedBlockerId`, or `-RelatedSliceId` is supplied, Done Gate can tie that artifact back to the goal contract instead of treating it as loose progress. It also triggers a periodic Codex efficiency audit in `standard` and `strict` modes, then the local council consumes the capability routes and audit status during post-evaluation.
 
+It also contributes to the project-local experience log. Key state transitions automatically append concise lessons to `docs/ai-review-loop/experience-log.md`, including GPT review capture, local council output, progress records, Done Gate results, local-first GPT skips, and `NextDecision` outcomes. Check `Status` fields `auto_experience_count` and `latest_experience_record` to see whether a project has sent useful feedback back into the loop.
+
 Record target Pro tab close after Pro has answered and the loop no longer needs that page:
 
 ```powershell
@@ -228,6 +239,16 @@ Check state:
 ```powershell
 & "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action Status -Root "<project-root>"
 ```
+
+When `pro_review_mode=optional` and no ChatGPT target URL is configured, `Status` is expected to recommend local continuation, not final completion:
+
+```text
+status_guidance          : optional_pro_url_missing_continue_local_loop
+recommended_next_action  : run_loop_local_without_pro_or_ask_once_for_target_url
+recommended_next_command : ... -Action RunLoop -Root "<project-root>"
+```
+
+Ask for a URL once only when the user wants Pro review for that project. Otherwise continue with `RunLoop`, local council, efficiency audit, local assessment, and next local action.
 
 ## Project Files
 
@@ -462,6 +483,18 @@ If `NextDecision` reports `loop_status: running` or `continuation_required: true
 - `local_only_next_action`: the concrete local action to execute before another external review.
 
 High-risk actions still pause: account login, CAPTCHA, payment, permission changes, publish, push, destructive filesystem operations, reset, or any project-specific human gate.
+
+## Experience Feedback
+
+Automatic experience collection is private and project-local by default. It records reusable operating lessons in `docs/ai-review-loop/experience-log.md` without creating GitHub issue drafts.
+
+Use manual `RecordExperience` only when a lesson should be promoted into a sanitized public issue draft or cross-project improvement note:
+
+```powershell
+& "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action RecordExperience -Root "<project-root>" -ExperienceOutcome "needs-improvement" -ExperienceLesson "Short reusable lesson" -ExperienceNotes "Sanitized notes only."
+```
+
+Manual records also create `docs/ai-review-loop/experience-issues/*-github-issue-draft.md`. Automatic records do not.
 
 In continuous loops, the second and later GPT-facing prompts automatically end with:
 

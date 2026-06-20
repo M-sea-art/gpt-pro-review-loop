@@ -23,6 +23,9 @@ def main() -> int:
             {
                 "name": "game-studio",
                 "status": "installed-not-exposed",
+                "directly_usable": "not-until-exposed",
+                "install_or_enable_needed": "maybe-expose-or-enable",
+                "authorization_needed": "human-gate-before-write-or-external-action",
                 "mention": "@game-studio",
                 "child_mentions": [
                     "$game-studio:game-playtest",
@@ -33,6 +36,9 @@ def main() -> int:
             {
                 "name": "codegraph",
                 "status": "available-in-session",
+                "directly_usable": "yes",
+                "install_or_enable_needed": "no",
+                "authorization_needed": "no-for-read-only",
                 "mention": "codegraph",
                 "child_mentions": [],
             },
@@ -42,12 +48,18 @@ def main() -> int:
             {
                 "name": "codegraph",
                 "status": "available-in-session",
+                "directly_usable": "yes",
+                "install_or_enable_needed": "no",
+                "authorization_needed": "no-for-read-only",
                 "mention": "codegraph",
                 "child_mentions": [],
             },
             {
                 "name": "github",
                 "status": "installed-not-exposed",
+                "directly_usable": "not-until-exposed",
+                "install_or_enable_needed": "maybe-expose-or-enable",
+                "authorization_needed": "human-gate-before-write-or-external-action",
                 "mention": "@github",
                 "child_mentions": ["$github:github"],
             },

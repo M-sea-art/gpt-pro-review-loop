@@ -86,6 +86,10 @@ Describe "gpt-pro-review-loop state machine" {
     $state.PSObject.Properties.Name | Should -Contain "goal_contract_status"
     $state.PSObject.Properties.Name | Should -Contain "goal_authority_sources"
     $state.PSObject.Properties.Name | Should -Contain "latest_architecture_map"
+    $state.PSObject.Properties.Name | Should -Contain "experience_collection_policy"
+    $state.PSObject.Properties.Name | Should -Contain "latest_experience_record"
+    $state.PSObject.Properties.Name | Should -Contain "latest_auto_experience_key"
+    $state.PSObject.Properties.Name | Should -Contain "auto_experience_count"
     @($state.pending_prompts).Count | Should -Be 0
     @($state.captured_reviews).Count | Should -Be 0
     $state.baseline_sent_to_url | Should -Be $null
@@ -116,12 +120,15 @@ Describe "gpt-pro-review-loop state machine" {
     $state.stalled_local_action_count | Should -Be 0
     @($state.action_contracts).Count | Should -Be 0
     @($state.evidence_records).Count | Should -Be 0
+    $state.experience_collection_policy | Should -Be "auto_record_key_loop_learning_events"
+    $state.auto_experience_count | Should -Be 0
 
     $statusText = (& $script:Skill -Action Status -Root $project | Out-String)
     $statusText | Should -Match "target_chatgpt_url"
     $statusText | Should -Match "https://chatgpt.com/g/test-project"
     $statusText | Should -Match "quota_mode"
     $statusText | Should -Match "efficiency_audit_mode"
+    $statusText | Should -Match "auto_experience_count"
   }
 
   It "rejects invalid ChatGPT URLs at init" {
@@ -143,6 +150,37 @@ Describe "gpt-pro-review-loop state machine" {
     $state = Read-State $project
     $state.url_confirmation_required | Should -BeFalse
     $state.url_confirmation_reason | Should -Be $null
+  }
+
+  It "continues locally instead of finaling when optional Pro URL is missing" {
+    $project = New-TestProject "optional-pro-url-missing"
+    Set-Content -LiteralPath (Join-Path $project "AGENTS.md") -Encoding UTF8 -Value "# Project`n`nProject Identity`nShip without fake external review.`n`nAcceptance gate: verifier pass."
+    & $script:Skill -Action Init -Root $project
+    & $script:Skill -Action RunLoop -Root $project -ForceExternalReview
+
+    $state = Read-State $project
+    $state.loop_status | Should -Be "running"
+    $state.continuation_required | Should -BeTrue
+    $state.should_send_to_gpt | Should -BeFalse
+    $state.send_reason | Should -Be "pro_url_missing_local_loop"
+    $state.next_action | Should -Be "capture_or_run_local_review"
+    $state.local_only_next_action | Should -Be "capture_or_run_local_review"
+    $state.url_confirmation_required | Should -BeTrue
+    $state.auto_experience_count | Should -BeGreaterThan 0
+    $experience = Get-Content -Raw -LiteralPath (Join-Path $project "docs/ai-review-loop/experience-log.md")
+    $experience | Should -Match "pro_url_missing_local_loop"
+    $experience | Should -Match "Missing optional GPT Pro URL"
+  }
+
+  It "recommends local RunLoop continuation from Status when optional Pro URL is missing" {
+    $project = New-TestProject "status-optional-pro-url-missing"
+    & $script:Skill -Action Init -Root $project
+
+    $statusText = (& $script:Skill -Action Status -Root $project | Out-String)
+
+    $statusText | Should -Match "optional_pro_url_missing_continue_local_loop"
+    $statusText | Should -Match "run_loop_local_without_pro_or_ask_once_for_target_url"
+    $statusText | Should -Match "RunLoop"
   }
 
   It "requires one-time confirmation after target URL changes outside Init" {
@@ -210,6 +248,12 @@ Describe "gpt-pro-review-loop state machine" {
     $scan = Get-Content -Raw -LiteralPath $scanPath | ConvertFrom-Json
     $scan.best_capabilities[0].name | Should -Be "game-studio"
     $scan.best_capabilities[0].status | Should -Be "installed-not-exposed"
+    $scan.best_capabilities[0].directly_usable | Should -Be "not-until-exposed"
+    $scan.best_capabilities[0].install_or_enable_needed | Should -Be "maybe-expose-or-enable"
+    $scan.best_capabilities[0].authorization_needed | Should -Be "human-gate-before-write-or-external-action"
+    $statusText = (& $script:Skill -Action Status -Root $project | Out-String)
+    $statusText | Should -Match "recommended_capability_routes_preview"
+    $statusText | Should -Match "game-studio"
   }
 
   It "RecordProgress triggers a periodic efficiency audit in standard mode" {
@@ -534,6 +578,24 @@ Human Gate: manual visual signoff required
     $state.final_closure_verdict | Should -Be "VERSION_CLOSED"
     $state.latest_done_gate | Should -Match "codex-efficiency-auditor-done-gate"
     $state.latest_final_closure | Should -Match "codex-efficiency-auditor-final-closure"
+  }
+
+  It "auto-records reusable experience on next decisions without creating public issue drafts" {
+    $project = New-TestProject "auto-experience"
+    Set-Content -LiteralPath (Join-Path $project "AGENTS.md") -Encoding UTF8 -Value "# Project`n`nProject Identity`nShip with local evidence.`n`nAcceptance gate: verifier pass."
+    & $script:Skill -Action Init -Root $project -TargetChatGptUrl "https://chatgpt.com/g/test-project"
+    & $script:Skill -Action RefreshProjectUnderstanding -Root $project
+    & $script:Skill -Action CaptureReview -Root $project -Reviewer codex-efficiency-auditor -Phase goal-audit -ReviewText "continue locally"
+    & $script:Skill -Action AssessFeedback -Root $project -GoalVerdict CONTINUE -NextAction "collect_evidence"
+    & $script:Skill -Action NextDecision -Root $project
+
+    $state = Read-State $project
+    $state.auto_experience_count | Should -BeGreaterThan 0
+    $state.latest_experience_record | Should -Be "docs/ai-review-loop/experience-log.md"
+    $experience = Get-Content -Raw -LiteralPath (Join-Path $project "docs/ai-review-loop/experience-log.md")
+    $experience | Should -Match "auto: next_decision"
+    $experience | Should -Match "When should_send_to_gpt=false"
+    @(Get-ChildItem -LiteralPath (Join-Path $project "docs/ai-review-loop/experience-issues") -File -ErrorAction SilentlyContinue).Count | Should -Be 0
   }
 
   It "keeps subgoal achievement running instead of completing the total project" {

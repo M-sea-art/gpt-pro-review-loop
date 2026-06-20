@@ -27,6 +27,10 @@ Every continuous loop can also run a local expert council review. The council is
 
 Codex efficiency audit is the loop's process supervisor. It is not just another advisory reviewer: it provides read-only capability scan input, periodic audit, stall/pivot status, Done Gate, and final closure checks. The loop stores those events in the same `reviews/` stream, but `NextDecision` treats Done Gate and stall/pivot fields as control evidence.
 
+For high-frequency Codex projects, run one project capability scan before serious execution or before the first continuous loop. The scan reads project goals and local Codex capability metadata, then recommends the best plugin/skill/app/MCP routes with status, direct usability, install/enable needs, authorization needs, and risk boundaries. It is tool selection, not tool installation.
+
+The loop also collects reusable project/user experience. Key events such as GPT review capture, local council output, progress records, Done Gate results, local-first iterations, and `NextDecision` outcomes are automatically summarized into `experience-log.md`. Automatic records are project-local and private by default; they do not create public GitHub issue drafts. Use `RecordExperience` manually only when a lesson should be promoted into a sanitized issue draft or cross-project improvement note.
+
 v1.7 adds a project understanding layer before review:
 
 - `project-goal-contract.json` / `project-goal-contract.md`: authority-ordered project total goal contract with completion gates, Human Gate boundaries, evidence requirements, confidence, and open questions.
@@ -71,7 +75,7 @@ GPT Pro, Codex efficiency review, and the local expert council are `reviewer` va
    & "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action Init -Root "<project-root>" -TargetChatGptUrl "https://chatgpt.com/..."
    ```
 
-   If the project has no configured URL, ask the user once for the ChatGPT project/conversation URL before preparing or sending review material. After the user confirms it, store it with `Init -TargetChatGptUrl`; do not ask again in later loop iterations unless the URL changes, is invalid, or the browser is clearly on a different ChatGPT conversation.
+   If the project has no configured URL, ask the user once for the ChatGPT project/conversation URL before preparing or sending review material. After the user confirms it, store it with `Init -TargetChatGptUrl`; do not ask again in later loop iterations unless the URL changes, is invalid, or the browser is clearly on a different ChatGPT conversation. In `pro_review_mode=optional`, a missing URL is not a loop stop: `Status` must show `status_guidance=optional_pro_url_missing_continue_local_loop` and a `RunLoop` command so the outer Codex agent continues with local review, local council, efficiency audit, assessment, and local action.
 
    If the user wants a fully local loop, initialize or update with:
 
@@ -252,6 +256,8 @@ GPT Pro, Codex efficiency review, and the local expert council are `reviewer` va
    & "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action RecordExperience -Root "<project-root>" -ExperienceOutcome "success|blocked|needs-improvement" -ExperienceLesson "<short reusable lesson>" -ExperienceNotes "<sanitized notes>"
    ```
 
+   The loop also records automatic experience entries during important state transitions. Check `Status` fields `auto_experience_count` and `latest_experience_record` to see whether a project has produced feedback. Automatic entries stay in `experience-log.md`; manual `RecordExperience` additionally creates a sanitized draft under `experience-issues/` for possible GitHub promotion.
+
 ## Codex Efficiency Supervisor Actions
 
 Use these when the loop needs explicit process supervision:
@@ -267,6 +273,7 @@ Rules:
 
 - `RunCapabilityScan` reuses `codex-efficiency-auditor/scripts/audit_codex_capabilities.py`; do not copy or reimplement inventory logic.
 - Capability Scan is read-only recommendation input. It does not install, expose, authenticate, or authorize tools.
+- `Status` shows `top_capability_family`, `top_capability_status`, and `recommended_capability_routes_preview` after a scan so outer Codex agents can route work without rereading the full scan.
 - In game/playable/Godot/Phaser/Three/WebGL/sprite/playtest contexts, Game Studio should appear as a top route when detected. Respect `installed-not-exposed`.
 - `RecordProgress` triggers `periodic-audit` in `standard` and `strict` modes.
 - `stale_count >= 2` means pivot/process fix; do not keep repeating the same `local_only_next_action`.
@@ -291,7 +298,7 @@ When the user explicitly starts continuous review, use:
 & "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action RunLoop -Root "<project-root>" -PreflightBrowser
 ```
 
-`RunLoop` is the compact loop entry for the outer Codex agent. In optional mode it starts local-first: if the current next action does not require GPT Pro, it records runtime state and runs the local expert council instead of generating an empty GPT handoff. In `standard` and `strict` efficiency modes, it ensures a capability scan exists first so the council and decision engine have capability-route context. The PowerShell script prepares local ledger material and writes a runtime brief; it does not control Edge or wait for ChatGPT by itself. After explicit authorization, Codex must continue ordinary next rounds without confirmation until `NextDecision` reports terminal project-total completion, `NEEDS_HUMAN_DECISION`, `BLOCKED`, or the user stops the session. A `running` loop status with `continuation_required=true` is an instruction to keep working, not a final-answer point. Safety blockers, human gates, external account/login/CAPTCHA, publish/push, destructive file operations, and permission changes still pause.
+`RunLoop` is the compact loop entry for the outer Codex agent. In optional mode it starts local-first: if the current next action does not require GPT Pro, it records runtime state and runs the local expert council instead of generating an empty GPT handoff. If an external review would be useful but this project has no configured ChatGPT URL, optional Pro is skipped with `send_reason=pro_url_missing_local_loop`; this is not a final state and must continue locally with review capture, local assessment, `NextDecision`, and local action until the user supplies a URL or the local loop reaches a real pause/terminal gate. In `standard` and `strict` efficiency modes, it ensures a capability scan exists first so the council and decision engine have capability-route context. The PowerShell script prepares local ledger material and writes a runtime brief; it does not control Edge or wait for ChatGPT by itself. After explicit authorization, Codex must continue ordinary next rounds without confirmation until `NextDecision` reports terminal project-total completion, `NEEDS_HUMAN_DECISION`, `BLOCKED`, or the user stops the session. A `running` loop status with `continuation_required=true` is an instruction to keep working, not a final-answer point. Safety blockers, human gates, external account/login/CAPTCHA, publish/push, destructive file operations, and permission changes still pause.
 
 For subgoal reviews:
 

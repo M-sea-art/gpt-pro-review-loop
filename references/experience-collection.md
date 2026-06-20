@@ -1,6 +1,8 @@
 # Experience Collection
 
-Use `RecordExperience` after a review round when the result teaches something reusable about the offline review loop, browser handoff, prompt quality, sensitive-data scanning, review event quality, or Codex local assessment quality.
+The loop automatically records concise project-local experience after key review-loop state transitions. Use `RecordExperience` manually after a review round only when the result teaches something reusable enough to promote into a sanitized issue draft or cross-project improvement note.
+
+Automatic records are written when the loop captures GPT Pro feedback, captures local council or efficiency review output, records progress, runs Done Gate, skips GPT because local work should continue, or writes a `NextDecision` loop-run record.
 
 Command:
 
@@ -12,6 +14,8 @@ Local outputs:
 
 - `docs/ai-review-loop/experience-log.md`: private project-local history.
 - `docs/ai-review-loop/experience-issues/<timestamp>-github-issue-draft.md`: sanitized public issue draft.
+
+Automatic records write only to `experience-log.md`. Manual `RecordExperience` writes to `experience-log.md` and creates an issue draft.
 
 Record:
 
