@@ -4,6 +4,8 @@ Offline review loop skill for Codex. It lets Codex package a local project into 
 
 Chinese trigger: `Pro 审阅循环`.
 
+![GPT Pro Review Loop bilingual overview](docs/assets/repo-overview-bilingual.svg)
+
 Default quota strategy: `economy`. The local ledger keeps full evidence, while ChatGPT handoffs receive compact Markdown summaries unless `-QuotaMode balanced` or `-QuotaMode deep` is explicitly requested.
 
 ## 90-Second Path

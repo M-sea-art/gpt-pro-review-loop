@@ -1,0 +1,97 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="720" viewBox="0 0 1280 720" role="img" aria-labelledby="title desc">
+  <title id="title">GPT Pro Review Loop bilingual repository overview</title>
+  <desc id="desc">A bilingual diagram explaining how Codex packages local project evidence, optionally asks GPT Pro for review, assesses feedback locally, and records the next action in an offline ledger.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#f8fafc"/>
+      <stop offset="1" stop-color="#eef6f4"/>
+    </linearGradient>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="8" stdDeviation="9" flood-color="#0f172a" flood-opacity="0.12"/>
+    </filter>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#2563eb"/>
+    </marker>
+    <style>
+      .title { font: 700 42px "Segoe UI", "Microsoft YaHei", Arial, sans-serif; fill: #0f172a; }
+      .subtitle { font: 500 18px "Segoe UI", "Microsoft YaHei", Arial, sans-serif; fill: #475569; }
+      .cardTitle { font: 700 20px "Segoe UI", "Microsoft YaHei", Arial, sans-serif; fill: #0f172a; }
+      .cardCn { font: 600 17px "Segoe UI", "Microsoft YaHei", Arial, sans-serif; fill: #334155; }
+      .cardEn { font: 500 15px "Segoe UI", "Microsoft YaHei", Arial, sans-serif; fill: #64748b; }
+      .small { font: 500 14px "Segoe UI", "Microsoft YaHei", Arial, sans-serif; fill: #475569; }
+      .badge { font: 700 13px "Segoe UI", "Microsoft YaHei", Arial, sans-serif; fill: #0f172a; }
+      .line { stroke: #2563eb; stroke-width: 3; fill: none; marker-end: url(#arrow); }
+      .mutedLine { stroke: #94a3b8; stroke-width: 2; fill: none; stroke-dasharray: 7 7; marker-end: url(#arrow); }
+      .card { fill: #ffffff; stroke: #dbe3ea; stroke-width: 1.4; rx: 8; filter: url(#shadow); }
+      .ledger { fill: #f8fbff; stroke: #93c5fd; stroke-width: 1.6; rx: 8; }
+      .safety { fill: #fff7ed; stroke: #fdba74; stroke-width: 1.5; rx: 8; }
+      .mode { fill: #ecfdf5; stroke: #86efac; stroke-width: 1.5; rx: 8; }
+    </style>
+  </defs>
+
+  <rect width="1280" height="720" fill="url(#bg)"/>
+
+  <text x="64" y="72" class="title">GPT Pro Review Loop</text>
+  <text x="64" y="106" class="subtitle">离线审阅闭环技能 / Offline review loop skill for Codex projects</text>
+
+  <rect x="64" y="148" width="206" height="140" class="card"/>
+  <text x="88" y="188" class="cardTitle">1. 本地项目</text>
+  <text x="88" y="218" class="cardCn">Codex 读取项目事实</text>
+  <text x="88" y="246" class="cardEn">Local files, tests, goals</text>
+  <text x="88" y="270" class="cardEn">stay under Codex control</text>
+
+  <rect x="326" y="148" width="220" height="140" class="card"/>
+  <text x="350" y="188" class="cardTitle">2. 离线材料包</text>
+  <text x="350" y="218" class="cardCn">目标合同 + 架构摘要</text>
+  <text x="350" y="246" class="cardEn">Compact Markdown dossier</text>
+  <text x="350" y="270" class="cardEn">No direct file access</text>
+
+  <rect x="602" y="148" width="216" height="140" class="card"/>
+  <text x="626" y="188" class="cardTitle">3. 可选 Pro 审阅</text>
+  <text x="626" y="218" class="cardCn">GPT Pro 是专家意见</text>
+  <text x="626" y="246" class="cardEn">Optional external review</text>
+  <text x="626" y="270" class="cardEn">Not the final gate</text>
+
+  <rect x="874" y="148" width="216" height="140" class="card"/>
+  <text x="898" y="188" class="cardTitle">4. 本地评审团</text>
+  <text x="898" y="218" class="cardCn">头脑风暴 + 效率审计</text>
+  <text x="898" y="246" class="cardEn">Council, audit, Done Gate</text>
+  <text x="898" y="270" class="cardEn">grounded in local evidence</text>
+
+  <rect x="1012" y="360" width="206" height="142" class="ledger"/>
+  <text x="1036" y="400" class="cardTitle">5. 下一步决策</text>
+  <text x="1036" y="430" class="cardCn">执行、补证据或暂停</text>
+  <text x="1036" y="458" class="cardEn">Next action, evidence,</text>
+  <text x="1036" y="482" class="cardEn">or human decision</text>
+
+  <rect x="64" y="360" width="332" height="142" class="ledger"/>
+  <text x="88" y="400" class="cardTitle">项目本地账本 / Local Ledger</text>
+  <text x="88" y="432" class="cardCn">docs/ai-review-loop/ 保存证据、审阅、评估、经验</text>
+  <text x="88" y="464" class="cardEn">Stores reviews, assessments, evidence, goals, and summaries</text>
+
+  <rect x="440" y="360" width="236" height="142" class="mode"/>
+  <text x="464" y="400" class="cardTitle">两种模式 / Modes</text>
+  <text x="464" y="432" class="cardCn">保守 loop：证据优先</text>
+  <text x="464" y="458" class="cardCn">疯狂 loop：测试线 95 分</text>
+  <text x="464" y="484" class="cardEn">Conservative or isolated 95-point candidate loop</text>
+
+  <rect x="720" y="360" width="248" height="142" class="safety"/>
+  <text x="744" y="400" class="cardTitle">安全边界 / Safety</text>
+  <text x="744" y="432" class="cardCn">不发布、不合并、不越过 Human Gate</text>
+  <text x="744" y="464" class="cardEn">No publish, merge, secrets,</text>
+  <text x="744" y="488" class="cardEn">or protected actions by default</text>
+
+  <path d="M270 218 H318" class="line"/>
+  <path d="M546 218 H594" class="line"/>
+  <path d="M818 218 H866" class="line"/>
+  <path d="M982 288 C1006 316 1032 334 1084 354" class="line"/>
+  <path d="M1012 432 H970" class="mutedLine"/>
+  <path d="M720 432 H684" class="mutedLine"/>
+  <path d="M440 432 H404" class="mutedLine"/>
+  <path d="M230 360 V306" class="mutedLine"/>
+
+  <rect x="64" y="560" width="1112" height="80" fill="#0f172a" rx="8"/>
+  <text x="92" y="594" fill="#ffffff" class="badge">Core promise / 核心承诺</text>
+  <text x="92" y="624" fill="#dbeafe" class="small">GPT Pro can advise, but Codex verifies locally. Completion requires goal contracts, evidence, gates, and human boundaries.</text>
+  <text x="666" y="624" fill="#dbeafe" class="small">Pro 可以审阅，但本地事实、目标合同、证据门禁和人工边界才决定下一步。</text>
+</svg>
