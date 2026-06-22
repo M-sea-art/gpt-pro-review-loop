@@ -57,10 +57,16 @@ Describe "gpt-pro-review-loop state machine" {
     $config.pro_review_mode | Should -Be "optional"
     $config.efficiency_audit_mode | Should -Be "standard"
     $config.efficiency_audit_policy | Should -Be "capability_scan_goal_supervision_periodic_done_gate_final_closure"
+    $config.loop_profile | Should -Be "conservative"
+    $config.target_score | Should -Be 95
+    $config.candidate_scope | Should -Be "test_line"
+    $config.max_fixes_per_round | Should -Be 3
+    $config.formal_completion_claim_allowed | Should -BeFalse
     $state.PSObject.Properties.Name | Should -Contain "pending_prompts"
     $state.PSObject.Properties.Name | Should -Contain "captured_reviews"
     $state.PSObject.Properties.Name | Should -Contain "runtime_brief"
     $state.PSObject.Properties.Name | Should -Contain "browser_preflight_status"
+    $state.PSObject.Properties.Name | Should -Contain "browser_preflight_error_category"
     $state.PSObject.Properties.Name | Should -Contain "should_send_to_gpt"
     $state.PSObject.Properties.Name | Should -Contain "active_goal_scope"
     $state.PSObject.Properties.Name | Should -Contain "completion_guard_status"
@@ -71,6 +77,18 @@ Describe "gpt-pro-review-loop state machine" {
     $state.PSObject.Properties.Name | Should -Contain "latest_evidence"
     $state.PSObject.Properties.Name | Should -Contain "latest_evidence_id"
     $state.PSObject.Properties.Name | Should -Contain "action_executor_status"
+    $state.PSObject.Properties.Name | Should -Contain "latest_evidence_strategy"
+    $state.PSObject.Properties.Name | Should -Contain "latest_evidence_strategy_status"
+    $state.PSObject.Properties.Name | Should -Contain "evidence_strategy_attempts"
+    $state.PSObject.Properties.Name | Should -Contain "current_evidence_source"
+    $state.PSObject.Properties.Name | Should -Contain "loop_profile"
+    $state.PSObject.Properties.Name | Should -Contain "target_score"
+    $state.PSObject.Properties.Name | Should -Contain "candidate_status"
+    $state.PSObject.Properties.Name | Should -Contain "candidate_score"
+    $state.PSObject.Properties.Name | Should -Contain "highest_deductions"
+    $state.PSObject.Properties.Name | Should -Contain "testline_isolation_status"
+    $state.PSObject.Properties.Name | Should -Contain "testline_git_metadata_kind"
+    $state.PSObject.Properties.Name | Should -Contain "formal_completion_claim_allowed"
     $state.PSObject.Properties.Name | Should -Contain "latest_capability_scan"
     $state.PSObject.Properties.Name | Should -Contain "latest_efficiency_audit"
     $state.PSObject.Properties.Name | Should -Contain "latest_done_gate"
@@ -115,13 +133,21 @@ Describe "gpt-pro-review-loop state machine" {
     $state.efficiency_audit_mode | Should -Be "standard"
     $state.stale_count | Should -Be 0
     $state.stall_pivot_status | Should -Be "CONTINUE"
+    $state.evidence_strategy_attempts | Should -Be 0
+    $state.loop_profile | Should -Be "conservative"
+    $state.target_score | Should -Be 95
+    $state.testline_isolation_status | Should -Be "not_required"
+    $state.formal_line_protected | Should -BeTrue
+    $state.formal_completion_claim_allowed | Should -BeFalse
     @($state.project_blocker_queue).Count | Should -Be 0
     $state.current_blocker_id | Should -Be $null
     $state.stalled_local_action_count | Should -Be 0
     @($state.action_contracts).Count | Should -Be 0
     @($state.evidence_records).Count | Should -Be 0
-    $state.experience_collection_policy | Should -Be "auto_record_key_loop_learning_events"
+    $state.experience_collection_policy | Should -Be "key_events_only"
     $state.auto_experience_count | Should -Be 0
+    Test-Path -LiteralPath (Join-Path $project "docs/ai-review-loop/loop-contract.json") | Should -BeTrue
+    Test-Path -LiteralPath (Join-Path $project "docs/ai-review-loop/loop-contract.md") | Should -BeTrue
 
     $statusText = (& $script:Skill -Action Status -Root $project | Out-String)
     $statusText | Should -Match "target_chatgpt_url"
@@ -129,11 +155,189 @@ Describe "gpt-pro-review-loop state machine" {
     $statusText | Should -Match "quota_mode"
     $statusText | Should -Match "efficiency_audit_mode"
     $statusText | Should -Match "auto_experience_count"
+    $statusText | Should -Match "loop_profile"
+    $statusText | Should -Match "target_score"
   }
 
   It "rejects invalid ChatGPT URLs at init" {
     $project = New-TestProject "bad-url"
     { & $script:Skill -Action Init -Root $project -TargetChatGptUrl "https://example.com/not-chatgpt" } | Should -Throw
+  }
+
+  It "records loop needs clarification as a formal contract gate" {
+    $project = New-TestProject "clarify-loop-needs"
+    & $script:Skill -Action Init -Root $project
+    & $script:Skill -Action ClarifyLoopNeeds -Root $project
+
+    $state = Read-State $project
+    $contract = Get-Content -Raw -LiteralPath (Join-Path $project "docs/ai-review-loop/loop-contract.json") | ConvertFrom-Json
+    $state.loop_status | Should -Be "paused"
+    $state.goal_verdict | Should -Be "NEEDS_HUMAN_DECISION"
+    $state.next_action | Should -Be "configure_loop_profile"
+    $state.loop_contract_status | Should -Be "needs_user_choice"
+    $contract.needs_user_choice | Should -BeTrue
+    $contract.loop_profile | Should -Be "conservative"
+  }
+
+  It "blocks testline 95 auto mode until isolation is confirmed" {
+    $project = New-TestProject "testline-no-git"
+    & $script:Skill -Action Init -Root $project
+    & $script:Skill -Action ConfigureLoopProfile -Root $project -LoopProfile testline_95_auto
+
+    $state = Read-State $project
+    $state.loop_profile | Should -Be "testline_95_auto"
+    $state.loop_status | Should -Be "paused"
+    $state.goal_verdict | Should -Be "NEEDS_HUMAN_DECISION"
+    $state.candidate_status | Should -Be "CANDIDATE_BLOCKED"
+    $state.testline_isolation_status | Should -Be "not_git_repo"
+    $state.next_action | Should -Be "confirm_testline_isolation"
+    $state.formal_completion_claim_allowed | Should -BeFalse
+  }
+
+  It "enters testline 95 auto mode only on a confirmed isolated branch" {
+    $project = New-TestProject "testline-confirmed"
+    git -C $project init -q
+    git -C $project checkout -b codex/testline-confirmed | Out-Null
+    & $script:Skill -Action Init -Root $project
+    & $script:Skill -Action ConfigureLoopProfile -Root $project -LoopProfile testline_95_auto -ConfirmTestlineIsolation
+
+    $state = Read-State $project
+    $state.loop_profile | Should -Be "testline_95_auto"
+    $state.testline_isolation_status | Should -Be "confirmed"
+    $state.testline_branch_or_worktree | Should -Be "codex/testline-confirmed"
+    $state.formal_line_protected | Should -BeTrue
+    $state.formal_completion_claim_allowed | Should -BeFalse
+  }
+
+  It "recognizes linked Git worktrees as valid isolated test lines" {
+    $main = New-TestProject "linked-main"
+    git -C $main init -q
+    git -C $main config user.email "test@example.com"
+    git -C $main config user.name "Test User"
+    git -C $main checkout -b codex/base | Out-Null
+    git -C $main add README.md src/app.txt
+    git -C $main commit -m "init" -q
+    $linked = Join-Path (Split-Path $main -Parent) ("gpt-pro-review-loop-linked-{0}" -f [guid]::NewGuid().ToString("N"))
+    git -C $main worktree add -q -b codex/testline-linked $linked
+
+    & $script:Skill -Action Init -Root $linked
+    & $script:Skill -Action ConfigureLoopProfile -Root $linked -LoopProfile testline_95_auto -ConfirmTestlineIsolation
+
+    $state = Read-State $linked
+    $state.testline_isolation_status | Should -Be "confirmed"
+    $state.testline_branch_or_worktree | Should -Be "codex/testline-linked"
+    $state.testline_git_metadata_kind | Should -Be "linked_worktree_file"
+    $state.testline_git_probe_status | Should -Be "ok"
+    $state.version_control_checked | Should -BeTrue
+    $state.candidate_status | Should -Be "CANDIDATE_PARTIAL"
+  }
+
+  It "blocks testline 95 auto mode on formal Git branches" {
+    $project = New-TestProject "testline-formal-branch"
+    git -C $project init -q
+    git -C $project checkout -b main | Out-Null
+    & $script:Skill -Action Init -Root $project
+    & $script:Skill -Action ConfigureLoopProfile -Root $project -LoopProfile testline_95_auto -ConfirmTestlineIsolation
+
+    $state = Read-State $project
+    $state.testline_isolation_status | Should -Be "formal_line_blocked"
+    $state.loop_status | Should -Be "paused"
+    $state.goal_verdict | Should -Be "NEEDS_HUMAN_DECISION"
+    $state.candidate_status | Should -Be "CANDIDATE_BLOCKED"
+    $state.next_action | Should -Be "confirm_testline_isolation"
+  }
+
+  It "recovers an old not_git_repo candidate block after a valid linked worktree is confirmed" {
+    $main = New-TestProject "linked-recovery-main"
+    git -C $main init -q
+    git -C $main config user.email "test@example.com"
+    git -C $main config user.name "Test User"
+    git -C $main checkout -b codex/base | Out-Null
+    git -C $main add README.md src/app.txt
+    git -C $main commit -m "init" -q
+    $linked = Join-Path (Split-Path $main -Parent) ("gpt-pro-review-loop-recovery-{0}" -f [guid]::NewGuid().ToString("N"))
+    git -C $main worktree add -q -b codex/testline-recovery $linked
+    & $script:Skill -Action Init -Root $linked
+
+    $statePath = Join-Path $linked "docs/ai-review-loop/review-state.json"
+    $state = Read-State $linked
+    $state.loop_profile = "testline_95_auto"
+    $state.loop_status = "paused"
+    $state.goal_verdict = "NEEDS_HUMAN_DECISION"
+    $state.candidate_status = "CANDIDATE_BLOCKED"
+    $state.testline_isolation_status = "not_git_repo"
+    $state.next_action = "confirm_testline_isolation"
+    $state.local_only_next_action = "confirm_testline_isolation"
+    $state.stop_reason = "Project is not inside a Git worktree."
+    $state.send_reason = "testline_isolation_not_confirmed"
+    $state | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $statePath -Encoding UTF8
+
+    & $script:Skill -Action CheckTestlineIsolation -Root $linked -ConfirmTestlineIsolation
+
+    $updated = Read-State $linked
+    $updated.testline_isolation_status | Should -Be "confirmed"
+    $updated.loop_status | Should -Be "running"
+    $updated.goal_verdict | Should -Be "CONTINUE"
+    $updated.candidate_status | Should -Be "CANDIDATE_PARTIAL"
+    $updated.next_action | Should -Be "run_candidate_cycle"
+    $updated.stop_reason | Should -Be $null
+  }
+
+  It "runs a candidate cycle below 95 without claiming project completion" {
+    $project = New-TestProject "candidate-cycle"
+    git -C $project init -q
+    git -C $project checkout -b codex/testline-cycle | Out-Null
+    Set-Content -LiteralPath (Join-Path $project "AGENTS.md") -Encoding UTF8 -Value "# Project`n`nProject Identity`nBuild a candidate.`n`nAcceptance gate: local candidate can run."
+    & $script:Skill -Action Init -Root $project -LoopProfile testline_95_auto
+    & $script:Skill -Action ConfigureLoopProfile -Root $project -LoopProfile testline_95_auto -ConfirmTestlineIsolation
+    $output = (& $script:Skill -Action RunLoop -Root $project -ConfirmTestlineIsolation | Out-String)
+
+    $state = Read-State $project
+    $contract = Get-Content -Raw -LiteralPath (Join-Path $project "docs/ai-review-loop/loop-contract.json") | ConvertFrom-Json
+    $expectedHeadings = @("【状态】", "【总分】", "【各项评分】", "【本轮实际改动】", "【运行/查看/使用方式】", "【证据】", "【最高扣分项】", "【下一轮自动目标】")
+    @($contract.reporting_format) | Should -Be $expectedHeadings
+    $actualHeadings = @($output -split "`r?`n" | Where-Object { $_ -match "^【.*】$" })
+    $actualHeadings | Should -Be $expectedHeadings
+    $output | Should -Match "【状态】"
+    $output | Should -Match "【总分】"
+    $output | Should -Match "【下一轮自动目标】"
+    $state.loop_status | Should -Be "running"
+    $state.candidate_status | Should -Be "CANDIDATE_PARTIAL"
+    [int]$state.candidate_score | Should -BeLessThan 95
+    $state.formal_completion_claim_allowed | Should -BeFalse
+    $state.goal_achieved_is_terminal | Should -BeFalse
+    $state.latest_candidate_fix_plan | Should -Match "^docs/ai-review-loop/loop-runs/"
+    $state.local_only_next_action | Should -Not -BeNullOrEmpty
+  }
+
+  It "treats candidate pass as testline-only, not project-total completion" {
+    $project = New-TestProject "candidate-pass-not-total"
+    git -C $project init -q
+    git -C $project checkout -b codex/testline-pass | Out-Null
+    & $script:Skill -Action Init -Root $project -LoopProfile testline_95_auto
+    & $script:Skill -Action ConfigureLoopProfile -Root $project -LoopProfile testline_95_auto -ConfirmTestlineIsolation
+    $statePath = Join-Path $project "docs/ai-review-loop/review-state.json"
+    $state = Read-State $project
+    $state.candidate_score_breakdown = [pscustomobject]@{
+      goal_fit = 25
+      runnable_usability = 20
+      result_quality = 20
+      ux_readability = 15
+      stability_correctness = 10
+      delivery_completeness = 10
+    }
+    $state.project_blocker_queue = @()
+    $state | ConvertTo-Json -Depth 20 | Set-Content -Encoding UTF8 -LiteralPath $statePath
+
+    & $script:Skill -Action RecordCandidateScore -Root $project
+    $updated = Read-State $project
+    $updated.candidate_status | Should -Be "CANDIDATE_PASS"
+    $updated.candidate_score | Should -Be 100
+    $updated.loop_status | Should -Be "paused"
+    $updated.project_goal_verdict | Should -Be "CONTINUE"
+    $updated.goal_achieved_is_terminal | Should -BeFalse
+    $updated.formal_completion_claim_allowed | Should -BeFalse
+    $updated.stop_reason | Should -Be "candidate_pass_testline_only_not_project_total"
   }
 
   It "requires one-time target URL confirmation before prepare" {
@@ -162,14 +366,17 @@ Describe "gpt-pro-review-loop state machine" {
     $state.loop_status | Should -Be "running"
     $state.continuation_required | Should -BeTrue
     $state.should_send_to_gpt | Should -BeFalse
-    $state.send_reason | Should -Be "pro_url_missing_local_loop"
-    $state.next_action | Should -Be "capture_or_run_local_review"
-    $state.local_only_next_action | Should -Be "capture_or_run_local_review"
+    $state.latest_action_contract | Should -Match "^docs/ai-review-loop/action-contracts/"
+    $state.latest_evidence | Should -Match "^docs/ai-review-loop/"
+    $state.action_executor_status | Should -Be "executed"
+    $state.next_action | Should -Not -Be "confirm_target_chatgpt_url"
+    $state.local_only_next_action | Should -Not -Be "confirm_target_chatgpt_url"
     $state.url_confirmation_required | Should -BeTrue
     $state.auto_experience_count | Should -BeGreaterThan 0
     $experience = Get-Content -Raw -LiteralPath (Join-Path $project "docs/ai-review-loop/experience-log.md")
     $experience | Should -Match "pro_url_missing_local_loop"
     $experience | Should -Match "Missing optional GPT Pro URL"
+    [int]$state.suppressed_experience_count | Should -BeGreaterThan 0
   }
 
   It "does not preserve confirm target URL as the local next action in optional RunLoop" {
@@ -181,10 +388,68 @@ Describe "gpt-pro-review-loop state machine" {
     $state = Read-State $project
     $state.loop_status | Should -Be "running"
     $state.should_send_to_gpt | Should -BeFalse
-    $state.send_reason | Should -Be "pro_url_missing_local_loop"
-    $state.next_action | Should -Be "capture_or_run_local_review"
-    $state.local_only_next_action | Should -Be "capture_or_run_local_review"
+    $state.latest_action_contract | Should -Match "^docs/ai-review-loop/action-contracts/"
+    $state.latest_evidence | Should -Match "^docs/ai-review-loop/"
+    $state.action_executor_status | Should -Be "executed"
     $state.next_action | Should -Not -Be "confirm_target_chatgpt_url"
+    $state.local_only_next_action | Should -Not -Be "confirm_target_chatgpt_url"
+    $state.next_action | Should -Not -Be "confirm_target_chatgpt_url"
+    $state.raw_next_action | Should -Be "confirm_target_chatgpt_url"
+    $state.next_action_normalization_reason | Should -Be "optional_pro_url_missing_local_loop"
+  }
+
+  It "recovers empty project queues from goal contract evidence instead of repeating local council" {
+    $project = New-TestProject "empty-queue-contract"
+    Set-Content -LiteralPath (Join-Path $project "AGENTS.md") -Encoding UTF8 -Value "# Project`n`nProject Identity`nDeliver a governed local bridge without false completion.`n`nAcceptance gate: verifier pass.`nAcceptance gate: completion receipt evidence exists."
+    & $script:Skill -Action Init -Root $project
+    & $script:Skill -Action BuildGoalContract -Root $project
+    & $script:Skill -Action RunDoneGate -Root $project
+
+    $statePath = Join-Path $project "docs/ai-review-loop/review-state.json"
+    $state = Read-State $project
+    $state.project_blocker_queue = @()
+    $state.blocking_gates = @()
+    $state.goal_backlog = @()
+    $state.current_goal_slice_id = $null
+    $state.goal_slice_status = "no_open_slices"
+    $state.next_action = "run_local_council"
+    $state.local_only_next_action = "run_local_council"
+    $state.done_gate_verdict = "NEEDS_FIX"
+    $state | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $statePath -Encoding UTF8
+
+    & $script:Skill -Action NextLocalAction -Root $project
+
+    $state = Read-State $project
+    $state.loop_status | Should -Be "running"
+    $state.local_only_next_action | Should -Not -Be "run_local_council"
+    @($state.project_blocker_queue).Count | Should -BeGreaterThan 0
+    $state.send_reason | Should -Be "empty_queue_recovered_from_goal_contract"
+  }
+
+  It "local council creates a backlog item when recovery selects a non-council local action" {
+    $project = New-TestProject "empty-queue-council-backlog"
+    Set-Content -LiteralPath (Join-Path $project "AGENTS.md") -Encoding UTF8 -Value "# Project`n`nProject Identity`nDeliver a governed local bridge without false completion.`n`nAcceptance gate: verifier pass."
+    & $script:Skill -Action Init -Root $project
+    & $script:Skill -Action BuildGoalContract -Root $project
+    & $script:Skill -Action RunDoneGate -Root $project
+
+    $statePath = Join-Path $project "docs/ai-review-loop/review-state.json"
+    $state = Read-State $project
+    $state.project_blocker_queue = @()
+    $state.blocking_gates = @()
+    $state.goal_backlog = @()
+    $state.current_goal_slice_id = $null
+    $state.goal_slice_status = "no_open_slices"
+    $state.next_action = "run_local_council"
+    $state.local_only_next_action = "run_local_council"
+    $state.done_gate_verdict = "NEEDS_FIX"
+    $state | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $statePath -Encoding UTF8
+
+    & $script:Skill -Action RunLocalCouncil -Root $project
+
+    $state = Read-State $project
+    @($state.goal_backlog).Count | Should -BeGreaterThan 0
+    $state.local_only_next_action | Should -Not -Be "run_local_council"
   }
 
   It "recommends local RunLoop continuation from Status when optional Pro URL is missing" {
@@ -304,6 +569,22 @@ Describe "gpt-pro-review-loop state machine" {
     $second = Read-State $project
     $second.browser_preflight_checked_at | Should -Be $firstCheckedAt
     $second.runtime_brief | Should -Match "^docs/ai-review-loop/loop-runs/"
+  }
+
+  It "records browser runtime schema mismatch without marking prompt sent" {
+    $project = New-TestProject "preflight-schema-mismatch"
+    & $script:Skill -Action Init -Root $project -TargetChatGptUrl "https://chatgpt.com/g/test-project"
+    & $script:Skill -Action Prepare -Root $project
+    & $script:Skill -Action PreflightBrowser -Root $project -BrowserPreflightError "ConnectorClientError: missing field sandboxPolicy"
+
+    $state = Read-State $project
+    $state.browser_preflight_status | Should -Be "blocked_schema_mismatch"
+    $state.browser_preflight_error_category | Should -Be "browser_runtime_schema_mismatch"
+    $state.browser_preflight_error | Should -Match "sandboxPolicy"
+    $state.baseline_sent | Should -BeFalse
+    @($state.captured_reviews).Count | Should -Be 0
+    $briefPath = Join-Path $project ($state.runtime_brief -replace "/", "\")
+    (Get-Content -Raw -LiteralPath $briefPath) | Should -Match "blocked_schema_mismatch"
   }
 
   It "records baseline target and hash after prompt send" {
@@ -573,6 +854,20 @@ Human Gate: manual visual signoff required
     @($state.captured_reviews).Count | Should -Be 2
   }
 
+  It "keeps CaptureFeedback as a legacy alias for GPT Pro initial CaptureReview" {
+    $project = New-TestProject "capture-feedback-alias"
+    & $script:Skill -Action Init -Root $project -TargetChatGptUrl "https://chatgpt.com/g/test-project"
+    & $script:Skill -Action CaptureFeedback -Root $project -FeedbackText "legacy feedback"
+
+    $state = Read-State $project
+    @($state.captured_reviews).Count | Should -Be 1
+    $reviewPath = Join-Path $project ($state.latest_review -replace "/", "\")
+    $reviewText = Get-Content -Raw -LiteralPath $reviewPath
+    $reviewText | Should -Match "reviewer: gpt-pro"
+    $reviewText | Should -Match "phase: initial"
+    $reviewText | Should -Match "legacy feedback"
+  }
+
   It "maps terminal next decisions" {
     $project = New-TestProject "decision"
     Set-Content -LiteralPath (Join-Path $project "AGENTS.md") -Encoding UTF8 -Value "# Project`n`nProject Identity`nShip the test project.`n`nAcceptance gate: verifier pass."
@@ -598,22 +893,32 @@ Human Gate: manual visual signoff required
     $state.latest_final_closure | Should -Match "codex-efficiency-auditor-final-closure"
   }
 
-  It "auto-records reusable experience on next decisions without creating public issue drafts" {
-    $project = New-TestProject "auto-experience"
-    Set-Content -LiteralPath (Join-Path $project "AGENTS.md") -Encoding UTF8 -Value "# Project`n`nProject Identity`nShip with local evidence.`n`nAcceptance gate: verifier pass."
+  It "suppresses routine successful experience records but keeps important summaries" {
+    $project = New-TestProject "auto-experience-suppression"
     & $script:Skill -Action Init -Root $project -TargetChatGptUrl "https://chatgpt.com/g/test-project"
-    & $script:Skill -Action RefreshProjectUnderstanding -Root $project
-    & $script:Skill -Action CaptureReview -Root $project -Reviewer codex-efficiency-auditor -Phase goal-audit -ReviewText "continue locally"
-    & $script:Skill -Action AssessFeedback -Root $project -GoalVerdict CONTINUE -NextAction "collect_evidence"
-    & $script:Skill -Action NextDecision -Root $project
+    & $script:Skill -Action RunLocalCouncil -Root $project
 
     $state = Read-State $project
-    $state.auto_experience_count | Should -BeGreaterThan 0
-    $state.latest_experience_record | Should -Be "docs/ai-review-loop/experience-log.md"
+    $state.auto_experience_count | Should -Be 0
+    [int]$state.suppressed_experience_count | Should -BeGreaterThan 0
     $experience = Get-Content -Raw -LiteralPath (Join-Path $project "docs/ai-review-loop/experience-log.md")
-    $experience | Should -Match "auto: next_decision"
-    $experience | Should -Match "When should_send_to_gpt=false"
+    $experience | Should -Not -Match "auto: local_council_captured"
     @(Get-ChildItem -LiteralPath (Join-Path $project "docs/ai-review-loop/experience-issues") -File -ErrorAction SilentlyContinue).Count | Should -Be 0
+  }
+
+  It "summarizes manual experience without creating redundant automatic entries" {
+    $project = New-TestProject "experience-summary"
+    & $script:Skill -Action Init -Root $project -TargetChatGptUrl "https://chatgpt.com/g/test-project"
+    & $script:Skill -Action RecordExperience -Root $project -ExperienceOutcome "needs-improvement" -ExperienceLesson "Keep only behavior-changing review-loop lessons." -ExperienceNotes "Routine local council events should be suppressed."
+    & $script:Skill -Action SummarizeExperience -Root $project
+
+    $state = Read-State $project
+    $state.latest_experience_summary | Should -Be "docs/ai-review-loop/experience-summary.md"
+    $summary = Get-Content -Raw -LiteralPath (Join-Path $project "docs/ai-review-loop/experience-summary.md")
+    $summary | Should -Match "total_log_entries: 1"
+    $summary | Should -Match "needs-improvement"
+    $summary | Should -Match "Keep-Worthy Recent Lessons"
+    @(Get-ChildItem -LiteralPath (Join-Path $project "docs/ai-review-loop/experience-issues") -File -ErrorAction SilentlyContinue).Count | Should -Be 1
   }
 
   It "keeps subgoal achievement running instead of completing the total project" {
@@ -795,6 +1100,77 @@ Human Gate: manual visual signoff required
     $state.send_reason | Should -Be "local_action_executed"
   }
 
+  It "prefers an open blocker over generic local review when executing a local action" {
+    $project = New-TestProject "execute-prefers-blocker"
+    New-Item -ItemType Directory -Path (Join-Path $project "docs/project") -Force | Out-Null
+    Set-Content -LiteralPath (Join-Path $project "docs/project/FPV0_COMPLETION_ROADMAP.md") -Encoding UTF8 -Value 'AC-HMS-4: NOT_COMPLETE completion receipt evidence missing'
+    Set-Content -LiteralPath (Join-Path $project "src/codex_bridge.py") -Encoding UTF8 -Value "def send_update():`n    return 'receipt'"
+    & $script:Skill -Action Init -Root $project
+    & $script:Skill -Action BuildProjectGoalPlan -Root $project
+    $state = Read-State $project
+    @($state.project_blocker_queue).Count | Should -BeGreaterThan 0
+    $state.next_action = "capture_or_run_local_review"
+    $state.local_only_next_action = "capture_or_run_local_review"
+    $state | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath (Join-Path $project "docs/ai-review-loop/review-state.json") -Encoding UTF8
+
+    & $script:Skill -Action ExecuteNextLocalAction -Root $project
+
+    $state = Read-State $project
+    $contractPath = Join-Path $project ($state.latest_action_contract -replace "/", "\")
+    $contract = Get-Content -Raw -LiteralPath $contractPath | ConvertFrom-Json
+    $contract.recommended_next_action | Should -Not -Be "capture_or_run_local_review"
+    $contract.source_blocker_id | Should -Be "PB-001"
+    $contract.executor | Should -Be "local-evidence-ledger"
+  }
+
+  It "creates gate-aware evidence strategy and binds evidence to the current blocker and gate" {
+    $project = New-TestProject "gate-evidence-strategy"
+    New-Item -ItemType Directory -Path (Join-Path $project "docs/project") -Force | Out-Null
+    Set-Content -LiteralPath (Join-Path $project "docs/project/ACCEPTANCE.md") -Encoding UTF8 -Value 'AC-HMS-4: NOT_COMPLETE completion receipt delivery_status evidence missing'
+    Set-Content -LiteralPath (Join-Path $project "src/codex_bridge.py") -Encoding UTF8 -Value "class DeliveryStatus:`n    pass`n"
+    Set-Content -LiteralPath (Join-Path $project "src/run.py") -Encoding UTF8 -Value "def send_update():`n    delivery_status = 'unknown'`n"
+    & $script:Skill -Action Init -Root $project
+    & $script:Skill -Action RefreshProjectUnderstanding -Root $project
+    & $script:Skill -Action BuildProjectGoalPlan -Root $project
+    & $script:Skill -Action NextLocalAction -Root $project
+    & $script:Skill -Action ExecuteNextLocalAction -Root $project
+
+    $state = Read-State $project
+    $state.latest_evidence_strategy | Should -Match "^docs/ai-review-loop/loop-runs/"
+    $state.latest_evidence_strategy_status | Should -Be "executed"
+    $state.evidence_strategy_attempts | Should -BeGreaterThan 0
+    $state.current_evidence_source | Should -Not -BeNullOrEmpty
+    $evidencePath = Join-Path $project ($state.latest_evidence -replace "/", "\")
+    $evidenceText = Get-Content -Raw -LiteralPath $evidencePath
+    $evidenceText | Should -Match "Gate-Aware Local Evidence"
+    $evidenceText | Should -Match "codegraph_status"
+    $records = Get-Content -LiteralPath (Join-Path $project "docs/ai-review-loop/evidence/evidence.jsonl") | ForEach-Object { $_ | ConvertFrom-Json }
+    $last = @($records)[-1]
+    $last.related_blocker_id | Should -Be "PB-001"
+    $last.related_gate | Should -Match "^GATE-"
+    $state.stale_count | Should -Be 0
+    $state.stall_pivot_status | Should -Be "CONTINUE"
+  }
+
+  It "does not let a missing optional GPT URL override a concrete blocker action" {
+    $project = New-TestProject "optional-url-keeps-blocker"
+    New-Item -ItemType Directory -Path (Join-Path $project "docs/project") -Force | Out-Null
+    Set-Content -LiteralPath (Join-Path $project "docs/project/ACCEPTANCE.md") -Encoding UTF8 -Value 'GATE-A: NOT_COMPLETE local verification evidence missing'
+    & $script:Skill -Action Init -Root $project
+    & $script:Skill -Action BuildProjectGoalPlan -Root $project
+    & $script:Skill -Action RunLoop -Root $project
+
+    $state = Read-State $project
+    $state.raw_next_action | Should -BeIn @("confirm_target_chatgpt_url", $null)
+    $state.latest_action_contract | Should -Match "^docs/ai-review-loop/action-contracts/"
+    $contract = Get-Content -Raw -LiteralPath (Join-Path $project ($state.latest_action_contract -replace "/", "\")) | ConvertFrom-Json
+    $contract.recommended_next_action | Should -Not -Be "capture_or_run_local_review"
+    $contract.recommended_next_action | Should -Match "gate_001|not_complete|evidence"
+    $state.latest_evidence_strategy_status | Should -Be "executed"
+    $strategy = Get-Content -Raw -LiteralPath (Join-Path $project ($state.latest_evidence_strategy -replace "/", "\")) | ConvertFrom-Json
+    $strategy.related_gate | Should -Match "^GATE-"
+  }
+
   It "normalizes optional Pro URL confirmation before executing a local action" {
     $project = New-TestProject "execute-optional-url-confirm"
     & $script:Skill -Action Init -Root $project
@@ -816,10 +1192,32 @@ Human Gate: manual visual signoff required
     & $script:Skill -Action NextLocalAction -Root $project
 
     $state = Read-State $project
-    $state.next_action | Should -Be "run_local_council"
-    $state.local_only_next_action | Should -Be "run_local_council"
-    $state.send_reason | Should -Be "no_blocker_queue_run_local_council"
+    $state.next_action | Should -Not -Be "run_local_council"
+    $state.local_only_next_action | Should -Not -Be "run_local_council"
+    $state.send_reason | Should -BeIn @("empty_queue_build_goal_slices", "empty_queue_rebuild_goal_plan", "empty_queue_recovered_from_goal_contract")
     $state.next_action | Should -Not -Be "no_project_blocker_queue_item"
+  }
+
+  It "writes the effective local-loop action into the project goal plan when optional Pro URL is missing" {
+    $project = New-TestProject "goal-plan-optional-url-confirm"
+    & $script:Skill -Action Init -Root $project
+    & $script:Skill -Action BuildProjectGoalPlan -Root $project
+
+    $state = Read-State $project
+    $planPath = Join-Path $project "docs/ai-review-loop/project-goal-plan.md"
+    $plan = Get-Content -Raw -LiteralPath $planPath
+    $planJson = Get-ChildItem -LiteralPath (Join-Path $project "docs/ai-review-loop/loop-runs") -Filter "*project-goal-plan.json" | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+    $planState = Get-Content -Raw -LiteralPath $planJson.FullName | ConvertFrom-Json
+
+    $state.next_action | Should -Be "capture_or_run_local_review"
+    $state.local_only_next_action | Should -Be "capture_or_run_local_review"
+    $state.send_reason | Should -Be "optional_pro_url_missing_local_loop"
+    $plan | Should -Match "next_action: capture_or_run_local_review"
+    $plan | Should -Match "local_only_next_action: capture_or_run_local_review"
+    $plan | Should -Match "raw_next_action: confirm_target_chatgpt_url"
+    $plan | Should -Match "normalization_reason: optional_pro_url_missing_local_loop"
+    $planState.next_action | Should -Be "capture_or_run_local_review"
+    $planState.raw_next_action | Should -Be "confirm_target_chatgpt_url"
   }
 
   It "pauses a local action contract that requires explicit human authorization" {

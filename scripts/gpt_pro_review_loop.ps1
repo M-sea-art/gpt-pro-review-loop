@@ -1,6 +1,6 @@
 [CmdletBinding()]
 param(
-  [ValidateSet("Init", "Prepare", "PrepareCompactReview", "PreflightBrowser", "SendPrompt", "CaptureFeedback", "CaptureReview", "WaitFeedback", "ShowLatestReview", "AssessFeedback", "SendAssessment", "NextDecision", "BuildProjectGoalPlan", "NextLocalAction", "ExecuteNextLocalAction", "RunCapabilityScan", "RunEfficiencyAudit", "RunDoneGate", "RunFinalClosure", "RunLocalCouncil", "CloseProTab", "RecordProgress", "PromoteGoal", "BuildGoalContract", "BuildGoalModel", "AnalyzeArchitecture", "BuildArchitectureBrief", "BuildGoalSlices", "RefreshProjectUnderstanding", "RunLoop", "RecordExperience", "Status", "Run")]
+  [ValidateSet("Init", "ClarifyLoopNeeds", "ConfigureLoopProfile", "ShowLoopContract", "Prepare", "PrepareCompactReview", "PreflightBrowser", "SendPrompt", "CaptureFeedback", "CaptureReview", "WaitFeedback", "ShowLatestReview", "AssessFeedback", "SendAssessment", "NextDecision", "BuildProjectGoalPlan", "NextLocalAction", "ExecuteNextLocalAction", "RunCapabilityScan", "RunEfficiencyAudit", "RunDoneGate", "RunFinalClosure", "RunLocalCouncil", "CloseProTab", "RecordProgress", "PromoteGoal", "BuildGoalContract", "BuildGoalModel", "AnalyzeArchitecture", "BuildArchitectureBrief", "BuildGoalSlices", "RefreshProjectUnderstanding", "ScoreCandidate", "RunCandidateCycle", "SelectTopDeductions", "PlanCandidateFixes", "RecordCandidateScore", "FindAlternativeRoute", "CheckTestlineIsolation", "RunLoop", "RecordExperience", "SummarizeExperience", "Status", "Run")]
   [string]$Action = "Run",
   [string]$Root,
   [string]$TargetChatGptUrl,
@@ -62,7 +62,17 @@ param(
   [string]$RelatedGate,
   [string]$RelatedBlockerId,
   [string]$RelatedSliceId,
-  [string]$EvidenceType
+  [string]$EvidenceType,
+  [ValidateSet("conservative", "testline_95_auto")]
+  [string]$LoopProfile = "conservative",
+  [int]$TargetScore = 95,
+  [ValidateSet("test_line", "branch", "worktree", "local_only")]
+  [string]$CandidateScope = "test_line",
+  [int]$MaxFixesPerRound = 3,
+  [switch]$AllowWebResearch,
+  [switch]$AllowToolDiscovery,
+  [switch]$ConfirmTestlineIsolation,
+  [string]$BrowserPreflightError
 )
 
 $ErrorActionPreference = "Stop"
@@ -72,6 +82,7 @@ $ProReviewModeProvided = $PSBoundParameters.ContainsKey("ProReviewMode")
 $EfficiencyAuditModeProvided = $PSBoundParameters.ContainsKey("EfficiencyAuditMode")
 $GoalDiscoveryModeProvided = $PSBoundParameters.ContainsKey("GoalDiscoveryMode")
 $ArchitectureAnalysisModeProvided = $PSBoundParameters.ContainsKey("ArchitectureAnalysisMode")
+$LoopProfileProvided = $PSBoundParameters.ContainsKey("LoopProfile")
 
 if ($PSVersionTable.PSVersion.Major -lt 7) {
   throw "gpt_pro_review_loop.ps1 requires PowerShell 7+ because it uses .NET path APIs such as System.IO.Path.GetRelativePath."
@@ -152,6 +163,8 @@ function Get-ReviewPaths {
     Config = Join-Path $base "project-config.json"
     State = Join-Path $base "review-state.json"
     Decisions = Join-Path $base "decisions.md"
+    LoopContractJson = Join-Path $base "loop-contract.json"
+    LoopContract = Join-Path $base "loop-contract.md"
     Dossiers = Join-Path $base "dossiers"
     CodeMaps = Join-Path $base "code-maps"
     RoundRequests = Join-Path $base "round-requests"
@@ -174,6 +187,7 @@ function Get-ReviewPaths {
     LocalCouncil = Join-Path $base "local-council.md"
     GoalBacklog = Join-Path $base "goal-backlog.md"
     ExperienceLog = Join-Path $base "experience-log.md"
+    ExperienceSummary = Join-Path $base "experience-summary.md"
     ExperienceIssues = Join-Path $base "experience-issues"
   }
 }
@@ -181,6 +195,642 @@ function Get-ReviewPaths {
 function Test-ChatGptUrl {
   param([string]$Url)
   return ($Url -and $Url.Trim() -match "^https://chatgpt\.com/")
+}
+
+function Get-LoopProfileDisplayName {
+  param([Parameter(Mandatory = $true)][string]$Profile)
+  if ($Profile -eq "testline_95_auto") { return "疯狂 loop / 通用测试线 95 分全自动闭环模式" }
+  return "保守 loop / 审阅、证据、计划、门禁优先"
+}
+
+function Get-TestlineWarningText {
+  return "WARNING: before entering testline_95_auto, confirm version control is effective and an isolated test branch, temporary worktree, or disposable test line exists. Do not run this mode directly on formal, release, production, or protected branches."
+}
+
+function Get-CrazyLoopReportingFormat {
+  return @(
+    "【状态】",
+    "【总分】",
+    "【各项评分】",
+    "【本轮实际改动】",
+    "【运行/查看/使用方式】",
+    "【证据】",
+    "【最高扣分项】",
+    "【下一轮自动目标】"
+  )
+}
+
+function Get-FormalCompletionClaimAllowed {
+  return $false
+}
+
+function Get-FormalCompletionClaimAllowedText {
+  return ([string](Get-FormalCompletionClaimAllowed)).ToLowerInvariant()
+}
+
+function New-LoopContractData {
+  param(
+    [Parameter(Mandatory = $true)][string]$Profile,
+    [int]$ScoreTarget = 95,
+    [string]$Scope = "test_line",
+    [int]$FixesPerRound = 3,
+    [bool]$NeedsUserChoice = $false,
+    [string]$Reason = $null
+  )
+  if ($ScoreTarget -le 0) { $ScoreTarget = 95 }
+  if ($FixesPerRound -le 0) { $FixesPerRound = 3 }
+  $isCrazy = $Profile -eq "testline_95_auto"
+  $data = [ordered]@{
+    version = 1
+    updated_at = (Get-Date).ToString("o")
+    loop_profile = $Profile
+    loop_profile_display = Get-LoopProfileDisplayName -Profile $Profile
+    needs_user_choice = $NeedsUserChoice
+    needs_user_choice_reason = $Reason
+    conservative_summary = "Default profile. Keep the loop focused on review, local evidence, project-total guard, Done Gate, and explicit human boundaries."
+    testline_95_summary = "Optional explicit profile. Run in an isolated candidate line and keep improving until candidate_score >= target_score or a hard safety blocker appears."
+    target_score = $ScoreTarget
+    candidate_scope = $Scope
+    max_fixes_per_round = $FixesPerRound
+    allow_web_research = [bool]$AllowWebResearch
+    allow_tool_discovery = [bool]$AllowToolDiscovery
+    version_control_checked = $false
+    testline_isolation_status = if ($isCrazy) { "needs_confirmation" } else { "not_required" }
+    testline_branch_or_worktree = $null
+    formal_line_protected = $true
+    formal_completion_claim_allowed = (Get-FormalCompletionClaimAllowed)
+    warning = if ($isCrazy) { Get-TestlineWarningText } else { $null }
+    reporting_format = @(Get-CrazyLoopReportingFormat)
+  }
+  return [pscustomobject]$data
+}
+
+function Write-LoopContractFiles {
+  param(
+    [Parameter(Mandatory = $true)][string]$ProjectRoot,
+    [Parameter(Mandatory = $true)]$Contract
+  )
+  $paths = Get-ReviewPaths -ProjectRoot $ProjectRoot
+  ConvertTo-JsonFile $Contract $paths.LoopContractJson
+  $lines = @(
+    "# GPT Pro Review Loop Contract",
+    "",
+    "- loop_profile: $($Contract.loop_profile)",
+    "- display_name: $($Contract.loop_profile_display)",
+    "- target_score: $($Contract.target_score)",
+    "- candidate_scope: $($Contract.candidate_scope)",
+    "- max_fixes_per_round: $($Contract.max_fixes_per_round)",
+    "- needs_user_choice: $($Contract.needs_user_choice)",
+    "- needs_user_choice_reason: $($Contract.needs_user_choice_reason)",
+    "- version_control_checked: $($Contract.version_control_checked)",
+    "- testline_isolation_status: $($Contract.testline_isolation_status)",
+    "- testline_branch_or_worktree: $($Contract.testline_branch_or_worktree)",
+    "- formal_line_protected: $($Contract.formal_line_protected)",
+    "- formal_completion_claim_allowed: $($Contract.formal_completion_claim_allowed)",
+    "",
+    "## Conservative",
+    "",
+    $Contract.conservative_summary,
+    "",
+    "## Testline 95 Auto",
+    "",
+    $Contract.testline_95_summary,
+    "",
+    "## Warning",
+    "",
+    $(if ($Contract.warning) { $Contract.warning } else { "No testline warning applies in conservative mode." }),
+    "",
+    "## Reporting Format",
+    "",
+    ($Contract.reporting_format | ForEach-Object { "- $_" })
+  )
+  Set-Content -LiteralPath $paths.LoopContract -Encoding UTF8 -Value ($lines -join "`n")
+  return $paths.LoopContract
+}
+
+function Apply-LoopContractState {
+  param(
+    [Parameter(Mandatory = $true)]$State,
+    [Parameter(Mandatory = $true)]$Contract
+  )
+  Set-ObjectProperty $State "loop_profile" ([string]$Contract.loop_profile)
+  Set-ObjectProperty $State "target_score" ([int]$Contract.target_score)
+  Set-ObjectProperty $State "candidate_scope" ([string]$Contract.candidate_scope)
+  Set-ObjectProperty $State "max_fixes_per_round" ([int]$Contract.max_fixes_per_round)
+  Set-ObjectProperty $State "loop_contract_status" $(if ([bool]$Contract.needs_user_choice) { "needs_user_choice" } else { "configured" })
+  Set-ObjectProperty $State "loop_contract_needs_user_choice" ([bool]$Contract.needs_user_choice)
+  Set-ObjectProperty $State "latest_loop_contract" "docs/ai-review-loop/loop-contract.md"
+  Set-ObjectProperty $State "version_control_checked" ([bool]$Contract.version_control_checked)
+  Set-ObjectProperty $State "testline_isolation_status" ([string]$Contract.testline_isolation_status)
+  Set-ObjectProperty $State "testline_branch_or_worktree" $Contract.testline_branch_or_worktree
+  Set-ObjectProperty $State "formal_line_protected" ([bool]$Contract.formal_line_protected)
+  Set-ObjectProperty $State "formal_completion_claim_allowed" (Get-FormalCompletionClaimAllowed)
+}
+
+function Ensure-LoopContract {
+  param(
+    [Parameter(Mandatory = $true)][string]$ProjectRoot,
+    [Parameter(Mandatory = $true)]$State,
+    [Parameter(Mandatory = $true)]$Config,
+    [string]$Profile = "conservative",
+    [switch]$NeedsUserChoice,
+    [string]$Reason
+  )
+  $paths = Get-ReviewPaths -ProjectRoot $ProjectRoot
+  $profileToUse = if ($LoopProfileProvided) { $Profile } elseif ($Config.loop_profile) { [string]$Config.loop_profile } elseif ($State.loop_profile) { [string]$State.loop_profile } else { "conservative" }
+  if ($profileToUse -notin @("conservative", "testline_95_auto")) { $profileToUse = "conservative" }
+  $scoreToUse = if ($Config.target_score) { [int]$Config.target_score } else { $TargetScore }
+  $scopeToUse = if ($Config.candidate_scope) { [string]$Config.candidate_scope } else { $CandidateScope }
+  $fixesToUse = if ($Config.max_fixes_per_round) { [int]$Config.max_fixes_per_round } else { $MaxFixesPerRound }
+  if (Test-Path -LiteralPath $paths.LoopContractJson) {
+    $contract = Read-JsonFile $paths.LoopContractJson
+    if ($LoopProfileProvided) { Set-ObjectProperty $contract "loop_profile" $profileToUse; Set-ObjectProperty $contract "loop_profile_display" (Get-LoopProfileDisplayName -Profile $profileToUse) }
+    Set-ObjectProperty $contract "target_score" $scoreToUse
+    Set-ObjectProperty $contract "candidate_scope" $scopeToUse
+    Set-ObjectProperty $contract "max_fixes_per_round" $fixesToUse
+    if ($NeedsUserChoice) {
+      Set-ObjectProperty $contract "needs_user_choice" $true
+      Set-ObjectProperty $contract "needs_user_choice_reason" $Reason
+    } elseif (-not ($contract.PSObject.Properties.Name -contains "needs_user_choice")) {
+      Set-ObjectProperty $contract "needs_user_choice" $false
+    }
+    if ($profileToUse -eq "testline_95_auto" -and -not $contract.warning) { Set-ObjectProperty $contract "warning" (Get-TestlineWarningText) }
+    if (-not ($contract.PSObject.Properties.Name -contains "formal_completion_claim_allowed")) { Set-ObjectProperty $contract "formal_completion_claim_allowed" (Get-FormalCompletionClaimAllowed) }
+  } else {
+    $contract = New-LoopContractData -Profile $profileToUse -ScoreTarget $scoreToUse -Scope $scopeToUse -FixesPerRound $fixesToUse -NeedsUserChoice:$NeedsUserChoice -Reason $Reason
+  }
+  Write-LoopContractFiles -ProjectRoot $ProjectRoot -Contract $contract | Out-Null
+  Set-ObjectProperty $Config "loop_profile" ([string]$contract.loop_profile)
+  Set-ObjectProperty $Config "target_score" ([int]$contract.target_score)
+  Set-ObjectProperty $Config "candidate_scope" ([string]$contract.candidate_scope)
+  Set-ObjectProperty $Config "max_fixes_per_round" ([int]$contract.max_fixes_per_round)
+  Set-ObjectProperty $Config "formal_completion_claim_allowed" (Get-FormalCompletionClaimAllowed)
+  Apply-LoopContractState -State $State -Contract $contract
+  return $contract
+}
+
+function Invoke-ClarifyLoopNeeds {
+  param([Parameter(Mandatory = $true)][string]$ProjectRoot)
+  $paths = Get-ReviewPaths -ProjectRoot $ProjectRoot
+  $config = Get-Config -ProjectRoot $ProjectRoot
+  $state = Get-State -ProjectRoot $ProjectRoot
+  $contract = New-LoopContractData -Profile "conservative" -ScoreTarget $TargetScore -Scope $CandidateScope -FixesPerRound $MaxFixesPerRound -NeedsUserChoice:$true -Reason "choose_conservative_or_testline_95_auto"
+  Write-LoopContractFiles -ProjectRoot $ProjectRoot -Contract $contract | Out-Null
+  Set-ObjectProperty $config "loop_profile" "conservative"
+  Set-ObjectProperty $config "target_score" ([int]$contract.target_score)
+  Set-ObjectProperty $config "candidate_scope" ([string]$contract.candidate_scope)
+  Set-ObjectProperty $config "max_fixes_per_round" ([int]$contract.max_fixes_per_round)
+  ConvertTo-JsonFile $config $paths.Config
+  Apply-LoopContractState -State $state -Contract $contract
+  Set-ObjectProperty $state "loop_status" "paused"
+  Set-ObjectProperty $state "goal_verdict" "NEEDS_HUMAN_DECISION"
+  Set-ObjectProperty $state "next_action" "configure_loop_profile"
+  Set-ObjectProperty $state "local_only_next_action" "configure_loop_profile"
+  Set-ObjectProperty $state "send_reason" "loop_contract_needs_user_choice"
+  Set-ObjectProperty $state "should_send_to_gpt" $false
+  Set-ObjectProperty $state "stop_reason" "choose_loop_profile"
+  Save-State $ProjectRoot $state
+  Write-Host "Loop needs clarification. Choose conservative or testline_95_auto." -ForegroundColor Yellow
+  Write-Host "Contract: $($paths.LoopContract)"
+  Write-Host "Crazy loop warning: $(Get-TestlineWarningText)"
+}
+
+function Invoke-GitProbe {
+  param(
+    [Parameter(Mandatory = $true)][string]$ProjectRoot,
+    [Parameter(Mandatory = $true)][string[]]$Args
+  )
+  $output = @()
+  $code = 1
+  try {
+    $output = @(& git -C $ProjectRoot @Args 2>$null)
+    $code = if ($null -ne $LASTEXITCODE) { [int]$LASTEXITCODE } else { 1 }
+  } catch {
+    $output = @()
+    $code = 1
+  } finally {
+    $global:LASTEXITCODE = 0
+  }
+  return [pscustomobject]@{
+    code = $code
+    text = (($output | ForEach-Object { [string]$_ }) -join "`n").Trim()
+    lines = $output
+  }
+}
+
+function Get-GitMetadataInfo {
+  param([Parameter(Mandatory = $true)][string]$ProjectRoot)
+  $gitPath = Join-Path $ProjectRoot ".git"
+  if (Test-Path -LiteralPath $gitPath -PathType Container) {
+    return [pscustomobject]@{
+      git_metadata_kind = "git_directory"
+      gitdir = $gitPath
+    }
+  }
+  if (Test-Path -LiteralPath $gitPath -PathType Leaf) {
+    $firstLine = ""
+    try { $firstLine = (Get-Content -LiteralPath $gitPath -TotalCount 1 -ErrorAction Stop) } catch { $firstLine = "" }
+    $gitdir = $null
+    if ($firstLine -match "^gitdir:\s*(.+)$") { $gitdir = $Matches[1].Trim() }
+    return [pscustomobject]@{
+      git_metadata_kind = if ($gitdir) { "linked_worktree_file" } else { "git_file" }
+      gitdir = $gitdir
+    }
+  }
+  return [pscustomobject]@{
+    git_metadata_kind = "missing"
+    gitdir = $null
+  }
+}
+
+function Get-TestlineIsolationInfo {
+  param([Parameter(Mandatory = $true)][string]$ProjectRoot)
+  $insideProbe = Invoke-GitProbe -ProjectRoot $ProjectRoot -Args @("rev-parse", "--is-inside-work-tree")
+  $branchProbe = Invoke-GitProbe -ProjectRoot $ProjectRoot -Args @("branch", "--show-current")
+  $topProbe = Invoke-GitProbe -ProjectRoot $ProjectRoot -Args @("rev-parse", "--show-toplevel")
+  $metadata = Get-GitMetadataInfo -ProjectRoot $ProjectRoot
+  $insideText = $insideProbe.text.Trim().ToLowerInvariant()
+  $inside = ($insideText -eq "true")
+  $branch = if ($branchProbe.text) { [string]$branchProbe.text.Trim() } else { "" }
+  $top = if ($topProbe.text) { [string]$topProbe.text.Trim() } else { $ProjectRoot }
+  $formalBranches = @("main", "master", "release", "production", "prod", "stable")
+  $isFormal = $formalBranches -contains $branch.ToLowerInvariant()
+  return [pscustomobject]@{
+    inside_git = $inside
+    branch = $branch
+    worktree = $top
+    is_formal_line = $isFormal
+    branch_or_worktree = if ($branch) { $branch } else { $top }
+    git_metadata_kind = $metadata.git_metadata_kind
+    gitdir = $metadata.gitdir
+    git_probe_status = if ($inside) { "ok" } else { "not_git_repo" }
+    inside_probe_code = $insideProbe.code
+    branch_probe_code = $branchProbe.code
+    top_probe_code = $topProbe.code
+  }
+}
+
+function Invoke-CheckTestlineIsolation {
+  param(
+    [Parameter(Mandatory = $true)][string]$ProjectRoot,
+    [switch]$Confirmed
+  )
+  $paths = Get-ReviewPaths -ProjectRoot $ProjectRoot
+  $config = Get-Config -ProjectRoot $ProjectRoot
+  $state = Get-State -ProjectRoot $ProjectRoot
+  $info = Get-TestlineIsolationInfo -ProjectRoot $ProjectRoot
+  $status = "confirmed"
+  $reason = $null
+  if (-not [bool]$info.inside_git) {
+    $status = "not_git_repo"
+    $reason = "Project is not inside a Git worktree."
+  } elseif ([bool]$info.is_formal_line) {
+    $status = "formal_line_blocked"
+    $reason = "Current branch appears to be a formal line: $($info.branch)."
+  } elseif (-not $Confirmed) {
+    $status = "needs_confirmation"
+    $reason = "User has not confirmed an isolated test branch, worktree, or disposable test line."
+  }
+  Set-ObjectProperty $state "version_control_checked" ([bool]$info.inside_git)
+  Set-ObjectProperty $state "testline_isolation_status" $status
+  Set-ObjectProperty $state "testline_branch_or_worktree" $info.branch_or_worktree
+  Set-ObjectProperty $state "testline_git_metadata_kind" $info.git_metadata_kind
+  Set-ObjectProperty $state "testline_gitdir" $info.gitdir
+  Set-ObjectProperty $state "testline_git_probe_status" $info.git_probe_status
+  Set-ObjectProperty $state "testline_boundary" "candidate_only_no_formal_merge_or_release"
+  Set-ObjectProperty $state "formal_line_protected" $true
+  Set-ObjectProperty $state "formal_completion_claim_allowed" (Get-FormalCompletionClaimAllowed)
+  if ($status -ne "confirmed") {
+    Set-ObjectProperty $state "loop_status" "paused"
+    Set-ObjectProperty $state "goal_verdict" "NEEDS_HUMAN_DECISION"
+    Set-ObjectProperty $state "candidate_status" "CANDIDATE_BLOCKED"
+    Set-ObjectProperty $state "next_action" "confirm_testline_isolation"
+    Set-ObjectProperty $state "local_only_next_action" "confirm_testline_isolation"
+    Set-ObjectProperty $state "stop_reason" $reason
+    Set-ObjectProperty $state "should_send_to_gpt" $false
+    Set-ObjectProperty $state "send_reason" "testline_isolation_not_confirmed"
+  } else {
+    Set-ObjectProperty $state "loop_status" "running"
+    Set-ObjectProperty $state "goal_verdict" "CONTINUE"
+    $candidateStatus = if ($state.candidate_status) { [string]$state.candidate_status } else { "" }
+    $candidateScore = if ($state.candidate_score) { [int]$state.candidate_score } else { 0 }
+    $targetScoreForRecovery = if ($state.target_score) { [int]$state.target_score } else { $TargetScore }
+    $recoveredCandidateStatus = if ($candidateStatus -eq "CANDIDATE_PASS" -and $candidateScore -ge $targetScoreForRecovery) { "CANDIDATE_PASS" } elseif ($candidateStatus -eq "CANDIDATE_REJECTED") { "CANDIDATE_REJECTED" } else { "CANDIDATE_PARTIAL" }
+    Set-ObjectProperty $state "candidate_status" $recoveredCandidateStatus
+    Set-ObjectProperty $state "stop_reason" $null
+    if ($state.next_action -in @("confirm_testline_isolation", "confirm_target_chatgpt_url")) { Set-ObjectProperty $state "next_action" "run_candidate_cycle" }
+    if ($state.local_only_next_action -in @("confirm_testline_isolation", "confirm_target_chatgpt_url")) { Set-ObjectProperty $state "local_only_next_action" "run_candidate_cycle" }
+    if ($state.send_reason -eq "testline_isolation_not_confirmed") { Set-ObjectProperty $state "send_reason" "testline_isolation_confirmed" }
+  }
+  if (Test-Path -LiteralPath $paths.LoopContractJson) {
+    $contract = Read-JsonFile $paths.LoopContractJson
+  } else {
+    $contract = New-LoopContractData -Profile "testline_95_auto" -ScoreTarget $TargetScore -Scope $CandidateScope -FixesPerRound $MaxFixesPerRound
+  }
+  Set-ObjectProperty $contract "loop_profile" "testline_95_auto"
+  Set-ObjectProperty $contract "loop_profile_display" (Get-LoopProfileDisplayName -Profile "testline_95_auto")
+  Set-ObjectProperty $contract "version_control_checked" ([bool]$info.inside_git)
+  Set-ObjectProperty $contract "testline_isolation_status" $status
+  Set-ObjectProperty $contract "testline_branch_or_worktree" $info.branch_or_worktree
+  Set-ObjectProperty $contract "git_metadata_kind" $info.git_metadata_kind
+  Set-ObjectProperty $contract "gitdir" $info.gitdir
+  Set-ObjectProperty $contract "formal_line_protected" $true
+  Set-ObjectProperty $contract "formal_completion_claim_allowed" (Get-FormalCompletionClaimAllowed)
+  Set-ObjectProperty $contract "warning" (Get-TestlineWarningText)
+  Write-LoopContractFiles -ProjectRoot $ProjectRoot -Contract $contract | Out-Null
+  Set-ObjectProperty $config "loop_profile" "testline_95_auto"
+  ConvertTo-JsonFile $config $paths.Config
+  Save-State $ProjectRoot $state
+  [pscustomobject]@{
+    testline_isolation_status = $status
+    reason = $reason
+    inside_git = $info.inside_git
+    branch = $info.branch
+    worktree = $info.worktree
+    warning = Get-TestlineWarningText
+  } | Format-List
+  return $status
+}
+
+function Set-LoopProfileConfiguration {
+  param([Parameter(Mandatory = $true)][string]$ProjectRoot)
+  $paths = Get-ReviewPaths -ProjectRoot $ProjectRoot
+  $config = Get-Config -ProjectRoot $ProjectRoot
+  $state = Get-State -ProjectRoot $ProjectRoot
+  $contract = New-LoopContractData -Profile $LoopProfile -ScoreTarget $TargetScore -Scope $CandidateScope -FixesPerRound $MaxFixesPerRound
+  Write-LoopContractFiles -ProjectRoot $ProjectRoot -Contract $contract | Out-Null
+  Set-ObjectProperty $config "loop_profile" $LoopProfile
+  Set-ObjectProperty $config "target_score" $TargetScore
+  Set-ObjectProperty $config "candidate_scope" $CandidateScope
+  Set-ObjectProperty $config "max_fixes_per_round" $MaxFixesPerRound
+  Set-ObjectProperty $config "allow_web_research" ([bool]$AllowWebResearch)
+  Set-ObjectProperty $config "allow_tool_discovery" ([bool]$AllowToolDiscovery)
+  ConvertTo-JsonFile $config $paths.Config
+  Apply-LoopContractState -State $state -Contract $contract
+  if ($LoopProfile -eq "testline_95_auto") {
+    Save-State $ProjectRoot $state
+    Invoke-CheckTestlineIsolation -ProjectRoot $ProjectRoot -Confirmed:$ConfirmTestlineIsolation | Out-Null
+    return
+  }
+  Set-ObjectProperty $state "loop_status" "running"
+  Set-ObjectProperty $state "goal_verdict" "CONTINUE"
+  Set-ObjectProperty $state "candidate_status" $null
+  Set-ObjectProperty $state "should_send_to_gpt" $false
+  Set-ObjectProperty $state "send_reason" "conservative_loop_profile_configured"
+  Set-ObjectProperty $state "next_action" "refresh_project_understanding"
+  Set-ObjectProperty $state "local_only_next_action" "refresh_project_understanding"
+  Save-State $ProjectRoot $state
+  Write-Host "Loop profile configured: conservative" -ForegroundColor Green
+}
+
+function Get-CandidateScoreWeights {
+  return [ordered]@{
+    goal_fit = 25
+    runnable_usability = 20
+    result_quality = 20
+    ux_readability = 15
+    stability_correctness = 10
+    delivery_completeness = 10
+  }
+}
+
+function Get-CandidateScoreBreakdown {
+  param(
+    [Parameter(Mandatory = $true)][string]$ProjectRoot,
+    [Parameter(Mandatory = $true)]$State
+  )
+  $weights = Get-CandidateScoreWeights
+  $existing = $State.candidate_score_breakdown
+  if ($existing) {
+    $allPresent = $true
+    foreach ($key in $weights.Keys) {
+      if (-not ($existing.PSObject.Properties.Name -contains $key)) { $allPresent = $false }
+    }
+    if ($allPresent) { return $existing }
+  }
+  $evidenceCount = if ($State.evidence_records) { @($State.evidence_records).Count } else { 0 }
+  $reviewCount = if ($State.captured_reviews) { @($State.captured_reviews).Count } else { 0 }
+  $goalConfidence = if ($State.goal_contract_confidence) { [string]$State.goal_contract_confidence } else { "unknown" }
+  $goalFit = if ($goalConfidence -eq "high") { 20 } elseif ($goalConfidence -eq "medium") { 17 } else { 14 }
+  $runnable = [Math]::Min(20, 10 + ($evidenceCount * 2))
+  $quality = [Math]::Min(20, 11 + $reviewCount + [Math]::Min(4, $evidenceCount))
+  $ux = if ($State.latest_visual_evidence_hash -or $State.latest_visual_evidence_path) { 12 } else { 9 }
+  $stability = if ($State.done_gate_verdict -eq "DONE_GATE_PASS") { 9 } elseif ($evidenceCount -gt 0) { 7 } else { 5 }
+  $delivery = 5
+  if ($State.latest_architecture_brief) { $delivery += 2 }
+  if (Test-Path -LiteralPath (Join-Path $ProjectRoot "docs\ai-review-loop\project-goal-plan.md")) { $delivery += 2 }
+  return [pscustomobject]@{
+    goal_fit = [Math]::Min(25, $goalFit)
+    runnable_usability = [Math]::Min(20, $runnable)
+    result_quality = [Math]::Min(20, $quality)
+    ux_readability = [Math]::Min(15, $ux)
+    stability_correctness = [Math]::Min(10, $stability)
+    delivery_completeness = [Math]::Min(10, $delivery)
+  }
+}
+
+function Get-CandidateTotalScore {
+  param([Parameter(Mandatory = $true)]$Breakdown)
+  $sum = 0
+  foreach ($value in $Breakdown.PSObject.Properties.Value) { $sum += [int]$value }
+  return $sum
+}
+
+function Get-CandidateP0Blockers {
+  param([Parameter(Mandatory = $true)]$State)
+  $queue = @($State.project_blocker_queue)
+  return @($queue | Where-Object { $_.status -eq "open" -and (([string]$_.id -match "P0|V-P0|AC-P0") -or ([string]$_.raw_text -match "P0|V-P0|AC-P0|BLOCKER|fatal|critical")) })
+}
+
+function Write-CrazyLoopReport {
+  param(
+    [Parameter(Mandatory = $true)][hashtable]$Sections
+  )
+  foreach ($heading in @(Get-CrazyLoopReportingFormat)) {
+    Write-Output $heading
+    $value = if ($Sections.ContainsKey($heading)) { $Sections[$heading] } else { "" }
+    Write-Output $(if ($null -ne $value -and [string]$value -ne "") { $value } else { "N/A" })
+  }
+}
+
+function Invoke-ScoreCandidate {
+  param([Parameter(Mandatory = $true)][string]$ProjectRoot)
+  $state = Get-State -ProjectRoot $ProjectRoot
+  $target = if ($state.target_score) { [int]$state.target_score } else { $TargetScore }
+  if ($target -le 0) { $target = 95 }
+  $breakdown = Get-CandidateScoreBreakdown -ProjectRoot $ProjectRoot -State $state
+  $score = Get-CandidateTotalScore -Breakdown $breakdown
+  $p0 = Get-CandidateP0Blockers -State $state
+  $status = if ($score -ge $target -and $p0.Count -eq 0) { "CANDIDATE_PASS" } elseif ($score -ge 80) { "CANDIDATE_PARTIAL" } else { "CANDIDATE_PARTIAL" }
+  Set-ObjectProperty $state "candidate_score_breakdown" $breakdown
+  Set-ObjectProperty $state "candidate_score" $score
+  Set-ObjectProperty $state "target_score" $target
+  Set-ObjectProperty $state "candidate_status" $status
+  Set-ObjectProperty $state "candidate_p0_blockers" @($p0 | ForEach-Object { $_.id })
+  Set-ObjectProperty $state "formal_completion_claim_allowed" (Get-FormalCompletionClaimAllowed)
+  Save-State $ProjectRoot $state
+  return [pscustomobject]@{ score = $score; target_score = $target; candidate_status = $status; breakdown = $breakdown; p0_blockers = @($p0) }
+}
+
+function Get-CandidateDeductions {
+  param([Parameter(Mandatory = $true)]$Breakdown)
+  $weights = Get-CandidateScoreWeights
+  $deductions = New-Object System.Collections.Generic.List[object]
+  foreach ($key in $weights.Keys) {
+    $actual = if ($Breakdown.PSObject.Properties.Name -contains $key) { [int]$Breakdown.$key } else { 0 }
+    $lost = [Math]::Max(0, [int]$weights[$key] - $actual)
+    if ($lost -gt 0) {
+      $recommended = switch ($key) {
+        "goal_fit" { "tighten_goal_contract_and_acceptance_gates" }
+        "runnable_usability" { "run_or_open_candidate_and_record_usage_evidence" }
+        "result_quality" { "improve_highest_visible_quality_gap" }
+        "ux_readability" { "capture_ui_or_readability_evidence_and_fix_top_issue" }
+        "stability_correctness" { "run_safe_verification_and_fix_first_failure" }
+        "delivery_completeness" { "complete_delivery_packet_and_run_instructions" }
+        default { "improve_candidate_dimension_$key" }
+      }
+      $deductions.Add([pscustomobject]@{
+          dimension = $key
+          max_points = [int]$weights[$key]
+          actual_points = $actual
+          points_lost = $lost
+          recommended_next_action = $recommended
+        }) | Out-Null
+    }
+  }
+  return @($deductions.ToArray() | Sort-Object points_lost -Descending)
+}
+
+function Invoke-SelectTopDeductions {
+  param([Parameter(Mandatory = $true)][string]$ProjectRoot)
+  $state = Get-State -ProjectRoot $ProjectRoot
+  $breakdown = if ($state.candidate_score_breakdown) { $state.candidate_score_breakdown } else { (Invoke-ScoreCandidate -ProjectRoot $ProjectRoot).breakdown }
+  $deductions = @(Get-CandidateDeductions -Breakdown $breakdown | Select-Object -First $MaxFixesPerRound)
+  Set-ObjectProperty $state "highest_deductions" @($deductions)
+  Save-State $ProjectRoot $state
+  return $deductions
+}
+
+function Invoke-PlanCandidateFixes {
+  param([Parameter(Mandatory = $true)][string]$ProjectRoot)
+  $paths = Get-ReviewPaths -ProjectRoot $ProjectRoot
+  $state = Get-State -ProjectRoot $ProjectRoot
+  $deductions = @($state.highest_deductions)
+  if ($deductions.Count -eq 0) { $deductions = @(Invoke-SelectTopDeductions -ProjectRoot $ProjectRoot) }
+  $iteration = if ($state.candidate_iteration) { [int]$state.candidate_iteration } else { 0 }
+  $stamp = Get-Date -Format "yyyyMMdd-HHmmss-fff"
+  $planPath = Join-Path $paths.LoopRuns ("candidate-fix-plan-{0}-iter-{1:000}.md" -f $stamp, ($iteration + 1))
+  $fixes = @($deductions | Select-Object -First $MaxFixesPerRound)
+  $nextAction = if ($fixes.Count -gt 0) { [string]$fixes[0].recommended_next_action } else { "find_alternative_route" }
+  $lines = @(
+    "# Candidate Fix Plan",
+    "",
+    "- profile: testline_95_auto",
+    "- target_score: $($state.target_score)",
+    "- current_score: $($state.candidate_score)",
+    "- max_fixes_per_round: $MaxFixesPerRound",
+    "- next_action: $nextAction",
+    "",
+    "## Top Deductions",
+    ""
+  )
+  foreach ($fix in $fixes) {
+    $lines += "- $($fix.dimension): lost $($fix.points_lost), action=$($fix.recommended_next_action)"
+  }
+  Set-Content -LiteralPath $planPath -Encoding UTF8 -Value ($lines -join "`n")
+  Set-ObjectProperty $state "candidate_iteration" ($iteration + 1)
+  Set-ObjectProperty $state "latest_candidate_fix_plan" (Get-RelativePath -Root $ProjectRoot -Path $planPath)
+  Set-ObjectProperty $state "next_action" $nextAction
+  Set-ObjectProperty $state "local_only_next_action" $nextAction
+  Set-ObjectProperty $state "should_send_to_gpt" $false
+  Set-ObjectProperty $state "send_reason" "testline_95_local_candidate_cycle"
+  Set-ObjectProperty $state "continuation_required" $true
+  Save-State $ProjectRoot $state
+  return $planPath
+}
+
+function Invoke-RecordCandidateScore {
+  param([Parameter(Mandatory = $true)][string]$ProjectRoot)
+  $result = Invoke-ScoreCandidate -ProjectRoot $ProjectRoot
+  $state = Get-State -ProjectRoot $ProjectRoot
+  if ($result.candidate_status -eq "CANDIDATE_PASS") {
+    Set-ObjectProperty $state "loop_status" "paused"
+    Set-ObjectProperty $state "goal_verdict" "CONTINUE"
+    Set-ObjectProperty $state "project_goal_verdict" "CONTINUE"
+    Set-ObjectProperty $state "goal_achieved_is_terminal" $false
+    Set-ObjectProperty $state "stop_reason" "candidate_pass_testline_only_not_project_total"
+    Set-ObjectProperty $state "continuation_required" $false
+    Set-ObjectProperty $state "formal_completion_claim_allowed" (Get-FormalCompletionClaimAllowed)
+  } else {
+    Set-ObjectProperty $state "loop_status" "running"
+    Set-ObjectProperty $state "goal_verdict" "CONTINUE"
+    Set-ObjectProperty $state "continuation_required" $true
+    Set-ObjectProperty $state "formal_completion_claim_allowed" (Get-FormalCompletionClaimAllowed)
+  }
+  Save-State $ProjectRoot $state
+  return $result
+}
+
+function Invoke-FindAlternativeRoute {
+  param([Parameter(Mandatory = $true)][string]$ProjectRoot)
+  $state = Get-State -ProjectRoot $ProjectRoot
+  $routes = New-Object System.Collections.Generic.List[string]
+  foreach ($route in @($state.recommended_capability_routes | Select-Object -First 6)) { if ($route) { $routes.Add([string]$route) | Out-Null } }
+  if ($routes.Count -eq 0) {
+    $routes.Add("local_verification_and_evidence") | Out-Null
+    $routes.Add("codegraph_or_filesystem_code_map") | Out-Null
+    if ($AllowToolDiscovery) { $routes.Add("tool_discovery_for_candidate_gap") | Out-Null }
+    if ($AllowWebResearch) { $routes.Add("web_or_github_research_for_reusable_route") | Out-Null }
+  }
+  Set-ObjectProperty $state "alternative_routes" @($routes.ToArray())
+  Set-ObjectProperty $state "current_candidate_route" $routes[0]
+  Save-State $ProjectRoot $state
+  return @($routes.ToArray())
+}
+
+function Invoke-RunCandidateCycle {
+  param([Parameter(Mandatory = $true)][string]$ProjectRoot)
+  $state = Get-State -ProjectRoot $ProjectRoot
+  if ($state.testline_isolation_status -ne "confirmed") {
+    Invoke-CheckTestlineIsolation -ProjectRoot $ProjectRoot -Confirmed:$ConfirmTestlineIsolation | Out-Null
+    $state = Get-State -ProjectRoot $ProjectRoot
+    if ($state.testline_isolation_status -ne "confirmed") {
+      Write-CrazyLoopReport -Sections @{
+        "【状态】" = "CANDIDATE_BLOCKED: $($state.stop_reason)"
+        "【总分】" = "N/A"
+        "【各项评分】" = "N/A"
+        "【本轮实际改动】" = "Recorded testline isolation warning and paused before crazy loop."
+        "【运行/查看/使用方式】" = "Configure with -LoopProfile testline_95_auto -ConfirmTestlineIsolation after creating an isolated test branch/worktree."
+        "【证据】" = "loop-contract.md; review-state.json"
+        "【最高扣分项】" = "testline isolation not confirmed"
+        "【下一轮自动目标】" = "confirm_testline_isolation"
+      }
+      return
+    }
+  }
+  Invoke-RefreshProjectUnderstanding -ProjectRoot $ProjectRoot -GoalMode $GoalDiscoveryMode -ArchitectureMode $ArchitectureAnalysisMode -BriefMaxChars $ArchitectureBriefMaxChars | Out-Null
+  if ($CapabilityScan -or $AllowToolDiscovery) { Invoke-CapabilityScan -ProjectRoot $ProjectRoot -Context $AuditContext | Out-Null }
+  $scoreResult = Invoke-RecordCandidateScore -ProjectRoot $ProjectRoot
+  $deductions = @(Invoke-SelectTopDeductions -ProjectRoot $ProjectRoot)
+  if ($scoreResult.candidate_status -ne "CANDIDATE_PASS") {
+    Invoke-FindAlternativeRoute -ProjectRoot $ProjectRoot | Out-Null
+    $fixPlan = Invoke-PlanCandidateFixes -ProjectRoot $ProjectRoot
+  } else {
+    $fixPlan = $null
+  }
+  $state = Get-State -ProjectRoot $ProjectRoot
+  $breakdownText = ($scoreResult.breakdown.PSObject.Properties | ForEach-Object { "$($_.Name)=$($_.Value)" }) -join "; "
+  $deductionText = if ($deductions.Count -gt 0) { ($deductions | ForEach-Object { "$($_.dimension): -$($_.points_lost) -> $($_.recommended_next_action)" }) -join "; " } else { "none" }
+  Write-CrazyLoopReport -Sections @{
+    "【状态】" = "$($state.candidate_status); formal_completion_claim_allowed=$(Get-FormalCompletionClaimAllowedText)"
+    "【总分】" = "$($state.candidate_score)/$($state.target_score)"
+    "【各项评分】" = $breakdownText
+    "【本轮实际改动】" = $(if ($fixPlan) { "Generated candidate fix plan: $(Get-RelativePath -Root $ProjectRoot -Path $fixPlan)" } else { "Recorded CANDIDATE_PASS for isolated test line only." })
+    "【运行/查看/使用方式】" = "Run next local action from review-state.json; do not merge, publish, deploy, or claim project-total completion."
+    "【证据】" = "loop-contract.md; project-goal-contract.md; architecture-brief.md; $($state.latest_candidate_fix_plan)"
+    "【最高扣分项】" = $deductionText
+    "【下一轮自动目标】" = $(if ($state.candidate_status -eq "CANDIDATE_PASS") { "stop_candidate_cycle_not_project_total" } else { $state.local_only_next_action })
+  }
 }
 
 function Get-RelativePath {
@@ -227,6 +877,49 @@ function Add-StateItem {
     Set-ObjectProperty $state $Field @($items + $Value)
   }
   Save-State $ProjectRoot $state
+}
+
+function Get-ProgressArtifacts {
+  param([Parameter(Mandatory = $true)]$State)
+  $items = @()
+  if ($State.PSObject.Properties.Name -contains "progress_artifacts" -and $null -ne $State.progress_artifacts) {
+    $items += @($State.progress_artifacts)
+  }
+  if (($items.Count -eq 0) -and $State.PSObject.Properties.Name -contains "local_progress_artifacts" -and $null -ne $State.local_progress_artifacts) {
+    $items += @($State.local_progress_artifacts)
+  }
+  return @($items | Where-Object { $_ } | Select-Object -Unique)
+}
+
+function Set-ProgressArtifacts {
+  param(
+    [Parameter(Mandatory = $true)]$State,
+    [Parameter(Mandatory = $true)]$Artifacts
+  )
+  $items = @($Artifacts | Where-Object { $_ } | Select-Object -Unique)
+  Set-ObjectProperty $State "progress_artifacts" @($items)
+  # Legacy mirror: old ledgers and tests still read local_progress_artifacts.
+  Set-ObjectProperty $State "local_progress_artifacts" @($items)
+}
+
+function Add-ProgressArtifactsToState {
+  param(
+    [Parameter(Mandatory = $true)]$State,
+    [Parameter(Mandatory = $true)]$Artifacts
+  )
+  $items = New-Object System.Collections.Generic.List[string]
+  foreach ($existing in @(Get-ProgressArtifacts -State $State)) {
+    if ($existing -and -not $items.Contains([string]$existing)) { $items.Add([string]$existing) | Out-Null }
+  }
+  foreach ($artifact in @($Artifacts)) {
+    if ($artifact -and -not $items.Contains([string]$artifact)) { $items.Add([string]$artifact) | Out-Null }
+  }
+  Set-ProgressArtifacts -State $State -Artifacts @($items.ToArray())
+}
+
+function Get-ProgressArtifactCount {
+  param([Parameter(Mandatory = $true)]$State)
+  return @((Get-ProgressArtifacts -State $State)).Count
 }
 
 function Get-QuotaSettings {
@@ -443,10 +1136,250 @@ function Test-QueueHasOnlyHumanOrAuthorization {
   return ($auto.Count -eq 0)
 }
 
+function Get-CurrentOrNextOpenBlocker {
+  param([Parameter(Mandatory = $true)]$State)
+  $queue = @($State.project_blocker_queue)
+  if ($queue.Count -eq 0) { return $null }
+  if ($State.current_blocker_id) {
+    $current = @($queue | Where-Object { $_.id -eq $State.current_blocker_id -and $_.status -eq "open" } | Select-Object -First 1)
+    if ($current.Count -gt 0) { return $current[0] }
+  }
+  return (Select-NextProjectBlocker -Queue $queue)
+}
+
+function Test-GenericLocalReviewAction {
+  param([AllowNull()][string]$ActionText)
+  if (-not $ActionText) { return $true }
+  return ($ActionText -in @(
+      "capture_or_run_local_review",
+      "run_local_council",
+      "run_local_council_after_progress",
+      "no_project_blocker_queue_item",
+      "confirm_target_chatgpt_url",
+      "next_decision_after_local_action",
+      "build_assessment",
+      "capture_or_run_efficiency_review"
+    ))
+}
+
+function Test-ActionAllowsEmptyQueueRecovery {
+  param([AllowNull()][string]$ActionText)
+  if (-not $ActionText) { return $true }
+  return ($ActionText -in @(
+      "resolve_project_completion_blockers",
+      "resolve_done_gate_findings",
+      "run_local_council",
+      "no_project_blocker_queue_item",
+      "capture_or_run_local_review",
+      "build_project_goal_plan",
+      "split_or_update_project_goal_plan"
+    ))
+}
+
 function ConvertTo-MarkdownCell {
   param([AllowNull()][string]$Text)
   if ($null -eq $Text) { return "" }
   return (($Text -replace "\r?\n", " ") -replace "\|", "\|").Trim()
+}
+
+function Resolve-EffectiveLoopAction {
+  param(
+    [Parameter(Mandatory = $true)][string]$ProjectRoot,
+    [Parameter(Mandatory = $true)]$State
+  )
+  $config = $null
+  try {
+    $config = Get-Config -ProjectRoot $ProjectRoot
+  } catch {
+    $config = $null
+  }
+  $rawNextAction = if ($State.next_action) { [string]$State.next_action } else { $null }
+  $rawLocalOnlyAction = if ($State.local_only_next_action) { [string]$State.local_only_next_action } else { $null }
+  $effectiveNextAction = $rawNextAction
+  $effectiveLocalOnlyAction = if ($rawLocalOnlyAction) { $rawLocalOnlyAction } else { $rawNextAction }
+  $proMode = if ($State.pro_review_mode) { [string]$State.pro_review_mode } elseif ($config -and $config.pro_review_mode) { [string]$config.pro_review_mode } else { "optional" }
+  $targetUrl = if ($config) {
+    if ($config.target_chatgpt_conversation_url) { $config.target_chatgpt_conversation_url } else { $config.target_chatgpt_url }
+  } else {
+    $null
+  }
+  $actionIsUrlConfirmation = (
+    $rawNextAction -eq "confirm_target_chatgpt_url" -or
+    $rawLocalOnlyAction -eq "confirm_target_chatgpt_url"
+  )
+  $urlConfirmationOnly = (
+    $actionIsUrlConfirmation -or
+    ((-not $rawNextAction) -and (-not $rawLocalOnlyAction) -and [bool]$State.url_confirmation_required -and $State.url_confirmation_reason -eq "missing_target_chatgpt_url")
+  )
+  $reason = $null
+  if ($urlConfirmationOnly -and -not (Test-ChatGptUrl $targetUrl)) {
+    if ($proMode -eq "optional") {
+      $effectiveNextAction = "capture_or_run_local_review"
+      $effectiveLocalOnlyAction = "capture_or_run_local_review"
+      $reason = "optional_pro_url_missing_local_loop"
+    } elseif ($proMode -eq "disabled") {
+      $effectiveNextAction = "capture_or_run_local_review"
+      $effectiveLocalOnlyAction = "capture_or_run_local_review"
+      $reason = "pro_review_disabled_local_loop"
+    }
+  }
+  return [pscustomobject]@{
+    next_action = $effectiveNextAction
+    local_only_next_action = $effectiveLocalOnlyAction
+    raw_next_action = $rawNextAction
+    raw_local_only_next_action = $rawLocalOnlyAction
+    normalized = [bool]$reason
+    normalization_reason = $reason
+  }
+}
+
+function Apply-EffectiveLoopActionState {
+  param(
+    [Parameter(Mandatory = $true)][string]$ProjectRoot,
+    [Parameter(Mandatory = $true)]$State,
+    [switch]$Persist
+  )
+  $action = Resolve-EffectiveLoopAction -ProjectRoot $ProjectRoot -State $State
+  if ($action.normalized) {
+    Set-ObjectProperty $State "raw_next_action" $action.raw_next_action
+    Set-ObjectProperty $State "raw_local_only_next_action" $action.raw_local_only_next_action
+    Set-ObjectProperty $State "next_action_normalization_reason" $action.normalization_reason
+    Set-ObjectProperty $State "next_action" $action.next_action
+    Set-ObjectProperty $State "local_only_next_action" $action.local_only_next_action
+    Set-ObjectProperty $State "should_send_to_gpt" $false
+    Set-ObjectProperty $State "send_reason" $action.normalization_reason
+    Set-ObjectProperty $State "continuation_required" $true
+    if ($Persist) { Save-State $ProjectRoot $State }
+  }
+  return $action
+}
+
+function Get-GoalContractEvidenceBlockers {
+  param(
+    [Parameter(Mandatory = $true)][string]$ProjectRoot,
+    [Parameter(Mandatory = $true)]$State
+  )
+  $paths = Get-ReviewPaths -ProjectRoot $ProjectRoot
+  if (-not (Test-Path -LiteralPath $paths.ProjectGoalContractJson)) {
+    try {
+      New-ProjectGoalContract -ProjectRoot $ProjectRoot -Mode $GoalDiscoveryMode -ContractMode $GoalContractMode | Out-Null
+    } catch {
+      return @()
+    }
+  }
+  if (-not (Test-Path -LiteralPath $paths.ProjectGoalContractJson)) { return @() }
+  $contract = Read-JsonFile $paths.ProjectGoalContractJson
+  $evidence = Get-GoalContractEvidenceSummary -ProjectRoot $ProjectRoot -Contract $contract
+  $items = New-Object System.Collections.Generic.List[string]
+  foreach ($gate in @($evidence.missing)) {
+    $required = if ($gate.required_evidence) { [string]::Join(",", [string[]]@($gate.required_evidence)) } else { "local_evidence" }
+    $verification = if ($gate.verification_command) { "; verification_command=$($gate.verification_command)" } else { "" }
+    $items.Add("goal-contract:$($gate.id): missing evidence for $($gate.title); required evidence=$required$verification") | Out-Null
+  }
+  foreach ($gate in @($evidence.human)) {
+    $items.Add("goal-contract:$($gate.id): Human Gate unresolved for $($gate.title)") | Out-Null
+  }
+  return @($items.ToArray())
+}
+
+function Resolve-EmptyQueueRecovery {
+  param(
+    [Parameter(Mandatory = $true)][string]$ProjectRoot,
+    [Parameter(Mandatory = $true)]$State,
+    $Guard,
+    [string]$Stage = "decision"
+  )
+  $queue = @($State.project_blocker_queue)
+  if ($queue.Count -gt 0) {
+    $next = Select-NextProjectBlocker -Queue $queue
+    return [pscustomobject]@{ recovered = [bool]$next; action = if ($next) { $next.recommended_next_action } else { $null }; reason = "queue_has_items"; blocker = $next }
+  }
+
+  $guardBlockers = @()
+  if ($Guard -and $Guard.blockers) { $guardBlockers = @($Guard.blockers) }
+  if ($guardBlockers.Count -gt 0) {
+    $next = Update-ProjectBlockerQueue -ProjectRoot $ProjectRoot -State $State -Blockers $guardBlockers
+    if ($next) {
+      Set-ObjectProperty $State "next_action" $next.recommended_next_action
+      Set-ObjectProperty $State "local_only_next_action" $next.recommended_next_action
+      Set-ObjectProperty $State "should_send_to_gpt" ($next.category -eq "needs_external_review")
+      Set-ObjectProperty $State "send_reason" $(if ($next.category -eq "needs_external_review") { "next_action_requests_external_review" } else { "empty_queue_recovered_from_completion_guard" })
+      Set-ObjectProperty $State "continuation_required" $true
+      Save-State $ProjectRoot $State
+      return [pscustomobject]@{ recovered = $true; action = $next.recommended_next_action; reason = "completion_guard_blocker"; blocker = $next }
+    }
+  }
+
+  $contractBlockers = @(Get-GoalContractEvidenceBlockers -ProjectRoot $ProjectRoot -State $State)
+  if ($contractBlockers.Count -gt 0) {
+    $next = Update-ProjectBlockerQueue -ProjectRoot $ProjectRoot -State $State -Blockers $contractBlockers
+    if ($next) {
+      Set-ObjectProperty $State "next_action" $next.recommended_next_action
+      Set-ObjectProperty $State "local_only_next_action" $next.recommended_next_action
+      Set-ObjectProperty $State "should_send_to_gpt" ($next.category -eq "needs_external_review")
+      Set-ObjectProperty $State "send_reason" $(if ($next.category -eq "needs_external_review") { "next_action_requests_external_review" } else { "empty_queue_recovered_from_goal_contract" })
+      Set-ObjectProperty $State "loop_status" "running"
+      Set-ObjectProperty $State "stop_reason" $null
+      Set-ObjectProperty $State "continuation_required" $true
+      Save-State $ProjectRoot $State
+      return [pscustomobject]@{ recovered = $true; action = $next.recommended_next_action; reason = "empty_queue_recovered_from_goal_contract"; blocker = $next }
+    }
+  }
+
+  $goalConfidence = if ($State.goal_contract_confidence) { [string]$State.goal_contract_confidence } elseif ($State.goal_confidence) { [string]$State.goal_confidence } else { "medium" }
+  if ($goalConfidence -eq "low") {
+    Set-ObjectProperty $State "loop_status" "paused"
+    Set-ObjectProperty $State "goal_verdict" "NEEDS_HUMAN_DECISION"
+    Set-ObjectProperty $State "project_goal_verdict" "NEEDS_HUMAN_DECISION"
+    Set-ObjectProperty $State "next_action" "clarify_project_total_goal"
+    Set-ObjectProperty $State "local_only_next_action" $null
+    Set-ObjectProperty $State "should_send_to_gpt" $false
+    Set-ObjectProperty $State "send_reason" "low_confidence_project_goal"
+    Set-ObjectProperty $State "stop_reason" "empty_queue_low_confidence_project_goal"
+    Set-ObjectProperty $State "continuation_required" $false
+    Save-State $ProjectRoot $State
+    return [pscustomobject]@{ recovered = $false; action = "clarify_project_total_goal"; reason = "low_confidence_project_goal"; paused = $true }
+  }
+
+  $stale = if ($State.stale_count) { [int]$State.stale_count } elseif ($State.stalled_local_action_count) { [int]$State.stalled_local_action_count } else { 0 }
+  $doneNeedsFix = ($State.done_gate_verdict -eq "NEEDS_FIX" -or $State.final_closure_verdict -eq "NEEDS_FIX" -or $State.completion_guard_status -eq "blocked_by_project_goal")
+  $backlogCount = if ($State.goal_backlog) { @($State.goal_backlog).Count } else { 0 }
+  $noOpenSlices = (-not $State.current_goal_slice_id -or $State.goal_slice_status -eq "no_open_slices")
+  if ($stale -ge 2 -and $backlogCount -eq 0 -and $noOpenSlices) {
+    Set-ObjectProperty $State "loop_status" "paused"
+    Set-ObjectProperty $State "goal_verdict" "NEEDS_HUMAN_DECISION"
+    Set-ObjectProperty $State "project_goal_verdict" "NEEDS_HUMAN_DECISION"
+    Set-ObjectProperty $State "next_action" "clarify_project_total_goal_or_completion_gate"
+    Set-ObjectProperty $State "local_only_next_action" $null
+    Set-ObjectProperty $State "should_send_to_gpt" $false
+    Set-ObjectProperty $State "send_reason" "empty_queue_repeated_no_progress"
+    Set-ObjectProperty $State "stop_reason" "empty_queue_repeated_no_progress"
+    Set-ObjectProperty $State "continuation_required" $false
+    Save-State $ProjectRoot $State
+    return [pscustomobject]@{ recovered = $false; action = "clarify_project_total_goal_or_completion_gate"; reason = "empty_queue_repeated_no_progress"; paused = $true }
+  }
+
+  $action = $null
+  $reason = $null
+  if ($doneNeedsFix -and $noOpenSlices) {
+    $action = "build_goal_slices_from_goal_contract"
+    $reason = "empty_queue_build_goal_slices"
+  } elseif ($doneNeedsFix -or $stale -ge 1) {
+    $action = "split_or_update_project_goal_plan"
+    $reason = "empty_queue_rebuild_goal_plan"
+  } else {
+    $action = "run_local_council"
+    $reason = "empty_queue_initial_local_council"
+  }
+  Set-ObjectProperty $State "next_action" $action
+  Set-ObjectProperty $State "local_only_next_action" $action
+  Set-ObjectProperty $State "should_send_to_gpt" $false
+  Set-ObjectProperty $State "send_reason" $reason
+  Set-ObjectProperty $State "loop_status" "running"
+  Set-ObjectProperty $State "stop_reason" $null
+  Set-ObjectProperty $State "continuation_required" $true
+  Save-State $ProjectRoot $State
+  return [pscustomobject]@{ recovered = ($action -ne "run_local_council"); action = $action; reason = $reason; blocker = $null }
 }
 
 function Write-ProjectGoalPlan {
@@ -456,6 +1389,7 @@ function Write-ProjectGoalPlan {
   )
   $paths = Get-ReviewPaths -ProjectRoot $ProjectRoot
   $queue = @($State.project_blocker_queue)
+  $action = Apply-EffectiveLoopActionState -ProjectRoot $ProjectRoot -State $State -Persist
   $lines = New-Object System.Collections.Generic.List[string]
   $lines.Add("# Project Goal Plan") | Out-Null
   $lines.Add("") | Out-Null
@@ -463,8 +1397,13 @@ function Write-ProjectGoalPlan {
   $lines.Add("- active_goal_scope: $($State.active_goal_scope)") | Out-Null
   $lines.Add("- terminal_goal_scope: $($State.terminal_goal_scope)") | Out-Null
   $lines.Add("- completion_guard_status: $($State.completion_guard_status)") | Out-Null
-  $lines.Add("- next_action: $($State.next_action)") | Out-Null
-  $lines.Add("- local_only_next_action: $($State.local_only_next_action)") | Out-Null
+  $lines.Add("- next_action: $($action.next_action)") | Out-Null
+  $lines.Add("- local_only_next_action: $($action.local_only_next_action)") | Out-Null
+  if ($action.normalized) {
+    $lines.Add("- raw_next_action: $($action.raw_next_action)") | Out-Null
+    $lines.Add("- raw_local_only_next_action: $($action.raw_local_only_next_action)") | Out-Null
+    $lines.Add("- normalization_reason: $($action.normalization_reason)") | Out-Null
+  }
   $lines.Add("") | Out-Null
   $lines.Add("## Goal Matrix") | Out-Null
   $lines.Add("") | Out-Null
@@ -505,7 +1444,11 @@ function Write-ProjectGoalPlan {
     project_blocker_queue = $queue
     current_blocker_id = $State.current_blocker_id
     current_blocker_category = $State.current_blocker_category
-    local_only_next_action = $State.local_only_next_action
+    next_action = $action.next_action
+    local_only_next_action = $action.local_only_next_action
+    raw_next_action = $action.raw_next_action
+    raw_local_only_next_action = $action.raw_local_only_next_action
+    normalization_reason = $action.normalization_reason
   }
   ConvertTo-JsonFile $json $jsonPath
   return [pscustomobject]@{
@@ -652,7 +1595,9 @@ function New-LocalCouncilReview {
     Set-ObjectProperty $state "goal_context_sources" @($guard.sources)
     Set-ObjectProperty $state "completion_guard_status" $guard.status
     Update-ProjectBlockerQueue -ProjectRoot $ProjectRoot -State $state -Blockers @($guard.blockers) | Out-Null
+    Resolve-EmptyQueueRecovery -ProjectRoot $ProjectRoot -State $state -Guard $guard -Stage "local_council" | Out-Null
   }
+  $state = Get-State -ProjectRoot $ProjectRoot
   $queue = @($state.project_blocker_queue)
   $routeText = if ($state.recommended_capability_routes) { [string]::Join(", ", [string[]]@($state.recommended_capability_routes | Select-Object -First 8)) } else { "(no capability scan yet)" }
   $goalModelText = if ($state.latest_goal_model) { $state.latest_goal_model } else { "(no project goal model yet)" }
@@ -670,7 +1615,8 @@ function New-LocalCouncilReview {
     $ideaLines.Add("- 相互激发：围绕 $($item.id) 产生候选推进点：$($item.raw_text)") | Out-Null
   }
   if ($queue.Count -eq 0) {
-    $ideaLines.Add("- 自由补充：当前没有 blocker 队列时，先建立项目总目标计划，再记录第一条可执行目标。") | Out-Null
+    $fallbackAction = if ($state.local_only_next_action) { [string]$state.local_only_next_action } elseif ($state.next_action) { [string]$state.next_action } else { "split_or_update_project_goal_plan" }
+    $ideaLines.Add("- 自由补充：当前没有 blocker 队列，但项目未完成时，先执行 $fallbackAction，避免重复生成会议记录。") | Out-Null
   }
 
   $groups = [ordered]@{
@@ -695,7 +1641,7 @@ function New-LocalCouncilReview {
     $evalLines.Add("") | Out-Null
   }
   $nextCandidate = Select-NextProjectBlocker -Queue $queue
-  $nextAction = if ($nextCandidate) { $nextCandidate.recommended_next_action } else { "build_project_goal_plan" }
+  $nextAction = if ($nextCandidate) { $nextCandidate.recommended_next_action } elseif ($state.local_only_next_action) { [string]$state.local_only_next_action } elseif ($state.next_action) { [string]$state.next_action } else { "split_or_update_project_goal_plan" }
   $meeting = @(
     "# Local Expert Council Meeting",
     "",
@@ -742,10 +1688,28 @@ function New-LocalCouncilReview {
   $reviewRel = Get-RelativePath -Root $ProjectRoot -Path $reviewPath
   $state = Get-State -ProjectRoot $ProjectRoot
   Set-ObjectProperty $state "latest_local_council_review" $reviewRel
-  Set-ObjectProperty $state "goal_backlog" @(New-GoalBacklogItemsFromQueue -State $state -SourceReview $reviewRel)
+  $backlogItems = @(New-GoalBacklogItemsFromQueue -State $state -SourceReview $reviewRel)
+  if ($backlogItems.Count -eq 0 -and $nextAction -and $nextAction -ne "run_local_council") {
+    $backlogItems = @([pscustomobject]@{
+        id = "GB-001"
+        title = "Execute local loop action: $nextAction"
+        source_review = $reviewRel
+        parent_goal_scope = if ($state.active_goal_scope) { [string]$state.active_goal_scope } else { "project_total" }
+        category = "needs_evidence"
+        priority = "P1"
+        status = "candidate"
+        recommended_next_action = $nextAction
+        recommended_capability_route = "local-codex"
+      })
+  }
+  Set-ObjectProperty $state "goal_backlog" @($backlogItems)
   Set-ObjectProperty $state "local_council_mode" "enabled"
-  if (-not $state.local_only_next_action) { Set-ObjectProperty $state "local_only_next_action" $nextAction }
-  if (-not $state.next_action -or $state.next_action -eq "resolve_project_completion_blockers") { Set-ObjectProperty $state "next_action" $nextAction }
+  if (-not $state.local_only_next_action -or $state.local_only_next_action -in @("capture_or_run_local_review", "run_local_council", "confirm_target_chatgpt_url")) {
+    Set-ObjectProperty $state "local_only_next_action" $nextAction
+  }
+  if (-not $state.next_action -or $state.next_action -in @("resolve_project_completion_blockers", "capture_or_run_local_review", "run_local_council", "confirm_target_chatgpt_url")) {
+    Set-ObjectProperty $state "next_action" $nextAction
+  }
   Save-State $ProjectRoot $state
   Write-GoalBacklog -ProjectRoot $ProjectRoot -State $state | Out-Null
   Write-LocalCouncilIndex -ProjectRoot $ProjectRoot -State $state | Out-Null
@@ -801,12 +1765,7 @@ function Add-ProgressArtifact {
   if (Test-Path -LiteralPath $Artifact) {
     $artifactValue = Get-RelativePath -Root $ProjectRoot -Path (Resolve-Path -LiteralPath $Artifact).Path
   }
-  foreach ($field in @("progress_artifacts", "local_progress_artifacts")) {
-    $items = @($state.$field)
-    if ($items -notcontains $artifactValue) {
-      Set-ObjectProperty $state $field @($items + $artifactValue)
-    }
-  }
+  Add-ProgressArtifactsToState -State $state -Artifacts @($artifactValue)
   Set-ObjectProperty $state "next_action" "run_local_council_after_progress"
   if ($Gate) { Set-ObjectProperty $state "latest_progress_related_gate" $Gate }
   if ($BlockerId) { Set-ObjectProperty $state "latest_progress_related_blocker_id" $BlockerId }
@@ -841,6 +1800,7 @@ function Get-ActionExecutor {
   )
   $kind = if ($Blocker -and $Blocker.action_kind) { [string]$Blocker.action_kind } else { "" }
   $text = "$kind $ActionText"
+  if ($text -match "(?i)(collect[_\-\s]?evidence|local[_\-\s]?evidence|needs[_\-\s]?evidence|collect_or_improve_local_evidence)") { return "local-evidence-ledger" }
   if ($text -match "(?i)(capture_or_run_local_review|run_local_review)") { return "local-council-ledger" }
   if ($text -match "(?i)(goal[_\-\s]?plan|split_or_update_project_goal_plan)") { return "project-goal-plan-ledger" }
   if ($text -match "(?i)(refresh_project_understanding|assess_parent_project_goal|architecture|goal_model|goal_slices)") { return "project-understanding-ledger" }
@@ -849,15 +1809,52 @@ function Get-ActionExecutor {
   return "local-evidence-ledger"
 }
 
+function Test-ActionRequestsExternalReview {
+  param([AllowNull()][string]$ActionText)
+  if (-not $ActionText) { return $false }
+  if ($ActionText -match "(?i)(local[_\-\s]?review|local[_\-\s]?council|efficiency|audit|done[_\-\s]?gate|goal[_\-\s]?plan|project[_\-\s]?understanding|next[_\-\s]?decision)") {
+    return $false
+  }
+  return ($ActionText -match "(?i)(^|[_\-\s])(gpt|pro|external|review|recheck|send)([_\-\s]|$)")
+}
+
+function Resolve-AutoAdvanceLocalAction {
+  param([Parameter(Mandatory = $true)]$State)
+  $actionText = if ($State.local_only_next_action) { [string]$State.local_only_next_action } elseif ($State.next_action) { [string]$State.next_action } else { "" }
+  $blocker = Get-CurrentOrNextOpenBlocker -State $State
+  if ($blocker -and (Test-GenericLocalReviewAction -ActionText $actionText)) {
+    return [string]$blocker.recommended_next_action
+  }
+  if (-not $actionText) { return "run_local_council" }
+  if ($actionText -match "(?i)^(next_decision_after_local_action|build_assessment|select_or_promote_generated_goal|capture_or_run_efficiency_review)$") {
+    return "build_project_goal_plan"
+  }
+  return $actionText
+}
+
 function New-ActionContract {
   param([Parameter(Mandatory = $true)][string]$ProjectRoot)
   $paths = Get-ReviewPaths -ProjectRoot $ProjectRoot
   $config = Get-Config -ProjectRoot $ProjectRoot
   $state = Get-State -ProjectRoot $ProjectRoot
+  Apply-EffectiveLoopActionState -ProjectRoot $ProjectRoot -State $state -Persist | Out-Null
+  $state = Get-State -ProjectRoot $ProjectRoot
   $actionText = if ($state.local_only_next_action) { [string]$state.local_only_next_action } elseif ($state.next_action) { [string]$state.next_action } else { "run_local_council" }
+  $blocker = Get-CurrentOrNextOpenBlocker -State $state
+  if ($blocker -and (Test-GenericLocalReviewAction -ActionText $actionText)) {
+    $actionText = [string]$blocker.recommended_next_action
+    Set-ObjectProperty $state "current_blocker_id" $blocker.id
+    Set-ObjectProperty $state "current_blocker_category" $blocker.category
+    Set-ObjectProperty $state "next_action" $actionText
+    Set-ObjectProperty $state "local_only_next_action" $actionText
+    Set-ObjectProperty $state "should_send_to_gpt" ($blocker.category -eq "needs_external_review")
+    Set-ObjectProperty $state "send_reason" $(if ($blocker.category -eq "needs_external_review") { "next_action_requests_external_review" } else { "blocker_queue_action_selected" })
+    Set-ObjectProperty $state "continuation_required" $true
+    Save-State $ProjectRoot $state
+  }
   $targetUrl = if ($config.target_chatgpt_conversation_url) { $config.target_chatgpt_conversation_url } else { $config.target_chatgpt_url }
   $proMode = if ($state.pro_review_mode) { [string]$state.pro_review_mode } elseif ($config.pro_review_mode) { [string]$config.pro_review_mode } else { "optional" }
-  if ($actionText -eq "confirm_target_chatgpt_url" -and $proMode -eq "optional" -and -not (Test-ChatGptUrl $targetUrl)) {
+  if ($actionText -eq "confirm_target_chatgpt_url" -and -not $blocker -and $proMode -eq "optional" -and -not (Test-ChatGptUrl $targetUrl)) {
     $actionText = "capture_or_run_local_review"
     Set-ObjectProperty $state "next_action" $actionText
     Set-ObjectProperty $state "local_only_next_action" $actionText
@@ -866,10 +1863,32 @@ function New-ActionContract {
     Set-ObjectProperty $state "continuation_required" $true
     Save-State $ProjectRoot $state
   }
-  $blocker = $null
-  if ($state.current_blocker_id) {
-    $blocker = @($state.project_blocker_queue | Where-Object { $_.id -eq $state.current_blocker_id } | Select-Object -First 1)
-    if ($blocker.Count -gt 0) { $blocker = $blocker[0] } else { $blocker = $null }
+  if (-not $blocker -and $state.current_blocker_id) {
+    $selected = @($state.project_blocker_queue | Where-Object { $_.id -eq $state.current_blocker_id } | Select-Object -First 1)
+    if ($selected.Count -gt 0) { $blocker = $selected[0] }
+  }
+  if (-not $blocker) {
+    $selectedByAction = @($state.project_blocker_queue | Where-Object { $_.recommended_next_action -eq $actionText -and $_.status -eq "open" } | Select-Object -First 1)
+    if ($selectedByAction.Count -gt 0) {
+      $blocker = $selectedByAction[0]
+      Set-ObjectProperty $state "current_blocker_id" $blocker.id
+      Set-ObjectProperty $state "current_blocker_category" $blocker.category
+      Save-State $ProjectRoot $state
+    }
+  }
+  if (-not $blocker) {
+    $selectedFallback = Select-NextProjectBlocker -Queue @($state.project_blocker_queue)
+    if ($selectedFallback) {
+      $blocker = $selectedFallback
+      Set-ObjectProperty $state "current_blocker_id" $blocker.id
+      Set-ObjectProperty $state "current_blocker_category" $blocker.category
+      if (Test-GenericLocalReviewAction -ActionText $actionText) {
+        $actionText = [string]$blocker.recommended_next_action
+        Set-ObjectProperty $state "next_action" $actionText
+        Set-ObjectProperty $state "local_only_next_action" $actionText
+      }
+      Save-State $ProjectRoot $state
+    }
   }
   $safeAction = ConvertTo-SafeActionName $actionText
   $stamp = Get-Date -Format "yyyyMMdd-HHmmss-fff"
@@ -966,13 +1985,7 @@ function Add-EvidenceRecord {
   Set-ObjectProperty $state "latest_evidence_id" $id
   if ($relativeArtifacts.Count -gt 0) {
     Set-ObjectProperty $state "latest_evidence" $relativeArtifacts[0]
-    foreach ($field in @("progress_artifacts", "local_progress_artifacts")) {
-      $progress = @($state.$field)
-      foreach ($artifact in @($relativeArtifacts.ToArray())) {
-        if ($progress -notcontains $artifact) { $progress += $artifact }
-      }
-      Set-ObjectProperty $state $field @($progress)
-    }
+    Add-ProgressArtifactsToState -State $state -Artifacts @($relativeArtifacts.ToArray())
   }
   if ($RelatedGate) { Set-ObjectProperty $state "latest_evidence_related_gate" $RelatedGate }
   if ($RelatedBlockerId) { Set-ObjectProperty $state "latest_evidence_related_blocker_id" $RelatedBlockerId }
@@ -983,6 +1996,214 @@ function Add-EvidenceRecord {
   return [pscustomobject]@{
     id = $id
     record = [pscustomobject]$record
+  }
+}
+
+function Get-GateIdFromBlocker {
+  param($Blocker)
+  if (-not $Blocker) { return $null }
+  foreach ($value in @($Blocker.raw_text, $Blocker.source, $Blocker.recommended_next_action)) {
+    if ($value -and [string]$value -match "(GATE-\d{3,})") { return $Matches[1] }
+  }
+  return $null
+}
+
+function Get-SafeEvidenceTerms {
+  param([AllowNull()][string]$Text)
+  $terms = New-Object System.Collections.Generic.List[string]
+  foreach ($part in @(([string]$Text) -split "[^A-Za-z0-9_\-\u4e00-\u9fff]+")) {
+    $term = $part.Trim()
+    if ($term.Length -lt 4) { continue }
+    if ($term -match "^(missing|evidence|required|local|gate|goal|contract|status|open|pass|fail|true|false)$") { continue }
+    if ($terms -notcontains $term) { $terms.Add($term) | Out-Null }
+    if ($terms.Count -ge 12) { break }
+  }
+  return @($terms.ToArray())
+}
+
+function Get-ProjectEvidenceFileCandidates {
+  param(
+    [Parameter(Mandatory = $true)][string]$ProjectRoot,
+    [string[]]$Terms = @()
+  )
+  $candidates = New-Object System.Collections.Generic.List[string]
+  $mapPath = (Get-ReviewPaths -ProjectRoot $ProjectRoot).ProjectArchitectureMap
+  if (Test-Path -LiteralPath $mapPath) {
+    try {
+      $map = Read-JsonFile $mapPath
+      foreach ($field in @("entry_points", "protected_paths", "file_sample", "key_modules")) {
+        foreach ($item in @($map.$field)) {
+          if ($item -and $candidates -notcontains [string]$item) { $candidates.Add([string]$item) | Out-Null }
+        }
+      }
+    } catch {
+    }
+  }
+  if ($candidates.Count -lt 20) {
+    try {
+      $gitFiles = & git -C $ProjectRoot ls-files 2>$null
+      if ($LASTEXITCODE -eq 0) {
+        foreach ($file in @($gitFiles | Where-Object { $_ -and $_ -notmatch "^docs/ai-review-loop/" })) {
+          if ($candidates -notcontains [string]$file) { $candidates.Add([string]$file) | Out-Null }
+          if ($candidates.Count -ge 120) { break }
+        }
+      }
+    } catch {
+    } finally {
+      $global:LASTEXITCODE = 0
+    }
+  }
+  if ($candidates.Count -lt 20) {
+    foreach ($file in @(Get-ChildItem -LiteralPath $ProjectRoot -File -Recurse -ErrorAction SilentlyContinue |
+        Where-Object { $_.FullName -notmatch "\\docs\\ai-review-loop\\" } |
+        Select-Object -First 120)) {
+      $rel = Get-RelativePath -Root $ProjectRoot -Path $file.FullName
+      if ($candidates -notcontains $rel) { $candidates.Add($rel) | Out-Null }
+    }
+  }
+  $scored = foreach ($candidate in @($candidates.ToArray())) {
+    $score = 0
+    foreach ($term in @($Terms)) {
+      if ($candidate -match [regex]::Escape($term)) { $score += 3 }
+    }
+    if ($candidate -match "(?i)(agent|readme|roadmap|acceptance|completion|gate|verify|test|run|session|bridge|adapter|config|src|app|main)") { $score += 1 }
+    [pscustomobject]@{ path = $candidate; score = $score }
+  }
+  return @($scored | Sort-Object -Property @{ Expression = "score"; Descending = $true }, path | Select-Object -First 8 | ForEach-Object { $_.path })
+}
+
+function Resolve-GateEvidenceStrategy {
+  param(
+    [Parameter(Mandatory = $true)][string]$ProjectRoot,
+    [Parameter(Mandatory = $true)]$ContractInfo,
+    $State
+  )
+  $blocker = $null
+  if ($ContractInfo.contract.source_blocker_id) {
+    $found = @($State.project_blocker_queue | Where-Object { $_.id -eq $ContractInfo.contract.source_blocker_id } | Select-Object -First 1)
+    if ($found.Count -gt 0) { $blocker = $found[0] }
+  }
+  $gateId = Get-GateIdFromBlocker -Blocker $blocker
+  if (-not $gateId -and $ContractInfo.contract.recommended_next_action -match "(?i)gate[_\-]?(\d{3,})") {
+    $gateId = "GATE-$($Matches[1])"
+  }
+  $gate = $null
+  $paths = Get-ReviewPaths -ProjectRoot $ProjectRoot
+  if ($gateId -and (Test-Path -LiteralPath $paths.ProjectGoalContractJson)) {
+    try {
+      $contract = Read-JsonFile $paths.ProjectGoalContractJson
+      $matches = @($contract.completion_gates | Where-Object { $_.id -eq $gateId } | Select-Object -First 1)
+      if ($matches.Count -gt 0) { $gate = $matches[0] }
+    } catch {
+    }
+  }
+  $rawText = if ($blocker) { [string]$blocker.raw_text } else { [string]$ContractInfo.contract.recommended_next_action }
+  $gateTitle = if ($gate -and $gate.title) { [string]$gate.title } else { $rawText }
+  $terms = Get-SafeEvidenceTerms -Text "$gateId $gateTitle $rawText $($ContractInfo.contract.recommended_next_action)"
+  $files = Get-ProjectEvidenceFileCandidates -ProjectRoot $ProjectRoot -Terms $terms
+  $verificationCommands = New-Object System.Collections.Generic.List[string]
+  if ($gate -and $gate.verification_command) { $verificationCommands.Add([string]$gate.verification_command) | Out-Null }
+  if (Test-Path -LiteralPath $paths.ProjectArchitectureMap) {
+    try {
+      $map = Read-JsonFile $paths.ProjectArchitectureMap
+      foreach ($command in @($map.verification_commands | Select-Object -First 6)) {
+        if ($command -and $verificationCommands -notcontains [string]$command) { $verificationCommands.Add([string]$command) | Out-Null }
+      }
+    } catch {
+    }
+  }
+  $codeGraphStatus = if (Test-Path -LiteralPath (Join-Path $ProjectRoot ".codegraph")) { "available_to_outer_codex_not_called_by_script" } else { "not_initialized_or_not_available_fallback_to_filesystem" }
+  $strategy = [ordered]@{
+    created_at = (Get-Date).ToString("o")
+    action_contract_id = $ContractInfo.contract.id
+    related_blocker_id = $ContractInfo.contract.source_blocker_id
+    related_gate = $gateId
+    gate_title = $gateTitle
+    evidence_kind = if ($gate -and $gate.required_evidence) { [string]::Join(",", [string[]]@($gate.required_evidence)) } else { "local_evidence" }
+    terms = @($terms)
+    candidate_files = @($files)
+    verification_command_candidates = @($verificationCommands.ToArray())
+    command_execution_policy = "not_executed_by_default_only_record_project_defined_candidates"
+    codegraph_status = $codeGraphStatus
+    status = "planned"
+  }
+  $stamp = Get-Date -Format "yyyyMMdd-HHmmss-fff"
+  $strategyPath = Join-Path $paths.LoopRuns ("$stamp-evidence-strategy.json")
+  ConvertTo-JsonFile $strategy $strategyPath
+  return [pscustomobject]@{
+    path = $strategyPath
+    relative_path = (Get-RelativePath -Root $ProjectRoot -Path $strategyPath)
+    strategy = [pscustomobject]$strategy
+    blocker = $blocker
+    gate = $gate
+  }
+}
+
+function Write-GateEvidenceArtifact {
+  param(
+    [Parameter(Mandatory = $true)][string]$ProjectRoot,
+    [Parameter(Mandatory = $true)]$ContractInfo,
+    [Parameter(Mandatory = $true)]$StrategyInfo
+  )
+  $paths = Get-ReviewPaths -ProjectRoot $ProjectRoot
+  $safe = ConvertTo-SafeActionName $ContractInfo.contract.recommended_next_action
+  $evidencePath = Join-Path $paths.Evidence ("$($ContractInfo.contract.id)-$safe.md")
+  $lines = New-Object System.Collections.Generic.List[string]
+  $lines.Add("# Gate-Aware Local Evidence") | Out-Null
+  $lines.Add("") | Out-Null
+  $lines.Add("- created_at: $(Get-Date -Format o)") | Out-Null
+  $lines.Add("- action_contract: $($ContractInfo.relative_path)") | Out-Null
+  $lines.Add("- evidence_strategy: $($StrategyInfo.relative_path)") | Out-Null
+  $lines.Add("- related_blocker_id: $($StrategyInfo.strategy.related_blocker_id)") | Out-Null
+  $lines.Add("- related_gate: $($StrategyInfo.strategy.related_gate)") | Out-Null
+  $lines.Add("- gate_title: $($StrategyInfo.strategy.gate_title)") | Out-Null
+  $lines.Add("- codegraph_status: $($StrategyInfo.strategy.codegraph_status)") | Out-Null
+  $lines.Add("- command_execution_policy: $($StrategyInfo.strategy.command_execution_policy)") | Out-Null
+  $lines.Add("") | Out-Null
+  $lines.Add("## Strategy") | Out-Null
+  $lines.Add("") | Out-Null
+  $lines.Add("- evidence_kind: $($StrategyInfo.strategy.evidence_kind)") | Out-Null
+  $lines.Add("- terms: $([string]::Join(', ', [string[]]@($StrategyInfo.strategy.terms)))") | Out-Null
+  $lines.Add("- verification_command_candidates: $([string]::Join(' | ', [string[]]@($StrategyInfo.strategy.verification_command_candidates)))") | Out-Null
+  $lines.Add("") | Out-Null
+  $lines.Add("## Bounded File Evidence") | Out-Null
+  foreach ($rel in @($StrategyInfo.strategy.candidate_files | Select-Object -First 8)) {
+    $full = Join-Path $ProjectRoot ($rel -replace "/", "\")
+    if (-not (Test-Path -LiteralPath $full)) { continue }
+    $lines.Add("") | Out-Null
+    $lines.Add("### $rel") | Out-Null
+    $lines.Add("") | Out-Null
+    $lines.Add('```text') | Out-Null
+    $lines.Add((Get-ContentExcerpt -Path $full -MaxChars 1600)) | Out-Null
+    $lines.Add('```') | Out-Null
+  }
+  if (@($StrategyInfo.strategy.candidate_files).Count -eq 0) {
+    $lines.Add("") | Out-Null
+    $lines.Add("No bounded file candidates were found. The loop should pivot to project-goal clarification or user-provided evidence.") | Out-Null
+  }
+  $lines.Add("") | Out-Null
+  $lines.Add("## Executor Boundary") | Out-Null
+  $lines.Add("") | Out-Null
+  $lines.Add("This evidence executor gathered bounded local facts only. It did not modify business code, initialize CodeGraph, run untrusted commands, push, publish, merge, delete files, or access credentials.") | Out-Null
+  Set-Content -LiteralPath $evidencePath -Encoding UTF8 -Value ($lines.ToArray() -join [Environment]::NewLine)
+  return $evidencePath
+}
+
+function Update-BlockerAfterEvidence {
+  param(
+    [Parameter(Mandatory = $true)]$State,
+    [string]$BlockerId,
+    [string]$EvidenceId,
+    [string]$EvidencePath
+  )
+  if (-not $BlockerId) { return }
+  foreach ($item in @($State.project_blocker_queue)) {
+    if ($item.id -eq $BlockerId) {
+      $item.status = "evidence_recorded"
+      Set-ObjectProperty $item "evidence_id" $EvidenceId
+      Set-ObjectProperty $item "evidence_path" $EvidencePath
+      Set-ObjectProperty $item "updated_at" (Get-Date).ToString("o")
+    }
   }
 }
 
@@ -1032,45 +2253,49 @@ function Invoke-ExecuteNextLocalAction {
       $summary = "Ran local expert council and refreshed goal backlog."
     }
     default {
-      $safe = ConvertTo-SafeActionName $contractInfo.contract.recommended_next_action
-      $evidencePath = Join-Path $paths.Evidence ("$($contractInfo.contract.id)-$safe.md")
-      $gitStatus = Get-GitText -ProjectRoot $ProjectRoot -Args @("status", "--short")
-      $diffStat = Get-GitText -ProjectRoot $ProjectRoot -Args @("diff", "--stat")
-      $body = @(
-        "# Local Action Evidence",
-        "",
-        "- created_at: $(Get-Date -Format o)",
-        "- action_contract: $($contractInfo.relative_path)",
-        "- action: $($contractInfo.contract.recommended_next_action)",
-        "- executor: $($contractInfo.contract.executor)",
-        "- related_blocker_id: $($contractInfo.contract.source_blocker_id)",
-        "",
-        "## Evidence Summary",
-        "",
-        "This conservative executor recorded local project state for the selected next action. It did not modify business code, publish, push, merge, delete files, or access credentials.",
-        "",
-        "## Git Status",
-        "",
-        '```text',
-        $gitStatus,
-        '```',
-        "",
-        "## Diff Stat",
-        "",
-        '```text',
-        $diffStat,
-        '```'
-      ) -join [Environment]::NewLine
-      Set-Content -LiteralPath $evidencePath -Encoding UTF8 -Value $body
+      $strategyInfo = Resolve-GateEvidenceStrategy -ProjectRoot $ProjectRoot -ContractInfo $contractInfo -State $state
+      $evidencePath = Write-GateEvidenceArtifact -ProjectRoot $ProjectRoot -ContractInfo $contractInfo -StrategyInfo $strategyInfo
       $artifacts.Add($evidencePath) | Out-Null
-      $summary = "Recorded local evidence snapshot for the selected action."
-      $command = "git status --short; git diff --stat"
-      $stdout = "git status:`n$gitStatus`n`ngit diff --stat:`n$diffStat"
+      $artifacts.Add($strategyInfo.path) | Out-Null
+      $summary = "Recorded gate-aware local evidence for the selected blocker or gate."
+      $command = "bounded_file_evidence_strategy"
+      $stdout = "strategy=$($strategyInfo.relative_path); codegraph_status=$($strategyInfo.strategy.codegraph_status); candidate_files=$([string]::Join(', ', [string[]]@($strategyInfo.strategy.candidate_files)))"
+      $state = Get-State -ProjectRoot $ProjectRoot
+      Set-ObjectProperty $state "latest_evidence_strategy" $strategyInfo.relative_path
+      Set-ObjectProperty $state "latest_evidence_strategy_status" "executed"
+      $attempts = if ($state.evidence_strategy_attempts) { [int]$state.evidence_strategy_attempts } else { 0 }
+      Set-ObjectProperty $state "evidence_strategy_attempts" ($attempts + 1)
+      $source = @($strategyInfo.strategy.candidate_files | Select-Object -First 1)
+      Set-ObjectProperty $state "current_evidence_source" $(if ($source.Count -gt 0) { [string]$source[0] } else { $null })
+      Save-State $ProjectRoot $state
     }
   }
   $stateForEvidence = Get-State -ProjectRoot $ProjectRoot
-  Add-EvidenceRecord -ProjectRoot $ProjectRoot -ContractInfo $contractInfo -Summary $summary -ArtifactPaths @($artifacts.ToArray()) -Command $command -ExitCode 0 -StdoutExcerpt $stdout -RelatedBlockerId $contractInfo.contract.source_blocker_id -RelatedSliceId $stateForEvidence.current_goal_slice_id -EvidenceKind "local_action_result" | Out-Null
+  $gateId = $null
+  $evidenceKind = "local_action_result"
+  if ($contractInfo.contract.executor -eq "local-evidence-ledger" -or $stateForEvidence.latest_evidence_strategy) {
+    $strategyRel = $stateForEvidence.latest_evidence_strategy
+    if ($strategyRel) {
+      $strategyPath = Join-Path $ProjectRoot ($strategyRel -replace "/", "\")
+      if (Test-Path -LiteralPath $strategyPath) {
+        try {
+          $strategy = Read-JsonFile $strategyPath
+          $gateId = $strategy.related_gate
+          if ($strategy.evidence_kind) { $evidenceKind = [string]$strategy.evidence_kind }
+        } catch {
+        }
+      }
+    }
+  }
+  $recordInfo = Add-EvidenceRecord -ProjectRoot $ProjectRoot -ContractInfo $contractInfo -Summary $summary -ArtifactPaths @($artifacts.ToArray()) -Command $command -ExitCode 0 -StdoutExcerpt $stdout -RelatedGate $gateId -RelatedBlockerId $contractInfo.contract.source_blocker_id -RelatedSliceId $stateForEvidence.current_goal_slice_id -EvidenceKind $evidenceKind
   $state = Get-State -ProjectRoot $ProjectRoot
+  if ($contractInfo.contract.source_blocker_id) {
+    Update-BlockerAfterEvidence -State $state -BlockerId $contractInfo.contract.source_blocker_id -EvidenceId $recordInfo.id -EvidencePath $state.latest_evidence
+    Set-ObjectProperty $state "project_blocker_queue" @($state.project_blocker_queue)
+  }
+  Set-ObjectProperty $state "stalled_local_action_count" 0
+  Set-ObjectProperty $state "stale_count" 0
+  Set-ObjectProperty $state "stall_pivot_status" "CONTINUE"
   Set-ObjectProperty $state "next_action" "next_decision_after_local_action"
   Set-ObjectProperty $state "local_only_next_action" $null
   Set-ObjectProperty $state "should_send_to_gpt" $false
@@ -1078,6 +2303,13 @@ function Invoke-ExecuteNextLocalAction {
   Set-ObjectProperty $state "loop_status" "running"
   Set-ObjectProperty $state "continuation_required" $true
   Save-State $ProjectRoot $state
+  try {
+    Invoke-BuildProjectGoalPlan -ProjectRoot $ProjectRoot | Out-Null
+  } catch {
+    $state = Get-State -ProjectRoot $ProjectRoot
+    Set-ObjectProperty $state "latest_evidence_strategy_status" "executed_plan_refresh_failed"
+    Save-State $ProjectRoot $state
+  }
   New-RuntimeBrief -ProjectRoot $ProjectRoot -Reason "execute_local_action" | Out-Null
   Write-Host "Executed local action: $($contractInfo.contract.recommended_next_action)" -ForegroundColor Green
   Write-Host "Action contract: $($contractInfo.path)"
@@ -1255,11 +2487,13 @@ function New-EfficiencyAuditReview {
   $previousShouldSend = $state.should_send_to_gpt
   $previousSendReason = $state.send_reason
   $previousLocalOnlyNextAction = $state.local_only_next_action
-  $artifactCount = if ($state.local_progress_artifacts) { @($state.local_progress_artifacts).Count } else { 0 }
+  $effectiveAction = Resolve-EffectiveLoopAction -ProjectRoot $ProjectRoot -State $state
+  $artifactCount = Get-ProgressArtifactCount -State $state
   $staleCount = if ($state.stale_count) { [int]$state.stale_count } elseif ($state.stalled_local_action_count) { [int]$state.stalled_local_action_count } else { 0 }
   $stallVerdict = Get-StallPivotVerdict -StaleCount $staleCount
-  $scopeDrift = if ($state.next_action -match "(?i)(push|publish|deploy|merge|delete|reset|credential|billing|external account)") { "POSSIBLE_SCOPE_DRIFT_OR_HUMAN_GATE" } else { "none_detected" }
+  $scopeDrift = if ($effectiveAction.next_action -match "(?i)(push|publish|deploy|merge|delete|reset|credential|billing|external account)") { "POSSIBLE_SCOPE_DRIFT_OR_HUMAN_GATE" } else { "none_detected" }
   $routeText = if ($state.recommended_capability_routes) { [string]::Join(", ", [string[]]@($state.recommended_capability_routes)) } else { "(run capability scan for route recommendations)" }
+  $rawActionText = if ($effectiveAction.normalized) { "`n- raw_next_action: $($effectiveAction.raw_next_action)`n- normalization_reason: $($effectiveAction.normalization_reason)" } else { "" }
   $audit = @"
 # Codex Efficiency Audit
 
@@ -1268,9 +2502,9 @@ function New-EfficiencyAuditReview {
 - efficiency_audit_mode: $($state.efficiency_audit_mode)
 - loop_status: $($state.loop_status)
 - goal_verdict: $($state.goal_verdict)
-- next_action: $($state.next_action)
+- next_action: $($effectiveAction.next_action)$rawActionText
 - should_send_to_gpt: $($state.should_send_to_gpt)
-- local_only_next_action: $($state.local_only_next_action)
+- local_only_next_action: $($effectiveAction.local_only_next_action)
 
 ## Capability Route Input
 
@@ -1488,6 +2722,8 @@ function Update-ProjectBlockerQueue {
 function Invoke-NextLocalAction {
   param([Parameter(Mandatory = $true)][string]$ProjectRoot)
   $state = Get-State -ProjectRoot $ProjectRoot
+  Apply-EffectiveLoopActionState -ProjectRoot $ProjectRoot -State $state -Persist | Out-Null
+  $state = Get-State -ProjectRoot $ProjectRoot
   $queue = @($state.project_blocker_queue)
   if ($queue.Count -eq 0 -and $state.blocking_gates) {
     $queue = New-ProjectBlockerQueue -Blockers @($state.blocking_gates)
@@ -1496,10 +2732,24 @@ function Invoke-NextLocalAction {
   }
   $next = Select-NextProjectBlocker -Queue $queue
   if (-not $next) {
-    Set-ObjectProperty $state "next_action" "run_local_council"
-    Set-ObjectProperty $state "local_only_next_action" "run_local_council"
-    Set-ObjectProperty $state "should_send_to_gpt" $false
-    Set-ObjectProperty $state "send_reason" "no_blocker_queue_run_local_council"
+    $guard = Invoke-CompletionGuard -ProjectRoot $ProjectRoot -State $state -Verdict $(if ($state.goal_verdict) { [string]$state.goal_verdict } else { "CONTINUE" })
+    $recovery = Resolve-EmptyQueueRecovery -ProjectRoot $ProjectRoot -State $state -Guard $guard -Stage "next_local_action"
+    $state = Get-State -ProjectRoot $ProjectRoot
+    $queue = @($state.project_blocker_queue)
+    $next = Select-NextProjectBlocker -Queue $queue
+    if ($next) {
+      Set-ObjectProperty $state "current_blocker_id" $next.id
+      Set-ObjectProperty $state "current_blocker_category" $next.category
+      Set-ObjectProperty $state "next_action" $next.recommended_next_action
+      Set-ObjectProperty $state "local_only_next_action" $next.recommended_next_action
+      Set-ObjectProperty $state "should_send_to_gpt" ($next.category -eq "needs_external_review")
+      Set-ObjectProperty $state "send_reason" $(if ($next.category -eq "needs_external_review") { "next_action_requests_external_review" } else { $recovery.reason })
+    } elseif ($state.loop_status -ne "paused" -and (-not $state.local_only_next_action -or $state.local_only_next_action -eq "run_local_council")) {
+      Set-ObjectProperty $state "next_action" "split_or_update_project_goal_plan"
+      Set-ObjectProperty $state "local_only_next_action" "split_or_update_project_goal_plan"
+      Set-ObjectProperty $state "should_send_to_gpt" $false
+      Set-ObjectProperty $state "send_reason" "empty_queue_rebuild_goal_plan"
+    }
   } else {
     Set-ObjectProperty $state "current_blocker_id" $next.id
     Set-ObjectProperty $state "current_blocker_category" $next.category
@@ -1697,6 +2947,8 @@ function New-RuntimeBrief {
     browser_preflight_status = $state.browser_preflight_status
     browser_backend_type = $state.browser_backend_type
     browser_target_tab_id = $state.browser_target_tab_id
+    browser_preflight_error_category = $state.browser_preflight_error_category
+    browser_preflight_error = $state.browser_preflight_error
     loop_status = $state.loop_status
     goal_verdict = $state.goal_verdict
     active_goal_scope = $state.active_goal_scope
@@ -1753,18 +3005,41 @@ function New-RuntimeBrief {
   return $briefPath
 }
 
+function Get-BrowserPreflightStatusFromError {
+  param([string]$ErrorText)
+  if (-not $ErrorText) { return "pending_edge_browser_control" }
+  if ($ErrorText -match "sandboxPolicy") { return "blocked_schema_mismatch" }
+  if ($ErrorText -match "(?i)(login|captcha|permission|account|auth)") { return "blocked_user_browser_gate" }
+  return "blocked_browser_runtime_error"
+}
+
+function Get-BrowserPreflightErrorCategory {
+  param([string]$ErrorText)
+  if (-not $ErrorText) { return $null }
+  if ($ErrorText -match "sandboxPolicy") { return "browser_runtime_schema_mismatch" }
+  if ($ErrorText -match "(?i)(login|captcha|permission|account|auth)") { return "user_browser_gate" }
+  return "browser_runtime_error"
+}
+
 function Invoke-BrowserPreflight {
-  param([Parameter(Mandatory = $true)][string]$ProjectRoot)
+  param(
+    [Parameter(Mandatory = $true)][string]$ProjectRoot,
+    [string]$ErrorText
+  )
   $state = Get-State -ProjectRoot $ProjectRoot
   $iteration = if ($state.iteration_counter) { [int]$state.iteration_counter } else { 0 }
-  if ($state.browser_preflight_iteration -eq $iteration -and $state.browser_preflight_status) {
+  if (-not $ErrorText -and $state.browser_preflight_iteration -eq $iteration -and $state.browser_preflight_status) {
     $briefPath = New-RuntimeBrief -ProjectRoot $ProjectRoot -Reason "browser_preflight_cached"
     Write-Host "Browser preflight reused from runtime state: $($state.browser_preflight_status)" -ForegroundColor Green
     Write-Host "Runtime brief: $briefPath"
     return
   }
-  Set-ObjectProperty $state "browser_preflight_status" "pending_edge_browser_control"
+  $status = Get-BrowserPreflightStatusFromError -ErrorText $ErrorText
+  $category = Get-BrowserPreflightErrorCategory -ErrorText $ErrorText
+  Set-ObjectProperty $state "browser_preflight_status" $status
   Set-ObjectProperty $state "browser_backend_type" "codex_edge_chrome_extension_backend"
+  Set-ObjectProperty $state "browser_preflight_error_category" $category
+  Set-ObjectProperty $state "browser_preflight_error" $(if ($ErrorText) { [string]$ErrorText } else { $null })
   if (-not ($state.PSObject.Properties.Name -contains "browser_target_tab_id")) {
     Set-ObjectProperty $state "browser_target_tab_id" $null
   }
@@ -1772,8 +3047,11 @@ function Invoke-BrowserPreflight {
   Set-ObjectProperty $state "browser_preflight_checked_at" (Get-Date).ToString("o")
   Save-State $ProjectRoot $state
   $briefPath = New-RuntimeBrief -ProjectRoot $ProjectRoot -Reason "browser_preflight"
-  Write-Host "Browser preflight recorded once for this iteration." -ForegroundColor Green
+  Write-Host "Browser preflight recorded once for this iteration: $status" -ForegroundColor Green
   Write-Host "Preferred route: Codex Edge/Chrome extension backend."
+  if ($category -eq "browser_runtime_schema_mismatch") {
+    Write-Host "Browser runtime schema mismatch recorded. Do not mark GPT Pro as reviewed; use the printed prompt path/target URL for manual handoff or retry after browser runtime update." -ForegroundColor Yellow
+  }
   Write-Host "Runtime brief: $briefPath"
 }
 
@@ -1839,6 +3117,14 @@ function Ensure-ReviewLoop {
   $effectiveArchitectureBriefMaxChars = if ($ArchitectureBriefMaxChars -gt 0) { $ArchitectureBriefMaxChars } elseif ($config.architecture_brief_max_chars) { [int]$config.architecture_brief_max_chars } else { 8000 }
   $effectiveLocalCouncilMode = if ($config.local_council_mode) { [string]$config.local_council_mode } else { "enabled" }
   if ($LocalCouncil) { $effectiveLocalCouncilMode = "enabled" }
+  $effectiveLoopProfile = if ($LoopProfileProvided) { $LoopProfile } elseif ($config.loop_profile) { [string]$config.loop_profile } else { "conservative" }
+  if ($effectiveLoopProfile -notin @("conservative", "testline_95_auto")) { $effectiveLoopProfile = "conservative" }
+  $effectiveTargetScore = if ($config.target_score) { [int]$config.target_score } else { $TargetScore }
+  if ($effectiveTargetScore -le 0) { $effectiveTargetScore = 95 }
+  $effectiveCandidateScope = if ($config.candidate_scope) { [string]$config.candidate_scope } else { $CandidateScope }
+  if ($effectiveCandidateScope -notin @("test_line", "branch", "worktree", "local_only")) { $effectiveCandidateScope = "test_line" }
+  $effectiveMaxFixesPerRound = if ($config.max_fixes_per_round) { [int]$config.max_fixes_per_round } else { $MaxFixesPerRound }
+  if ($effectiveMaxFixesPerRound -le 0) { $effectiveMaxFixesPerRound = 3 }
   $requiredConfig = [ordered]@{
     transport = "browser_dossier"
     run_mode = "continuous_until_stopped"
@@ -1872,6 +3158,14 @@ function Ensure-ReviewLoop {
     architecture_brief_max_chars = $effectiveArchitectureBriefMaxChars
     architecture_brief_policy = "first_baseline_or_architecture_hash_change"
     pro_role_policy = "external_expert_advisory_only"
+    loop_profile = $effectiveLoopProfile
+    target_score = $effectiveTargetScore
+    candidate_scope = $effectiveCandidateScope
+    max_fixes_per_round = $effectiveMaxFixesPerRound
+    allow_web_research = [bool]$AllowWebResearch
+    allow_tool_discovery = [bool]$AllowToolDiscovery
+    testline_isolation_required = $true
+    formal_completion_claim_allowed = (Get-FormalCompletionClaimAllowed)
   }
   foreach ($key in $requiredConfig.Keys) {
     Set-ObjectProperty $config $key $requiredConfig[$key]
@@ -1916,6 +3210,8 @@ function Ensure-ReviewLoop {
       browser_target_tab_id = $null
       browser_preflight_iteration = $null
       browser_preflight_checked_at = $null
+      browser_preflight_error_category = $null
+      browser_preflight_error = $null
       latest_visual_evidence_hash = $null
       latest_visual_evidence_path = $null
       last_visual_evidence_sent_hash = $null
@@ -1983,20 +3279,53 @@ function Ensure-ReviewLoop {
       latest_goal_slices = $null
       current_goal_slice_id = $null
       goal_slice_status = "not_built"
-      experience_collection_policy = "auto_record_key_loop_learning_events"
+      experience_collection_policy = "key_events_only"
       latest_experience_record = $null
+      latest_experience_summary = $null
       latest_auto_experience_key = $null
+      latest_experience_signal_key = $null
+      latest_experience_suppressed_reason = $null
       auto_experience_count = 0
+      suppressed_experience_count = 0
       latest_action_contract = $null
       latest_evidence = $null
       latest_evidence_id = $null
       action_executor_status = $null
+      latest_evidence_strategy = $null
+      latest_evidence_strategy_status = $null
+      evidence_strategy_attempts = 0
+      current_evidence_source = $null
+      loop_profile = $effectiveLoopProfile
+      target_score = $effectiveTargetScore
+      candidate_scope = $effectiveCandidateScope
+      max_fixes_per_round = $effectiveMaxFixesPerRound
+      loop_contract_status = "configured"
+      loop_contract_needs_user_choice = $false
+      latest_loop_contract = "docs/ai-review-loop/loop-contract.md"
+      candidate_status = $null
+      candidate_score = $null
+      candidate_score_breakdown = $null
+      highest_deductions = @()
+      current_candidate_route = $null
+      alternative_routes = @()
+      candidate_iteration = 0
+      latest_candidate_fix_plan = $null
+      testline_boundary = $null
+      version_control_checked = $false
+      testline_isolation_status = $(if ($effectiveLoopProfile -eq "testline_95_auto") { "needs_confirmation" } else { "not_required" })
+      testline_branch_or_worktree = $null
+      testline_git_metadata_kind = $null
+      testline_gitdir = $null
+      testline_git_probe_status = $null
+      formal_line_protected = $true
+      formal_completion_claim_allowed = (Get-FormalCompletionClaimAllowed)
+      candidate_p0_blockers = @()
       action_contracts = @()
       evidence_records = @()
     }
   } else {
     $state = Read-JsonFile $paths.State
-    foreach ($field in @("version", "iteration_counter", "loop_mode", "loop_status", "latest_review", "latest_assessment_prompt", "goal_verdict", "next_action", "stop_reason", "baseline_sent_to_url", "baseline_sent_hash", "latest_prompt_target_url", "latest_prompt_opened_tab_url", "latest_assessment_target_url", "latest_assessment_opened_tab_url", "continuation_required", "url_confirmation_required", "url_confirmation_reason", "quota_mode", "runtime_brief", "browser_preflight_status", "browser_backend_type", "browser_target_tab_id", "browser_preflight_iteration", "browser_preflight_checked_at", "latest_visual_evidence_hash", "latest_visual_evidence_path", "last_visual_evidence_sent_hash", "attach_visual_evidence_requested", "last_prompt_chars", "cumulative_prompt_chars", "external_review_count", "local_only_iteration_count", "should_send_to_gpt", "send_reason", "local_only_next_action", "active_goal_scope", "terminal_goal_scope", "subgoal_verdict", "project_goal_verdict", "completion_guard_status", "goal_achieved_is_terminal", "gpt_courtesy_footer_sent_count", "current_blocker_id", "current_blocker_category", "blocker_queue_updated_at", "stalled_local_action_count", "pro_review_mode", "efficiency_audit_mode", "latest_capability_scan", "latest_efficiency_audit", "latest_done_gate", "latest_final_closure", "capability_scan_basis", "top_capability_family", "top_capability_status", "stale_count", "stall_pivot_status", "done_gate_verdict", "final_closure_verdict", "pro_tab_close_policy", "pro_tab_close_status", "pro_tab_close_target_url", "pro_tab_closed_at", "local_council_mode", "latest_local_council_review", "active_generated_goal_id", "project_total_goal", "goal_confidence", "latest_goal_contract", "goal_contract_hash", "goal_contract_confidence", "goal_contract_status", "latest_goal_model", "latest_architecture_snapshot", "latest_architecture_map", "latest_architecture_brief", "architecture_brief_hash", "architecture_brief_sent_hash", "latest_prompt_included_architecture_brief", "latest_goal_slices", "current_goal_slice_id", "goal_slice_status", "experience_collection_policy", "latest_experience_record", "latest_auto_experience_key", "auto_experience_count", "latest_action_contract", "latest_evidence", "latest_evidence_id", "action_executor_status")) {
+    foreach ($field in @("version", "iteration_counter", "loop_mode", "loop_status", "latest_review", "latest_assessment_prompt", "goal_verdict", "next_action", "raw_next_action", "raw_local_only_next_action", "next_action_normalization_reason", "stop_reason", "baseline_sent_to_url", "baseline_sent_hash", "latest_prompt_target_url", "latest_prompt_opened_tab_url", "latest_assessment_target_url", "latest_assessment_opened_tab_url", "continuation_required", "url_confirmation_required", "url_confirmation_reason", "quota_mode", "runtime_brief", "browser_preflight_status", "browser_backend_type", "browser_target_tab_id", "browser_preflight_iteration", "browser_preflight_checked_at", "browser_preflight_error_category", "browser_preflight_error", "latest_visual_evidence_hash", "latest_visual_evidence_path", "last_visual_evidence_sent_hash", "attach_visual_evidence_requested", "last_prompt_chars", "cumulative_prompt_chars", "external_review_count", "local_only_iteration_count", "should_send_to_gpt", "send_reason", "local_only_next_action", "active_goal_scope", "terminal_goal_scope", "subgoal_verdict", "project_goal_verdict", "completion_guard_status", "goal_achieved_is_terminal", "gpt_courtesy_footer_sent_count", "current_blocker_id", "current_blocker_category", "blocker_queue_updated_at", "stalled_local_action_count", "pro_review_mode", "efficiency_audit_mode", "latest_capability_scan", "latest_efficiency_audit", "latest_done_gate", "latest_final_closure", "capability_scan_basis", "top_capability_family", "top_capability_status", "stale_count", "stall_pivot_status", "done_gate_verdict", "final_closure_verdict", "pro_tab_close_policy", "pro_tab_close_status", "pro_tab_close_target_url", "pro_tab_closed_at", "local_council_mode", "latest_local_council_review", "active_generated_goal_id", "project_total_goal", "goal_confidence", "latest_goal_contract", "goal_contract_hash", "goal_contract_confidence", "goal_contract_status", "latest_goal_model", "latest_architecture_snapshot", "latest_architecture_map", "latest_architecture_brief", "architecture_brief_hash", "architecture_brief_sent_hash", "latest_prompt_included_architecture_brief", "latest_goal_slices", "current_goal_slice_id", "goal_slice_status", "experience_collection_policy", "latest_experience_record", "latest_experience_summary", "latest_auto_experience_key", "latest_experience_signal_key", "latest_experience_suppressed_reason", "auto_experience_count", "suppressed_experience_count", "latest_action_contract", "latest_evidence", "latest_evidence_id", "action_executor_status", "latest_evidence_strategy", "latest_evidence_strategy_status", "evidence_strategy_attempts", "current_evidence_source", "loop_profile", "target_score", "candidate_scope", "max_fixes_per_round", "loop_contract_status", "loop_contract_needs_user_choice", "latest_loop_contract", "candidate_status", "candidate_score", "candidate_score_breakdown", "current_candidate_route", "candidate_iteration", "latest_candidate_fix_plan", "testline_boundary", "version_control_checked", "testline_isolation_status", "testline_branch_or_worktree", "testline_git_metadata_kind", "testline_gitdir", "testline_git_probe_status", "formal_line_protected", "formal_completion_claim_allowed")) {
       if (-not ($state.PSObject.Properties.Name -contains $field)) {
         $default = $null
         if ($field -eq "version") { $default = 9 }
@@ -2033,12 +3362,26 @@ function Ensure-ReviewLoop {
         if ($field -eq "goal_contract_status") { $default = "not_built" }
         if ($field -eq "latest_prompt_included_architecture_brief") { $default = $false }
         if ($field -eq "goal_slice_status") { $default = "not_built" }
-        if ($field -eq "experience_collection_policy") { $default = "auto_record_key_loop_learning_events" }
+        if ($field -eq "experience_collection_policy") { $default = "key_events_only" }
         if ($field -eq "auto_experience_count") { $default = 0 }
+        if ($field -eq "suppressed_experience_count") { $default = 0 }
+        if ($field -eq "evidence_strategy_attempts") { $default = 0 }
+        if ($field -eq "loop_profile") { $default = $effectiveLoopProfile }
+        if ($field -eq "target_score") { $default = $effectiveTargetScore }
+        if ($field -eq "candidate_scope") { $default = $effectiveCandidateScope }
+        if ($field -eq "max_fixes_per_round") { $default = $effectiveMaxFixesPerRound }
+        if ($field -eq "loop_contract_status") { $default = "configured" }
+        if ($field -eq "loop_contract_needs_user_choice") { $default = $false }
+        if ($field -eq "latest_loop_contract") { $default = "docs/ai-review-loop/loop-contract.md" }
+        if ($field -eq "candidate_iteration") { $default = 0 }
+        if ($field -eq "testline_isolation_status") { $default = $(if ($effectiveLoopProfile -eq "testline_95_auto") { "needs_confirmation" } else { "not_required" }) }
+        if ($field -eq "version_control_checked") { $default = $false }
+        if ($field -eq "formal_line_protected") { $default = $true }
+        if ($field -eq "formal_completion_claim_allowed") { $default = Get-FormalCompletionClaimAllowed }
         Set-ObjectProperty $state $field $default
       }
     }
-    foreach ($field in @("pending_prompts", "pending_reviews", "captured_reviews", "pending_assessments", "blocking_gates", "goal_context_sources", "project_blocker_queue", "local_progress_artifacts", "progress_artifacts", "goal_backlog", "recommended_capability_routes", "goal_sources", "goal_authority_sources", "action_contracts", "evidence_records")) {
+    foreach ($field in @("pending_prompts", "pending_reviews", "captured_reviews", "pending_assessments", "blocking_gates", "goal_context_sources", "project_blocker_queue", "local_progress_artifacts", "progress_artifacts", "goal_backlog", "recommended_capability_routes", "goal_sources", "goal_authority_sources", "action_contracts", "evidence_records", "highest_deductions", "alternative_routes", "candidate_p0_blockers")) {
       if (-not ($state.PSObject.Properties.Name -contains $field) -or $null -eq $state.$field) {
         Set-ObjectProperty $state $field @()
       }
@@ -2050,6 +3393,12 @@ function Ensure-ReviewLoop {
     Set-ObjectProperty $state "efficiency_audit_mode" $effectiveEfficiencyAuditMode
     Set-ObjectProperty $state "pro_tab_close_policy" "target_conversation"
     Set-ObjectProperty $state "local_council_mode" $effectiveLocalCouncilMode
+    Set-ObjectProperty $state "loop_profile" $effectiveLoopProfile
+    Set-ObjectProperty $state "target_score" $effectiveTargetScore
+    Set-ObjectProperty $state "candidate_scope" $effectiveCandidateScope
+    Set-ObjectProperty $state "max_fixes_per_round" $effectiveMaxFixesPerRound
+    Set-ObjectProperty $state "formal_line_protected" $true
+    Set-ObjectProperty $state "formal_completion_claim_allowed" (Get-FormalCompletionClaimAllowed)
     if ($GoalScopeProvided) { Set-ObjectProperty $state "active_goal_scope" $effectiveGoalScope }
     if ($TerminalGoalScopeProvided) { Set-ObjectProperty $state "terminal_goal_scope" $effectiveTerminalGoalScope }
     $stateTargetBefore = $state.target_chatgpt_conversation_url
@@ -2072,6 +3421,18 @@ function Ensure-ReviewLoop {
   if ($config.target_chatgpt_conversation_url -and $state.target_chatgpt_conversation_url -ne $config.target_chatgpt_conversation_url) {
     Set-ObjectProperty $state "target_chatgpt_conversation_url" $config.target_chatgpt_conversation_url
   }
+  $contractMissingForRun = (-not (Test-Path -LiteralPath $paths.LoopContractJson)) -and ($Action -in @("Run", "RunLoop")) -and (-not $LoopProfileProvided)
+  Ensure-LoopContract -ProjectRoot $ProjectRoot -State $state -Config $config -Profile $effectiveLoopProfile -NeedsUserChoice:$contractMissingForRun -Reason $(if ($contractMissingForRun) { "choose_conservative_or_testline_95_auto" } else { $null }) | Out-Null
+  if ($contractMissingForRun) {
+    Set-ObjectProperty $state "loop_status" "paused"
+    Set-ObjectProperty $state "goal_verdict" "NEEDS_HUMAN_DECISION"
+    Set-ObjectProperty $state "next_action" "configure_loop_profile"
+    Set-ObjectProperty $state "local_only_next_action" "configure_loop_profile"
+    Set-ObjectProperty $state "should_send_to_gpt" $false
+    Set-ObjectProperty $state "send_reason" "loop_contract_needs_user_choice"
+    Set-ObjectProperty $state "stop_reason" "choose_loop_profile"
+  }
+  ConvertTo-JsonFile $config $paths.Config
   $effectiveTarget = $config.target_chatgpt_conversation_url
   if (-not $effectiveTarget) { $effectiveTarget = $config.target_chatgpt_url }
   if ($effectiveProReviewMode -eq "disabled") {
@@ -3429,6 +4790,22 @@ function New-ReviewPackage {
   return $promptPath
 }
 
+function Invoke-PrepareCompactReviewAction {
+  param(
+    [Parameter(Mandatory = $true)][string]$ProjectRoot,
+    [string]$ChatUrl,
+    [switch]$AllowSensitiveData,
+    [switch]$ForceFullBaseline,
+    [string]$Mode = "economy",
+    [int]$PromptLimit = 0
+  )
+  Ensure-ReviewLoop -ProjectRoot $ProjectRoot -ChatUrl $ChatUrl | Out-Null
+  $config = Get-Config -ProjectRoot $ProjectRoot
+  if ($config.pro_review_mode -ne "disabled") { Assert-TargetChatGptUrl -ProjectRoot $ProjectRoot | Out-Null }
+  $scan = Invoke-SensitiveScan -ProjectRoot $ProjectRoot -Allow:$AllowSensitiveData
+  New-ReviewPackage -ProjectRoot $ProjectRoot -ScanPath $scan -ForceFullBaseline:$ForceFullBaseline -Mode $Mode -PromptLimit $PromptLimit | Out-Null
+}
+
 function Complete-PromptSend {
   param(
     [Parameter(Mandatory = $true)][string]$ProjectRoot,
@@ -3770,8 +5147,15 @@ function Invoke-NextDecision {
   $config = Get-Config $ProjectRoot
   $state = Get-State $ProjectRoot
   $effectiveProMode = if ($state.pro_review_mode) { [string]$state.pro_review_mode } elseif ($config.pro_review_mode) { [string]$config.pro_review_mode } else { "optional" }
+  $targetUrl = if ($config.target_chatgpt_conversation_url) { $config.target_chatgpt_conversation_url } else { $config.target_chatgpt_url }
+  $forceExternalAllowed = [bool]$ForceExternalReview
+  if ($forceExternalAllowed -and $effectiveProMode -eq "optional" -and -not (Test-ChatGptUrl $targetUrl)) {
+    $forceExternalAllowed = $false
+    Set-ObjectProperty $state "url_confirmation_required" $true
+    Set-ObjectProperty $state "url_confirmation_reason" "missing_target_chatgpt_url"
+  }
   $previousLocalAction = if ($state.local_only_next_action) { [string]$state.local_only_next_action } else { $null }
-  $previousArtifactCount = if ($state.local_progress_artifacts) { @($state.local_progress_artifacts).Count } else { 0 }
+  $previousArtifactCount = Get-ProgressArtifactCount -State $state
   $verdict = if ($state.goal_verdict) { [string]$state.goal_verdict } else { "CONTINUE" }
   $guard = Invoke-CompletionGuard -ProjectRoot $ProjectRoot -State $state -Verdict $verdict
   $status = "running"
@@ -3829,6 +5213,16 @@ function Invoke-NextDecision {
   Set-ObjectProperty $state "goal_context_sources" @($guard.sources)
   Set-ObjectProperty $state "goal_achieved_is_terminal" $terminalAllowed
   $selectedBlocker = Update-ProjectBlockerQueue -ProjectRoot $ProjectRoot -State $state -Blockers @($guard.blockers)
+  $actionAllowsRecovery = Test-ActionAllowsEmptyQueueRecovery -ActionText $(if ($state.next_action) { [string]$state.next_action } else { $null })
+  if ($status -eq "running" -and $actionAllowsRecovery -and (-not $selectedBlocker) -and @($state.project_blocker_queue).Count -eq 0) {
+    $recovery = Resolve-EmptyQueueRecovery -ProjectRoot $ProjectRoot -State $state -Guard $guard -Stage "next_decision"
+    $state = Get-State -ProjectRoot $ProjectRoot
+    if ($recovery.paused) {
+      $status = if ($state.loop_status) { [string]$state.loop_status } else { "paused" }
+      $stopReason = $state.stop_reason
+    }
+    $selectedBlocker = Select-NextProjectBlocker -Queue @($state.project_blocker_queue)
+  }
   if ($state.goal_confidence -eq "low") {
     $status = "paused"
     $stopReason = "low_confidence_project_goal"
@@ -3839,7 +5233,7 @@ function Invoke-NextDecision {
   if ($terminalAllowed) {
     Set-ObjectProperty $state "project_goal_verdict" "GOAL_ACHIEVED"
   }
-  if ($status -eq "running" -and $state.next_action -eq "resolve_project_completion_blockers") {
+  if ($status -eq "running" -and (Test-ActionAllowsEmptyQueueRecovery -ActionText $(if ($state.next_action) { [string]$state.next_action } else { $null }))) {
     if (Test-QueueHasOnlyHumanOrAuthorization -Queue @($state.project_blocker_queue)) {
       $status = "paused"
       $stopReason = "human_or_authorization_required"
@@ -3847,11 +5241,19 @@ function Invoke-NextDecision {
       Set-ObjectProperty $state "next_action" "request_human_decision_for_project_blockers"
     } elseif ($selectedBlocker) {
       Set-ObjectProperty $state "next_action" $selectedBlocker.recommended_next_action
+    } else {
+      Resolve-EmptyQueueRecovery -ProjectRoot $ProjectRoot -State $state -Guard $guard -Stage "next_decision_fallback" | Out-Null
+      $state = Get-State -ProjectRoot $ProjectRoot
+      if ($state.loop_status -eq "paused") {
+        $status = "paused"
+        $stopReason = $state.stop_reason
+      }
     }
   }
   Set-ObjectProperty $state "loop_status" $status
   Set-ObjectProperty $state "stop_reason" $stopReason
   Set-ObjectProperty $state "continuation_required" ($status -eq "running")
+  Apply-EffectiveLoopActionState -ProjectRoot $ProjectRoot -State $state | Out-Null
   $nextActionText = if ($state.next_action) { [string]$state.next_action } else { "" }
   $shouldSend = $false
   $sendReason = "terminal_or_paused"
@@ -3865,10 +5267,10 @@ function Invoke-NextDecision {
     } elseif ($proReviewRequiredMissing) {
       $shouldSend = $true
       $sendReason = "pro_review_required"
-    } elseif ($ForceExternalReview) {
+    } elseif ($forceExternalAllowed) {
       $shouldSend = $true
       $sendReason = "force_external_review"
-    } elseif ($nextActionText -match "(?i)(^|[_\-\s])(gpt|pro|external|review|recheck|send)([_\-\s]|$)") {
+    } elseif (Test-ActionRequestsExternalReview -ActionText $nextActionText) {
       $shouldSend = $true
       $sendReason = "next_action_requests_external_review"
     } else {
@@ -3879,7 +5281,7 @@ function Invoke-NextDecision {
     }
   }
   if ($status -eq "running" -and $localOnlyNextAction) {
-    $currentArtifactCount = if ($state.local_progress_artifacts) { @($state.local_progress_artifacts).Count } else { 0 }
+    $currentArtifactCount = Get-ProgressArtifactCount -State $state
     $stalledCount = if ($state.stalled_local_action_count) { [int]$state.stalled_local_action_count } else { 0 }
     if ($previousLocalAction -eq $localOnlyNextAction -and $currentArtifactCount -le $previousArtifactCount) {
       $stalledCount += 1
@@ -4010,6 +5412,200 @@ function Invoke-NextDecision {
   Write-Host "Loop run record: $runPath"
 }
 
+function Invoke-AutoAdvanceLocalLoopStep {
+  param(
+    [Parameter(Mandatory = $true)][string]$ProjectRoot,
+    [string]$Trigger = "run_loop"
+  )
+  $state = Get-State -ProjectRoot $ProjectRoot
+  if ($state.loop_status -ne "running") {
+    Write-Host "Auto local advance skipped: loop_status=$($state.loop_status)" -ForegroundColor Yellow
+    return [pscustomobject]@{ advanced = $false; reason = "loop_not_running" }
+  }
+  if ([bool]$state.should_send_to_gpt) {
+    Write-Host "Auto local advance skipped: GPT handoff is required." -ForegroundColor Yellow
+    return [pscustomobject]@{ advanced = $false; reason = "gpt_handoff_required" }
+  }
+  $actionText = Resolve-AutoAdvanceLocalAction -State $state
+  if (Test-ActionRequestsExternalReview -ActionText $actionText) {
+    Write-Host "Auto local advance skipped: action requests external review: $actionText" -ForegroundColor Yellow
+    return [pscustomobject]@{ advanced = $false; reason = "external_review_action"; action = $actionText }
+  }
+  Set-ObjectProperty $state "next_action" $actionText
+  Set-ObjectProperty $state "local_only_next_action" $actionText
+  Set-ObjectProperty $state "should_send_to_gpt" $false
+  Set-ObjectProperty $state "send_reason" "auto_local_advance"
+  Set-ObjectProperty $state "continuation_required" $true
+  Save-State $ProjectRoot $state
+  $assessmentText = @"
+## Auto Local Loop Assessment
+
+- trigger: $Trigger
+- selected_local_action: $actionText
+- latest_review: $($state.latest_review)
+- latest_efficiency_audit: $($state.latest_efficiency_audit)
+- latest_goal_contract: $($state.latest_goal_contract)
+- done_gate_verdict: $($state.done_gate_verdict)
+
+Codex should continue locally because should_send_to_gpt=false. GPT Pro is optional and no new external-review question is required for this step. This assessment exists so RunLoop can advance the local ledger instead of stopping after a status-style report.
+"@
+  New-LocalAssessment -ProjectRoot $ProjectRoot -Text $assessmentText -Type "combined-next-decision" -Verdict "CONTINUE" -ActionText $actionText | Out-Null
+  Invoke-NextDecision -ProjectRoot $ProjectRoot | Out-Null
+  $state = Get-State -ProjectRoot $ProjectRoot
+  if ($state.loop_status -eq "running" -and -not [bool]$state.should_send_to_gpt -and $state.local_only_next_action) {
+    Invoke-ExecuteNextLocalAction -ProjectRoot $ProjectRoot | Out-Null
+    $state = Get-State -ProjectRoot $ProjectRoot
+    if ($state.loop_status -eq "running" -and -not [bool]$state.should_send_to_gpt) {
+      Invoke-NextLocalAction -ProjectRoot $ProjectRoot | Out-Null
+      $state = Get-State -ProjectRoot $ProjectRoot
+    }
+    Add-AutoExperienceRecord -ProjectRoot $ProjectRoot -Trigger "auto_local_advance" -Outcome "success" -Lesson "RunLoop should execute one safe local ledger step when GPT is not needed, so outer agents cannot stop at a status-only response." -Notes "trigger=$Trigger; selected_local_action=$actionText; latest_action_contract=$($state.latest_action_contract); latest_evidence=$($state.latest_evidence)" | Out-Null
+    Write-Host "Auto local loop step executed: $actionText" -ForegroundColor Green
+    Write-Host "Latest action contract: $($state.latest_action_contract)"
+    Write-Host "Latest evidence: $($state.latest_evidence)"
+    return [pscustomobject]@{ advanced = $true; reason = "local_action_executed"; action = $actionText; latest_action_contract = $state.latest_action_contract; latest_evidence = $state.latest_evidence }
+  }
+  Write-Host "Auto local advance stopped before execution: loop_status=$($state.loop_status), should_send_to_gpt=$($state.should_send_to_gpt), local_only_next_action=$($state.local_only_next_action)" -ForegroundColor Yellow
+  return [pscustomobject]@{ advanced = $false; reason = "post_decision_not_local"; action = $actionText }
+}
+
+function Invoke-ReviewLoopCycle {
+  param(
+    [Parameter(Mandatory = $true)][string]$ProjectRoot,
+    [ValidateSet("Run", "RunLoop")][string]$CycleName = "RunLoop",
+    [string]$RuntimeReason = "run_loop_local_first",
+    [string]$ExperienceTrigger = "run_loop_local_first",
+    [string]$LocalFirstLesson = "A local-first loop iteration should run the local council or next local action instead of spending GPT quota when no new external judgment is needed.",
+    [switch]$StrictPreflightAudit,
+    [switch]$AutoAdvance,
+    [switch]$AllowSensitiveData,
+    [switch]$ForceFullBaseline,
+    [string]$Mode = "economy",
+    [int]$PromptLimit = 0,
+    [switch]$CapabilityScanRequested,
+    [string]$AuditContextText,
+    [switch]$ForceExternalReviewRequested,
+    [switch]$LocalCouncilRequested,
+    [switch]$BrowserPreflightRequested,
+    [switch]$MarkSent,
+    [string]$GoalMode = "auto",
+    [string]$ArchitectureMode = "standard",
+    [int]$BriefMaxChars = 8000
+  )
+  $initialState = Get-State -ProjectRoot $ProjectRoot
+  if ([bool]$initialState.loop_contract_needs_user_choice) {
+    Write-Host "Loop contract needs user choice before RunLoop." -ForegroundColor Yellow
+    Write-Host "Run ConfigureLoopProfile with -LoopProfile conservative or -LoopProfile testline_95_auto."
+    return [pscustomobject]@{ paused = $true; reason = "loop_contract_needs_user_choice" }
+  }
+  if ($initialState.loop_profile -eq "testline_95_auto") {
+    Invoke-RunCandidateCycle -ProjectRoot $ProjectRoot
+    return [pscustomobject]@{ candidate_cycle = $true }
+  }
+  Invoke-RefreshProjectUnderstanding -ProjectRoot $ProjectRoot -GoalMode $GoalMode -ArchitectureMode $ArchitectureMode -BriefMaxChars $BriefMaxChars | Out-Null
+  $config = Get-Config -ProjectRoot $ProjectRoot
+  $state = Get-State -ProjectRoot $ProjectRoot
+  if ($state.efficiency_audit_mode -ne "off" -and (-not $state.latest_capability_scan -or $CapabilityScanRequested)) {
+    Invoke-CapabilityScan -ProjectRoot $ProjectRoot -Context $AuditContextText | Out-Null
+    $state = Get-State -ProjectRoot $ProjectRoot
+  }
+  if ($StrictPreflightAudit -and $state.efficiency_audit_mode -eq "strict") {
+    New-EfficiencyAuditReview -ProjectRoot $ProjectRoot -AuditPhase "preflight-audit" | Out-Null
+    $state = Get-State -ProjectRoot $ProjectRoot
+  }
+
+  $nextActionText = if ($state.next_action) { [string]$state.next_action } else { "" }
+  $needsExternal = $ForceExternalReviewRequested -or $config.pro_review_mode -eq "required" -or (Test-ActionRequestsExternalReview -ActionText $nextActionText)
+  $targetUrl = if ($config.target_chatgpt_conversation_url) { $config.target_chatgpt_conversation_url } else { $config.target_chatgpt_url }
+  $urlConfirmationOnly = ($nextActionText -eq "confirm_target_chatgpt_url" -or ($state.url_confirmation_reason -eq "missing_target_chatgpt_url" -and [bool]$state.url_confirmation_required))
+  $missingOptionalProUrl = ($config.pro_review_mode -eq "optional" -and ($needsExternal -or $urlConfirmationOnly) -and -not (Test-ChatGptUrl $targetUrl))
+  if ($config.pro_review_mode -eq "required" -and $needsExternal) { Assert-TargetChatGptUrl -ProjectRoot $ProjectRoot | Out-Null }
+  if ($missingOptionalProUrl) {
+    $needsExternal = $false
+    $openBlocker = Get-CurrentOrNextOpenBlocker -State $state
+    $fallbackAction = if ($openBlocker) { [string]$openBlocker.recommended_next_action } else { "capture_or_run_local_review" }
+    Set-ObjectProperty $state "raw_next_action" $(if ($state.next_action) { [string]$state.next_action } else { $null })
+    Set-ObjectProperty $state "raw_local_only_next_action" $(if ($state.local_only_next_action) { [string]$state.local_only_next_action } else { $null })
+    Set-ObjectProperty $state "next_action_normalization_reason" "optional_pro_url_missing_local_loop"
+    Set-ObjectProperty $state "loop_status" "running"
+    Set-ObjectProperty $state "continuation_required" $true
+    Set-ObjectProperty $state "should_send_to_gpt" $false
+    Set-ObjectProperty $state "send_reason" "pro_url_missing_local_loop"
+    Set-ObjectProperty $state "next_action" $fallbackAction
+    Set-ObjectProperty $state "local_only_next_action" $fallbackAction
+    if ($openBlocker) {
+      Set-ObjectProperty $state "current_blocker_id" $openBlocker.id
+      Set-ObjectProperty $state "current_blocker_category" $openBlocker.category
+    }
+    Set-ObjectProperty $state "url_confirmation_required" $true
+    Set-ObjectProperty $state "url_confirmation_reason" "missing_target_chatgpt_url"
+    Save-State $ProjectRoot $state
+    Add-AutoExperienceRecord -ProjectRoot $ProjectRoot -Trigger "pro_url_missing_local_loop" -Outcome "needs-improvement" -Lesson "Missing optional GPT Pro URL must downgrade to a local review loop, not a final answer or claimed external Pro review." -Notes "$CycleName could not send GPT Pro material because no target ChatGPT URL is configured. Continue with local reviewers, local assessment, NextDecision, and local action." | Out-Null
+    $state = Get-State -ProjectRoot $ProjectRoot
+  }
+
+  $promptPath = $null
+  if ($config.pro_review_mode -ne "disabled" -and $needsExternal) {
+    $scan = Invoke-SensitiveScan -ProjectRoot $ProjectRoot -Allow:$AllowSensitiveData
+    $promptPath = New-ReviewPackage -ProjectRoot $ProjectRoot -ScanPath $scan -ForceFullBaseline:$ForceFullBaseline -Mode $Mode -PromptLimit $PromptLimit
+  } else {
+    Set-ObjectProperty $state "loop_status" "running"
+    Set-ObjectProperty $state "should_send_to_gpt" $false
+    $localReason = if ($missingOptionalProUrl) { "pro_url_missing_local_loop" } elseif ($config.pro_review_mode -eq "disabled") { "pro_review_disabled" } else { "local_council_first" }
+    $openBlocker = Get-CurrentOrNextOpenBlocker -State $state
+    $localAction = if ($openBlocker -and ((Test-GenericLocalReviewAction -ActionText $nextActionText) -or $missingOptionalProUrl -or (Test-ActionRequestsExternalReview -ActionText $nextActionText))) { [string]$openBlocker.recommended_next_action } elseif ($missingOptionalProUrl) { "capture_or_run_local_review" } elseif ($nextActionText) { $nextActionText } else { "run_local_council" }
+    Set-ObjectProperty $state "send_reason" $localReason
+    Set-ObjectProperty $state "next_action" $localAction
+    Set-ObjectProperty $state "local_only_next_action" $localAction
+    if ($openBlocker) {
+      Set-ObjectProperty $state "current_blocker_id" $openBlocker.id
+      Set-ObjectProperty $state "current_blocker_category" $openBlocker.category
+    }
+    Save-State $ProjectRoot $state
+    New-RuntimeBrief -ProjectRoot $ProjectRoot -Reason $RuntimeReason | Out-Null
+  }
+
+  $state = Get-State -ProjectRoot $ProjectRoot
+  if ($state.local_council_mode -eq "enabled" -or $LocalCouncilRequested) { New-LocalCouncilReview -ProjectRoot $ProjectRoot | Out-Null }
+  $state = Get-State -ProjectRoot $ProjectRoot
+  if ($missingOptionalProUrl) {
+    $currentLocalAction = if ($state.local_only_next_action) { [string]$state.local_only_next_action } elseif ($state.next_action) { [string]$state.next_action } else { "" }
+    $openBlocker = Get-CurrentOrNextOpenBlocker -State $state
+    if (-not $currentLocalAction -or $currentLocalAction -eq "confirm_target_chatgpt_url" -or (Test-ActionRequestsExternalReview -ActionText $currentLocalAction)) {
+      $fallbackAction = if ($openBlocker) { [string]$openBlocker.recommended_next_action } else { "capture_or_run_local_review" }
+      Set-ObjectProperty $state "next_action" $fallbackAction
+      Set-ObjectProperty $state "local_only_next_action" $fallbackAction
+      Set-ObjectProperty $state "send_reason" "pro_url_missing_local_loop"
+      if ($openBlocker) {
+        Set-ObjectProperty $state "current_blocker_id" $openBlocker.id
+        Set-ObjectProperty $state "current_blocker_category" $openBlocker.category
+      }
+    }
+    Save-State $ProjectRoot $state
+    $state = Get-State -ProjectRoot $ProjectRoot
+  }
+
+  if ([bool]$state.should_send_to_gpt -and $promptPath) {
+    if ($BrowserPreflightRequested) { Invoke-BrowserPreflight -ProjectRoot $ProjectRoot -ErrorText $BrowserPreflightError }
+    Show-PromptHandoff -ProjectRoot $ProjectRoot -MarkSent:$MarkSent
+    return [pscustomobject]@{ sent_or_handoff = $true; prompt = $promptPath; local_first = $false }
+  }
+
+  Add-AutoExperienceRecord -ProjectRoot $ProjectRoot -Trigger $ExperienceTrigger -Outcome "success" -Lesson $LocalFirstLesson -Notes "local_only_next_action=$($state.local_only_next_action); send_reason=$($state.send_reason)" | Out-Null
+  Write-Host "No GPT Pro handoff needed this round. Continue local action: $($state.local_only_next_action)" -ForegroundColor Green
+  if ($state.send_reason -eq "pro_url_missing_local_loop") {
+    Write-Host "External GPT Pro URL is missing. Do not final: continue locally with CaptureReview/AssessFeedback/NextDecision/ExecuteNextLocalAction, or ask once for this project's ChatGPT URL." -ForegroundColor Yellow
+  }
+  if ($AutoAdvance) {
+    $advanceResult = Invoke-AutoAdvanceLocalLoopStep -ProjectRoot $ProjectRoot -Trigger "run_loop"
+    if (-not $advanceResult.advanced) {
+      Write-Host "RunLoop did not auto-execute a local action. Reason: $($advanceResult.reason)" -ForegroundColor Yellow
+    }
+    return $advanceResult
+  }
+  return [pscustomobject]@{ sent_or_handoff = $false; local_first = $true; local_only_next_action = $state.local_only_next_action; send_reason = $state.send_reason }
+}
+
 function New-ExperienceRecord {
   param(
     [Parameter(Mandatory = $true)][string]$ProjectRoot,
@@ -4051,6 +5647,61 @@ function New-ExperienceRecord {
   Write-Host "GitHub issue draft created: $issuePath" -ForegroundColor Green
 }
 
+function Add-SuppressedExperienceCount {
+  param(
+    [Parameter(Mandatory = $true)]$State,
+    [int]$Increment = 1
+  )
+  $count = if ($State.suppressed_experience_count) { [int]$State.suppressed_experience_count } else { 0 }
+  Set-ObjectProperty $State "suppressed_experience_count" ($count + $Increment)
+}
+
+function Test-ShouldRecordAutoExperience {
+  param(
+    [Parameter(Mandatory = $true)]$State,
+    [Parameter(Mandatory = $true)][string]$Trigger,
+    [Parameter(Mandatory = $true)][string]$Outcome,
+    [Parameter(Mandatory = $true)][string]$Lesson,
+    [string]$Notes
+  )
+  $policy = if ($State.experience_collection_policy) { [string]$State.experience_collection_policy } else { "key_events_only" }
+  if ($policy -eq "off") {
+    return [pscustomobject]@{ should_record = $false; reason = "policy_off"; signal_key = $null }
+  }
+
+  $signalKey = "$Trigger|$Outcome|$Lesson"
+  if ($State.latest_experience_signal_key -eq $signalKey) {
+    return [pscustomobject]@{ should_record = $false; reason = "same_signal_already_recorded"; signal_key = $signalKey }
+  }
+
+  $alwaysKeep = @(
+    "gpt_review_captured",
+    "done_gate_pass",
+    "done_gate_human_decision",
+    "done_gate_needs_fix",
+    "pro_url_missing_local_loop"
+  )
+  if ($alwaysKeep -contains $Trigger) {
+    return [pscustomobject]@{ should_record = $true; reason = "important_trigger"; signal_key = $signalKey }
+  }
+
+  if ($Outcome -ne "success") {
+    return [pscustomobject]@{ should_record = $true; reason = "non_success_outcome"; signal_key = $signalKey }
+  }
+
+  if ($Trigger -eq "progress_recorded") {
+    $hasBinding = ($Notes -match "related_gate=[^;\s]+" -or $Notes -match "related_blocker=[^;\s]+" -or $Notes -match "related_slice=[^;\s]+" -or $Notes -match "evidence_type=[^;\s]+")
+    return [pscustomobject]@{ should_record = $hasBinding; reason = $(if ($hasBinding) { "bound_progress" } else { "unbound_progress_suppressed" }); signal_key = $signalKey }
+  }
+
+  if ($Trigger -eq "next_decision") {
+    $interesting = ($State.completion_guard_status -in @("blocked_by_project_goal", "subgoal_achieved_not_terminal") -or $State.done_gate_verdict -in @("NEEDS_FIX", "NEEDS_HUMAN_DECISION", "DONE_GATE_PASS") -or $State.stall_pivot_status -in @("STALE_PROGRESS", "REPEATED_FAILURE", "SCOPE_DRIFT"))
+    return [pscustomobject]@{ should_record = $interesting; reason = $(if ($interesting) { "decision_changed_gate_or_stall" } else { "routine_next_decision_suppressed" }); signal_key = $signalKey }
+  }
+
+  return [pscustomobject]@{ should_record = $false; reason = "routine_success_suppressed"; signal_key = $signalKey }
+}
+
 function Add-AutoExperienceRecord {
   param(
     [Parameter(Mandatory = $true)][string]$ProjectRoot,
@@ -4063,6 +5714,14 @@ function Add-AutoExperienceRecord {
   $state = Get-State -ProjectRoot $ProjectRoot
   $policy = if ($state.experience_collection_policy) { [string]$state.experience_collection_policy } else { "auto_record_key_loop_learning_events" }
   if ($policy -eq "off") { return $null }
+  $decision = Test-ShouldRecordAutoExperience -State $state -Trigger $Trigger -Outcome $Outcome -Lesson $Lesson -Notes $Notes
+  if (-not [bool]$decision.should_record) {
+    Add-SuppressedExperienceCount -State $state
+    if ($decision.signal_key) { Set-ObjectProperty $state "latest_experience_signal_key" $decision.signal_key }
+    Set-ObjectProperty $state "latest_experience_suppressed_reason" $decision.reason
+    Save-State $ProjectRoot $state
+    return $null
+  }
   $keyParts = @(
     $Trigger,
     $Outcome,
@@ -4076,7 +5735,13 @@ function Add-AutoExperienceRecord {
     $state.latest_assessment
   )
   $key = ($keyParts -join "|")
-  if ($state.latest_auto_experience_key -eq $key) { return $null }
+  if ($state.latest_auto_experience_key -eq $key) {
+    Add-SuppressedExperienceCount -State $state
+    Set-ObjectProperty $state "latest_experience_signal_key" $decision.signal_key
+    Set-ObjectProperty $state "latest_experience_suppressed_reason" "same_state_key_already_recorded"
+    Save-State $ProjectRoot $state
+    return $null
+  }
   $stamp = Get-Date -Format "yyyy-MM-dd-HHmmss"
   $count = if ($state.auto_experience_count) { [int]$state.auto_experience_count } else { 0 }
   $safeNotes = if ($Notes) { $Notes } else { "Auto-captured from review loop state transition." }
@@ -4110,10 +5775,116 @@ function Add-AutoExperienceRecord {
   Add-Content -LiteralPath $paths.ExperienceLog -Encoding UTF8 -Value $entry
   $state = Get-State -ProjectRoot $ProjectRoot
   Set-ObjectProperty $state "latest_auto_experience_key" $key
+  Set-ObjectProperty $state "latest_experience_signal_key" $decision.signal_key
+  Set-ObjectProperty $state "latest_experience_suppressed_reason" $null
   Set-ObjectProperty $state "latest_experience_record" (Get-RelativePath -Root $ProjectRoot -Path $paths.ExperienceLog)
   Set-ObjectProperty $state "auto_experience_count" ($count + 1)
   Save-State $ProjectRoot $state
   return $paths.ExperienceLog
+}
+
+function Read-ExperienceEntries {
+  param([Parameter(Mandatory = $true)][string]$ProjectRoot)
+  $paths = Get-ReviewPaths -ProjectRoot $ProjectRoot
+  if (-not (Test-Path -LiteralPath $paths.ExperienceLog)) { return @() }
+  $entries = New-Object System.Collections.Generic.List[object]
+  $current = $null
+  foreach ($line in Get-Content -LiteralPath $paths.ExperienceLog) {
+    if ($line -match '^##\s+(.+)$') {
+      if ($current) { $entries.Add([pscustomobject]$current) | Out-Null }
+      $title = $Matches[1]
+      $trigger = "manual"
+      if ($title -match 'auto:\s*(.+)$') { $trigger = $Matches[1].Trim() }
+      $current = [ordered]@{
+        title = $title
+        trigger = $trigger
+        source = "manual"
+        outcome = ""
+        next_action = ""
+        send_reason = ""
+        completion_guard_status = ""
+        done_gate_verdict = ""
+        lesson = ""
+      }
+    } elseif ($current -and $line -match '^-\s+source:\s*(.*)$') {
+      $current.source = $Matches[1].Trim()
+    } elseif ($current -and $line -match '^-\s+outcome:\s*(.*)$') {
+      $current.outcome = $Matches[1].Trim()
+    } elseif ($current -and $line -match '^-\s+next_action:\s*(.*)$') {
+      $current.next_action = $Matches[1].Trim()
+    } elseif ($current -and $line -match '^-\s+send_reason:\s*(.*)$') {
+      $current.send_reason = $Matches[1].Trim()
+    } elseif ($current -and $line -match '^-\s+completion_guard_status:\s*(.*)$') {
+      $current.completion_guard_status = $Matches[1].Trim()
+    } elseif ($current -and $line -match '^-\s+done_gate_verdict:\s*(.*)$') {
+      $current.done_gate_verdict = $Matches[1].Trim()
+    } elseif ($current -and $line -and -not $current.lesson -and $line -notmatch '^#|^-|^\s*$') {
+      $current.lesson = $line.Trim()
+    }
+  }
+  if ($current) { $entries.Add([pscustomobject]$current) | Out-Null }
+  return @($entries.ToArray())
+}
+
+function Format-ExperienceGroupRows {
+  param(
+    [Parameter(Mandatory = $true)]$Entries,
+    [Parameter(Mandatory = $true)][string]$Field,
+    [int]$Limit = 12
+  )
+  $rows = @($Entries | Where-Object { $_.$Field } | Group-Object $Field | Sort-Object Count -Descending | Select-Object -First $Limit)
+  if ($rows.Count -eq 0) { return @("- none") }
+  return @($rows | ForEach-Object { "- $($_.Name): $($_.Count)" })
+}
+
+function Invoke-SummarizeExperience {
+  param([Parameter(Mandatory = $true)][string]$ProjectRoot)
+  Ensure-ReviewLoop -ProjectRoot $ProjectRoot -ChatUrl $null | Out-Null
+  $paths = Get-ReviewPaths -ProjectRoot $ProjectRoot
+  $state = Get-State -ProjectRoot $ProjectRoot
+  $entries = @(Read-ExperienceEntries -ProjectRoot $ProjectRoot)
+  $important = @(
+    $entries |
+      Where-Object {
+        $_.source -ne "auto" -or
+        $_.outcome -ne "success" -or
+        $_.trigger -in @("gpt_review_captured", "done_gate_pass", "done_gate_human_decision", "done_gate_needs_fix", "pro_url_missing_local_loop") -or
+        $_.done_gate_verdict -in @("NEEDS_FIX", "NEEDS_HUMAN_DECISION", "DONE_GATE_PASS") -or
+        $_.completion_guard_status -in @("blocked_by_project_goal", "subgoal_achieved_not_terminal")
+      } |
+      Select-Object -Last 10
+  )
+  $lines = @(
+    "# GPT Pro Review Loop Experience Summary",
+    "",
+    "- generated_at: $(Get-Date -Format o)",
+    "- total_log_entries: $($entries.Count)",
+    "- auto_experience_count: $($state.auto_experience_count)",
+    "- suppressed_experience_count: $(if ($state.suppressed_experience_count) { $state.suppressed_experience_count } else { 0 })",
+    "- latest_experience_record: $($state.latest_experience_record)",
+    "- latest_suppressed_reason: $($state.latest_experience_suppressed_reason)",
+    "",
+    "## By Trigger",
+    ""
+  )
+  $lines += Format-ExperienceGroupRows -Entries $entries -Field "trigger"
+  $lines += @("", "## By Outcome", "")
+  $lines += Format-ExperienceGroupRows -Entries $entries -Field "outcome"
+  $lines += @("", "## By Send Reason", "")
+  $lines += Format-ExperienceGroupRows -Entries $entries -Field "send_reason"
+  $lines += @("", "## Keep-Worthy Recent Lessons", "")
+  if ($important.Count -eq 0) {
+    $lines += "- none"
+  } else {
+    foreach ($entry in $important) {
+      $lesson = if ($entry.lesson) { $entry.lesson } else { "(no lesson text captured)" }
+      $lines += "- $($entry.title) [$($entry.outcome) / $($entry.trigger)]: $lesson"
+    }
+  }
+  Set-Content -LiteralPath $paths.ExperienceSummary -Encoding UTF8 -Value ($lines -join [Environment]::NewLine)
+  Set-ObjectProperty $state "latest_experience_summary" (Get-RelativePath -Root $ProjectRoot -Path $paths.ExperienceSummary)
+  Save-State $ProjectRoot $state
+  Write-Host "Experience summary: $($paths.ExperienceSummary)" -ForegroundColor Green
 }
 
 function Show-Status {
@@ -4126,7 +5897,7 @@ function Show-Status {
   $statusGuidance = $null
   $recommendedNextAction = $null
   $recommendedNextCommand = $null
-  $rawNextAction = if ($state) { $state.next_action } else { $null }
+  $rawNextAction = if ($state -and $state.raw_next_action) { $state.raw_next_action } elseif ($state) { $state.next_action } else { $null }
   $effectiveNextAction = $rawNextAction
   $effectiveLocalOnlyNextAction = if ($state) { $state.local_only_next_action } else { $null }
   $optionalProUrlMissing = $state -and $proMode -eq "optional" -and [bool]$state.url_confirmation_required -and $state.url_confirmation_reason -eq "missing_target_chatgpt_url"
@@ -4134,8 +5905,18 @@ function Show-Status {
   $capabilityPreview = if ($state -and $state.recommended_capability_routes) { [string]::Join(", ", [string[]]@($state.recommended_capability_routes | Select-Object -First 8)) } else { $null }
   if ($optionalProUrlMissing) {
     $statusGuidance = "optional_pro_url_missing_continue_local_loop"
-    $effectiveNextAction = "capture_or_run_local_review"
-    $effectiveLocalOnlyNextAction = "capture_or_run_local_review"
+    $openBlocker = Get-CurrentOrNextOpenBlocker -State $state
+    $fallbackLocal = if ($openBlocker) {
+      [string]$openBlocker.recommended_next_action
+    } elseif ($state.local_only_next_action -and $state.local_only_next_action -ne "confirm_target_chatgpt_url") {
+      [string]$state.local_only_next_action
+    } elseif ($state.next_action -and $state.next_action -ne "confirm_target_chatgpt_url") {
+      [string]$state.next_action
+    } else {
+      "capture_or_run_local_review"
+    }
+    $effectiveNextAction = $fallbackLocal
+    $effectiveLocalOnlyNextAction = $fallbackLocal
     $recommendedNextAction = "run_loop_local_without_pro"
     $recommendedNextCommand = '& "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action RunLoop -Root "{0}"' -f $ProjectRoot
   } elseif ($requiredProUrlMissing) {
@@ -4167,11 +5948,17 @@ function Show-Status {
     latest_assessment_target_url = if ($state) { $state.latest_assessment_target_url } else { $null }
     latest_assessment_opened_tab_url = if ($state) { $state.latest_assessment_opened_tab_url } else { $null }
     continuation_required = if ($state) { $state.continuation_required } else { $false }
+    loop_profile = if ($state) { $state.loop_profile } else { $null }
+    loop_contract_status = if ($state) { $state.loop_contract_status } else { $null }
+    loop_contract_needs_user_choice = if ($state) { $state.loop_contract_needs_user_choice } else { $null }
+    latest_loop_contract = if ($state) { $state.latest_loop_contract } else { $null }
     quota_mode = if ($state) { $state.quota_mode } else { $null }
     runtime_brief = if ($state) { $state.runtime_brief } else { $null }
     browser_preflight_status = if ($state) { $state.browser_preflight_status } else { $null }
     browser_backend_type = if ($state) { $state.browser_backend_type } else { $null }
     browser_target_tab_id = if ($state) { $state.browser_target_tab_id } else { $null }
+    browser_preflight_error_category = if ($state) { $state.browser_preflight_error_category } else { $null }
+    browser_preflight_error = if ($state) { $state.browser_preflight_error } else { $null }
     latest_visual_evidence_hash = if ($state) { $state.latest_visual_evidence_hash } else { $null }
     last_visual_evidence_sent_hash = if ($state) { $state.last_visual_evidence_sent_hash } else { $null }
     last_prompt_chars = if ($state) { $state.last_prompt_chars } else { 0 }
@@ -4224,7 +6011,10 @@ function Show-Status {
     goal_contract_status = if ($state) { $state.goal_contract_status } else { $null }
     experience_collection_policy = if ($state) { $state.experience_collection_policy } else { $null }
     latest_experience_record = if ($state) { $state.latest_experience_record } else { $null }
+    latest_experience_summary = if ($state) { $state.latest_experience_summary } else { $null }
     auto_experience_count = if ($state) { $state.auto_experience_count } else { 0 }
+    suppressed_experience_count = if ($state) { $state.suppressed_experience_count } else { 0 }
+    latest_experience_suppressed_reason = if ($state) { $state.latest_experience_suppressed_reason } else { $null }
     latest_goal_model = if ($state) { $state.latest_goal_model } else { $null }
     latest_architecture_snapshot = if ($state) { $state.latest_architecture_snapshot } else { $null }
     latest_architecture_map = if ($state) { $state.latest_architecture_map } else { $null }
@@ -4239,15 +6029,33 @@ function Show-Status {
     pro_tab_closed_at = if ($state) { $state.pro_tab_closed_at } else { $null }
     local_council_mode = if ($state) { $state.local_council_mode } else { $null }
     latest_local_council_review = if ($state) { $state.latest_local_council_review } else { $null }
-    progress_artifact_count = if ($state -and $state.progress_artifacts) { @($state.progress_artifacts).Count } else { 0 }
+    progress_artifact_count = if ($state) { Get-ProgressArtifactCount -State $state } else { 0 }
     latest_action_contract = if ($state) { $state.latest_action_contract } else { $null }
     latest_evidence = if ($state) { $state.latest_evidence } else { $null }
     latest_evidence_id = if ($state) { $state.latest_evidence_id } else { $null }
     action_executor_status = if ($state) { $state.action_executor_status } else { $null }
     goal_backlog_count = if ($state -and $state.goal_backlog) { @($state.goal_backlog).Count } else { 0 }
     active_generated_goal_id = if ($state) { $state.active_generated_goal_id } else { $null }
+    target_score = if ($state) { $state.target_score } else { $null }
+    candidate_status = if ($state) { $state.candidate_status } else { $null }
+    candidate_score = if ($state) { $state.candidate_score } else { $null }
+    highest_deduction_count = if ($state -and $state.highest_deductions) { @($state.highest_deductions).Count } else { 0 }
+    current_candidate_route = if ($state) { $state.current_candidate_route } else { $null }
+    candidate_iteration = if ($state) { $state.candidate_iteration } else { 0 }
+    latest_candidate_fix_plan = if ($state) { $state.latest_candidate_fix_plan } else { $null }
+    testline_boundary = if ($state) { $state.testline_boundary } else { $null }
+    version_control_checked = if ($state) { $state.version_control_checked } else { $null }
+    testline_isolation_status = if ($state) { $state.testline_isolation_status } else { $null }
+    testline_branch_or_worktree = if ($state) { $state.testline_branch_or_worktree } else { $null }
+    testline_git_metadata_kind = if ($state) { $state.testline_git_metadata_kind } else { $null }
+    testline_gitdir = if ($state) { $state.testline_gitdir } else { $null }
+    testline_git_probe_status = if ($state) { $state.testline_git_probe_status } else { $null }
+    formal_line_protected = if ($state) { $state.formal_line_protected } else { $null }
+    formal_completion_claim_allowed = if ($state) { $state.formal_completion_claim_allowed } else { $null }
     next_action = $effectiveNextAction
     raw_next_action = $rawNextAction
+    raw_local_only_next_action = if ($state -and $state.raw_local_only_next_action) { $state.raw_local_only_next_action } else { $null }
+    next_action_normalization_reason = if ($state) { $state.next_action_normalization_reason } else { $null }
     status_guidance = $statusGuidance
     recommended_next_action = $recommendedNextAction
     recommended_next_command = $recommendedNextCommand
@@ -4264,31 +6072,37 @@ switch ($Action) {
     Ensure-ReviewLoop -ProjectRoot $ProjectRoot -ChatUrl $TargetChatGptUrl | Out-Null
     Write-Host "GPT Pro review loop initialized for project: $(Split-Path -Leaf $ProjectRoot)" -ForegroundColor Green
   }
-  "Prepare" {
+  "ClarifyLoopNeeds" {
     Ensure-ReviewLoop -ProjectRoot $ProjectRoot -ChatUrl $TargetChatGptUrl | Out-Null
-    $config = Get-Config -ProjectRoot $ProjectRoot
-    if ($config.pro_review_mode -ne "disabled") { Assert-TargetChatGptUrl -ProjectRoot $ProjectRoot | Out-Null }
-    $scan = Invoke-SensitiveScan -ProjectRoot $ProjectRoot -Allow:$AllowSensitive
-    New-ReviewPackage -ProjectRoot $ProjectRoot -ScanPath $scan -ForceFullBaseline:$ForceBaseline -Mode $QuotaMode -PromptLimit $MaxPromptChars | Out-Null
+    Invoke-ClarifyLoopNeeds -ProjectRoot $ProjectRoot
+  }
+  "ConfigureLoopProfile" {
+    Ensure-ReviewLoop -ProjectRoot $ProjectRoot -ChatUrl $TargetChatGptUrl | Out-Null
+    Set-LoopProfileConfiguration -ProjectRoot $ProjectRoot
+  }
+  "ShowLoopContract" {
+    Ensure-ReviewLoop -ProjectRoot $ProjectRoot -ChatUrl $TargetChatGptUrl | Out-Null
+    $paths = Get-ReviewPaths -ProjectRoot $ProjectRoot
+    if (-not (Test-Path -LiteralPath $paths.LoopContract)) { throw "Loop contract is missing. Run -Action ClarifyLoopNeeds or -Action Init." }
+    Get-Content -Raw -LiteralPath $paths.LoopContract
+  }
+  "Prepare" {
+    Invoke-PrepareCompactReviewAction -ProjectRoot $ProjectRoot -ChatUrl $TargetChatGptUrl -AllowSensitiveData:$AllowSensitive -ForceFullBaseline:$ForceBaseline -Mode $QuotaMode -PromptLimit $MaxPromptChars
   }
   "PrepareCompactReview" {
-    Ensure-ReviewLoop -ProjectRoot $ProjectRoot -ChatUrl $TargetChatGptUrl | Out-Null
-    $config = Get-Config -ProjectRoot $ProjectRoot
-    if ($config.pro_review_mode -ne "disabled") { Assert-TargetChatGptUrl -ProjectRoot $ProjectRoot | Out-Null }
-    $scan = Invoke-SensitiveScan -ProjectRoot $ProjectRoot -Allow:$AllowSensitive
-    New-ReviewPackage -ProjectRoot $ProjectRoot -ScanPath $scan -ForceFullBaseline:$ForceBaseline -Mode $QuotaMode -PromptLimit $MaxPromptChars | Out-Null
+    Invoke-PrepareCompactReviewAction -ProjectRoot $ProjectRoot -ChatUrl $TargetChatGptUrl -AllowSensitiveData:$AllowSensitive -ForceFullBaseline:$ForceBaseline -Mode $QuotaMode -PromptLimit $MaxPromptChars
   }
   "PreflightBrowser" {
     Ensure-ReviewLoop -ProjectRoot $ProjectRoot -ChatUrl $TargetChatGptUrl | Out-Null
     Assert-TargetChatGptUrl -ProjectRoot $ProjectRoot | Out-Null
-    Invoke-BrowserPreflight -ProjectRoot $ProjectRoot
+    Invoke-BrowserPreflight -ProjectRoot $ProjectRoot -ErrorText $BrowserPreflightError
   }
   "SendPrompt" {
     Ensure-ReviewLoop -ProjectRoot $ProjectRoot -ChatUrl $TargetChatGptUrl | Out-Null
     $config = Get-Config -ProjectRoot $ProjectRoot
     if ($config.pro_review_mode -eq "disabled") { throw "pro_review_mode=disabled: SendPrompt is not available." }
     Assert-TargetChatGptUrl -ProjectRoot $ProjectRoot | Out-Null
-    if ($PreflightBrowser) { Invoke-BrowserPreflight -ProjectRoot $ProjectRoot }
+    if ($PreflightBrowser) { Invoke-BrowserPreflight -ProjectRoot $ProjectRoot -ErrorText $BrowserPreflightError }
     Show-PromptHandoff -ProjectRoot $ProjectRoot -MarkSent:$Send
   }
   "CaptureFeedback" {
@@ -4334,7 +6148,7 @@ switch ($Action) {
     Ensure-ReviewLoop -ProjectRoot $ProjectRoot -ChatUrl $TargetChatGptUrl | Out-Null
     $config = Get-Config -ProjectRoot $ProjectRoot
     if ($config.pro_review_mode -ne "disabled") { Assert-TargetChatGptUrl -ProjectRoot $ProjectRoot | Out-Null }
-    if ($PreflightBrowser) { Invoke-BrowserPreflight -ProjectRoot $ProjectRoot }
+    if ($PreflightBrowser) { Invoke-BrowserPreflight -ProjectRoot $ProjectRoot -ErrorText $BrowserPreflightError }
     New-AssessmentPrompt -ProjectRoot $ProjectRoot -Mode $QuotaMode -PromptLimit $MaxPromptChars
   }
   "NextDecision" {
@@ -4369,6 +6183,35 @@ switch ($Action) {
   "RefreshProjectUnderstanding" {
     Ensure-ReviewLoop -ProjectRoot $ProjectRoot -ChatUrl $TargetChatGptUrl | Out-Null
     Invoke-RefreshProjectUnderstanding -ProjectRoot $ProjectRoot -GoalMode $GoalDiscoveryMode -ArchitectureMode $ArchitectureAnalysisMode -BriefMaxChars $ArchitectureBriefMaxChars | Out-Null
+  }
+  "ScoreCandidate" {
+    Ensure-ReviewLoop -ProjectRoot $ProjectRoot -ChatUrl $TargetChatGptUrl | Out-Null
+    Invoke-ScoreCandidate -ProjectRoot $ProjectRoot | Format-List
+  }
+  "RunCandidateCycle" {
+    Ensure-ReviewLoop -ProjectRoot $ProjectRoot -ChatUrl $TargetChatGptUrl | Out-Null
+    Invoke-RunCandidateCycle -ProjectRoot $ProjectRoot
+  }
+  "SelectTopDeductions" {
+    Ensure-ReviewLoop -ProjectRoot $ProjectRoot -ChatUrl $TargetChatGptUrl | Out-Null
+    Invoke-SelectTopDeductions -ProjectRoot $ProjectRoot | Format-Table -AutoSize
+  }
+  "PlanCandidateFixes" {
+    Ensure-ReviewLoop -ProjectRoot $ProjectRoot -ChatUrl $TargetChatGptUrl | Out-Null
+    $plan = Invoke-PlanCandidateFixes -ProjectRoot $ProjectRoot
+    Write-Host "Candidate fix plan: $plan" -ForegroundColor Green
+  }
+  "RecordCandidateScore" {
+    Ensure-ReviewLoop -ProjectRoot $ProjectRoot -ChatUrl $TargetChatGptUrl | Out-Null
+    Invoke-RecordCandidateScore -ProjectRoot $ProjectRoot | Format-List
+  }
+  "FindAlternativeRoute" {
+    Ensure-ReviewLoop -ProjectRoot $ProjectRoot -ChatUrl $TargetChatGptUrl | Out-Null
+    Invoke-FindAlternativeRoute -ProjectRoot $ProjectRoot | ForEach-Object { $_ }
+  }
+  "CheckTestlineIsolation" {
+    Ensure-ReviewLoop -ProjectRoot $ProjectRoot -ChatUrl $TargetChatGptUrl | Out-Null
+    Invoke-CheckTestlineIsolation -ProjectRoot $ProjectRoot -Confirmed:$ConfirmTestlineIsolation | Out-Null
   }
   "NextLocalAction" {
     Ensure-ReviewLoop -ProjectRoot $ProjectRoot -ChatUrl $TargetChatGptUrl | Out-Null
@@ -4427,75 +6270,13 @@ switch ($Action) {
   }
   "RunLoop" {
     Ensure-ReviewLoop -ProjectRoot $ProjectRoot -ChatUrl $TargetChatGptUrl | Out-Null
-    Invoke-RefreshProjectUnderstanding -ProjectRoot $ProjectRoot -GoalMode $GoalDiscoveryMode -ArchitectureMode $ArchitectureAnalysisMode -BriefMaxChars $ArchitectureBriefMaxChars | Out-Null
-    $config = Get-Config -ProjectRoot $ProjectRoot
-    $state = Get-State -ProjectRoot $ProjectRoot
-    if ($state.efficiency_audit_mode -ne "off" -and (-not $state.latest_capability_scan -or $CapabilityScan)) {
-      Invoke-CapabilityScan -ProjectRoot $ProjectRoot -Context $AuditContext | Out-Null
-      $state = Get-State -ProjectRoot $ProjectRoot
-    }
-    if ($state.efficiency_audit_mode -eq "strict") {
-      New-EfficiencyAuditReview -ProjectRoot $ProjectRoot -AuditPhase "preflight-audit" | Out-Null
-      $state = Get-State -ProjectRoot $ProjectRoot
-    }
-    $nextActionText = if ($state.next_action) { [string]$state.next_action } else { "" }
-    $needsExternal = $ForceExternalReview -or $config.pro_review_mode -eq "required" -or ($nextActionText -match "(?i)(^|[_\-\s])(gpt|pro|external|review|recheck|send)([_\-\s]|$)")
-    $targetUrl = if ($config.target_chatgpt_conversation_url) { $config.target_chatgpt_conversation_url } else { $config.target_chatgpt_url }
-    $urlConfirmationOnly = ($nextActionText -eq "confirm_target_chatgpt_url" -or ($state.url_confirmation_reason -eq "missing_target_chatgpt_url" -and [bool]$state.url_confirmation_required))
-    $missingOptionalProUrl = ($config.pro_review_mode -eq "optional" -and ($needsExternal -or $urlConfirmationOnly) -and -not (Test-ChatGptUrl $targetUrl))
-    if ($config.pro_review_mode -eq "required" -and $needsExternal) { Assert-TargetChatGptUrl -ProjectRoot $ProjectRoot | Out-Null }
-    if ($missingOptionalProUrl) {
-      $needsExternal = $false
-      Set-ObjectProperty $state "loop_status" "running"
-      Set-ObjectProperty $state "continuation_required" $true
-      Set-ObjectProperty $state "should_send_to_gpt" $false
-      Set-ObjectProperty $state "send_reason" "pro_url_missing_local_loop"
-      Set-ObjectProperty $state "next_action" "capture_or_run_local_review"
-      Set-ObjectProperty $state "local_only_next_action" "capture_or_run_local_review"
-      Set-ObjectProperty $state "url_confirmation_required" $true
-      Set-ObjectProperty $state "url_confirmation_reason" "missing_target_chatgpt_url"
-      Save-State $ProjectRoot $state
-      Add-AutoExperienceRecord -ProjectRoot $ProjectRoot -Trigger "pro_url_missing_local_loop" -Outcome "needs-improvement" -Lesson "Missing optional GPT Pro URL must downgrade to a local review loop, not a final answer or claimed external Pro review." -Notes "RunLoop could not send GPT Pro material because no target ChatGPT URL is configured. Continue with local reviewers, local assessment, NextDecision, and local action." | Out-Null
-      $state = Get-State -ProjectRoot $ProjectRoot
-    }
-    $promptPath = $null
-    if ($config.pro_review_mode -ne "disabled" -and $needsExternal) {
-      $scan = Invoke-SensitiveScan -ProjectRoot $ProjectRoot -Allow:$AllowSensitive
-      $promptPath = New-ReviewPackage -ProjectRoot $ProjectRoot -ScanPath $scan -ForceFullBaseline:$ForceBaseline -Mode $QuotaMode -PromptLimit $MaxPromptChars
-    } else {
-      Set-ObjectProperty $state "loop_status" "running"
-      Set-ObjectProperty $state "should_send_to_gpt" $false
-      $localReason = if ($missingOptionalProUrl) { "pro_url_missing_local_loop" } elseif ($config.pro_review_mode -eq "disabled") { "pro_review_disabled" } else { "local_council_first" }
-      $localAction = if ($missingOptionalProUrl) { "capture_or_run_local_review" } elseif ($nextActionText) { $nextActionText } else { "run_local_council" }
-      Set-ObjectProperty $state "send_reason" $localReason
-      Set-ObjectProperty $state "next_action" $localAction
-      Set-ObjectProperty $state "local_only_next_action" $localAction
-      Save-State $ProjectRoot $state
-      New-RuntimeBrief -ProjectRoot $ProjectRoot -Reason "run_loop_local_first" | Out-Null
-    }
-    $state = Get-State -ProjectRoot $ProjectRoot
-    if ($state.local_council_mode -eq "enabled" -or $LocalCouncil) { New-LocalCouncilReview -ProjectRoot $ProjectRoot | Out-Null }
-    $state = Get-State -ProjectRoot $ProjectRoot
-    if ($missingOptionalProUrl) {
-      Set-ObjectProperty $state "next_action" "capture_or_run_local_review"
-      Set-ObjectProperty $state "local_only_next_action" "capture_or_run_local_review"
-      Set-ObjectProperty $state "send_reason" "pro_url_missing_local_loop"
-      Save-State $ProjectRoot $state
-      $state = Get-State -ProjectRoot $ProjectRoot
-    }
-    if ([bool]$state.should_send_to_gpt -and $promptPath) {
-      if ($PreflightBrowser) { Invoke-BrowserPreflight -ProjectRoot $ProjectRoot }
-      Show-PromptHandoff -ProjectRoot $ProjectRoot -MarkSent:$Send
-    } else {
-      Add-AutoExperienceRecord -ProjectRoot $ProjectRoot -Trigger "run_loop_local_first" -Outcome "success" -Lesson "A local-first loop iteration should run the local council or next local action instead of spending GPT quota when no new external judgment is needed." -Notes "local_only_next_action=$($state.local_only_next_action); send_reason=$($state.send_reason)" | Out-Null
-      Write-Host "No GPT Pro handoff needed this round. Continue local action: $($state.local_only_next_action)" -ForegroundColor Green
-      if ($state.send_reason -eq "pro_url_missing_local_loop") {
-        Write-Host "External GPT Pro URL is missing. Do not final: continue locally with CaptureReview/AssessFeedback/NextDecision/ExecuteNextLocalAction, or ask once for this project's ChatGPT URL." -ForegroundColor Yellow
-      }
-    }
+    Invoke-ReviewLoopCycle -ProjectRoot $ProjectRoot -CycleName "RunLoop" -RuntimeReason "run_loop_local_first" -ExperienceTrigger "run_loop_local_first" -LocalFirstLesson "A local-first loop iteration should run the local council or next local action instead of spending GPT quota when no new external judgment is needed." -StrictPreflightAudit -AutoAdvance -AllowSensitiveData:$AllowSensitive -ForceFullBaseline:$ForceBaseline -Mode $QuotaMode -PromptLimit $MaxPromptChars -CapabilityScanRequested:$CapabilityScan -AuditContextText $AuditContext -ForceExternalReviewRequested:$ForceExternalReview -LocalCouncilRequested:$LocalCouncil -BrowserPreflightRequested:$PreflightBrowser -MarkSent:$Send -GoalMode $GoalDiscoveryMode -ArchitectureMode $ArchitectureAnalysisMode -BriefMaxChars $ArchitectureBriefMaxChars
   }
   "RecordExperience" {
     New-ExperienceRecord -ProjectRoot $ProjectRoot -Outcome $ExperienceOutcome -Lesson $ExperienceLesson -Notes $ExperienceNotes
+  }
+  "SummarizeExperience" {
+    Invoke-SummarizeExperience -ProjectRoot $ProjectRoot
   }
   "Status" {
     Ensure-ReviewLoop -ProjectRoot $ProjectRoot -ChatUrl $TargetChatGptUrl | Out-Null
@@ -4503,68 +6284,7 @@ switch ($Action) {
   }
   "Run" {
     Ensure-ReviewLoop -ProjectRoot $ProjectRoot -ChatUrl $TargetChatGptUrl | Out-Null
-    Invoke-RefreshProjectUnderstanding -ProjectRoot $ProjectRoot -GoalMode $GoalDiscoveryMode -ArchitectureMode $ArchitectureAnalysisMode -BriefMaxChars $ArchitectureBriefMaxChars | Out-Null
-    $config = Get-Config -ProjectRoot $ProjectRoot
-    $state = Get-State -ProjectRoot $ProjectRoot
-    if ($state.efficiency_audit_mode -ne "off" -and (-not $state.latest_capability_scan -or $CapabilityScan)) {
-      Invoke-CapabilityScan -ProjectRoot $ProjectRoot -Context $AuditContext | Out-Null
-      $state = Get-State -ProjectRoot $ProjectRoot
-    }
-    $nextActionText = if ($state.next_action) { [string]$state.next_action } else { "" }
-    $needsExternal = $ForceExternalReview -or $config.pro_review_mode -eq "required" -or ($nextActionText -match "(?i)(^|[_\-\s])(gpt|pro|external|review|recheck|send)([_\-\s]|$)")
-    $targetUrl = if ($config.target_chatgpt_conversation_url) { $config.target_chatgpt_conversation_url } else { $config.target_chatgpt_url }
-    $urlConfirmationOnly = ($nextActionText -eq "confirm_target_chatgpt_url" -or ($state.url_confirmation_reason -eq "missing_target_chatgpt_url" -and [bool]$state.url_confirmation_required))
-    $missingOptionalProUrl = ($config.pro_review_mode -eq "optional" -and ($needsExternal -or $urlConfirmationOnly) -and -not (Test-ChatGptUrl $targetUrl))
-    if ($config.pro_review_mode -eq "required" -and $needsExternal) { Assert-TargetChatGptUrl -ProjectRoot $ProjectRoot | Out-Null }
-    if ($missingOptionalProUrl) {
-      $needsExternal = $false
-      Set-ObjectProperty $state "loop_status" "running"
-      Set-ObjectProperty $state "continuation_required" $true
-      Set-ObjectProperty $state "should_send_to_gpt" $false
-      Set-ObjectProperty $state "send_reason" "pro_url_missing_local_loop"
-      Set-ObjectProperty $state "next_action" "capture_or_run_local_review"
-      Set-ObjectProperty $state "local_only_next_action" "capture_or_run_local_review"
-      Set-ObjectProperty $state "url_confirmation_required" $true
-      Set-ObjectProperty $state "url_confirmation_reason" "missing_target_chatgpt_url"
-      Save-State $ProjectRoot $state
-      Add-AutoExperienceRecord -ProjectRoot $ProjectRoot -Trigger "pro_url_missing_local_loop" -Outcome "needs-improvement" -Lesson "Missing optional GPT Pro URL must downgrade to a local review loop, not a final answer or claimed external Pro review." -Notes "Run could not send GPT Pro material because no target ChatGPT URL is configured. Continue with local reviewers, local assessment, NextDecision, and local action." | Out-Null
-      $state = Get-State -ProjectRoot $ProjectRoot
-    }
-    $promptPath = $null
-    if ($config.pro_review_mode -ne "disabled" -and $needsExternal) {
-      $scan = Invoke-SensitiveScan -ProjectRoot $ProjectRoot -Allow:$AllowSensitive
-      $promptPath = New-ReviewPackage -ProjectRoot $ProjectRoot -ScanPath $scan -ForceFullBaseline:$ForceBaseline -Mode $QuotaMode -PromptLimit $MaxPromptChars
-    } else {
-      Set-ObjectProperty $state "loop_status" "running"
-      Set-ObjectProperty $state "should_send_to_gpt" $false
-      $localReason = if ($missingOptionalProUrl) { "pro_url_missing_local_loop" } elseif ($config.pro_review_mode -eq "disabled") { "pro_review_disabled" } else { "local_council_first" }
-      $localAction = if ($missingOptionalProUrl) { "capture_or_run_local_review" } elseif ($nextActionText) { $nextActionText } else { "run_local_council" }
-      Set-ObjectProperty $state "send_reason" $localReason
-      Set-ObjectProperty $state "next_action" $localAction
-      Set-ObjectProperty $state "local_only_next_action" $localAction
-      Save-State $ProjectRoot $state
-      New-RuntimeBrief -ProjectRoot $ProjectRoot -Reason "run_local_first" | Out-Null
-    }
-    $state = Get-State -ProjectRoot $ProjectRoot
-    if ($state.local_council_mode -eq "enabled" -or $LocalCouncil) { New-LocalCouncilReview -ProjectRoot $ProjectRoot | Out-Null }
-    $state = Get-State -ProjectRoot $ProjectRoot
-    if ($missingOptionalProUrl) {
-      Set-ObjectProperty $state "next_action" "capture_or_run_local_review"
-      Set-ObjectProperty $state "local_only_next_action" "capture_or_run_local_review"
-      Set-ObjectProperty $state "send_reason" "pro_url_missing_local_loop"
-      Save-State $ProjectRoot $state
-      $state = Get-State -ProjectRoot $ProjectRoot
-    }
-    if ([bool]$state.should_send_to_gpt -and $promptPath) {
-      if ($PreflightBrowser) { Invoke-BrowserPreflight -ProjectRoot $ProjectRoot }
-      Show-PromptHandoff -ProjectRoot $ProjectRoot -MarkSent:$Send
-    } else {
-      Add-AutoExperienceRecord -ProjectRoot $ProjectRoot -Trigger "run_local_first" -Outcome "success" -Lesson "One-command runs should still preserve why GPT was skipped so future projects can tune quota and routing behavior." -Notes "local_only_next_action=$($state.local_only_next_action); send_reason=$($state.send_reason)" | Out-Null
-      Write-Host "No GPT Pro handoff needed this round. Continue local action: $($state.local_only_next_action)" -ForegroundColor Green
-      if ($state.send_reason -eq "pro_url_missing_local_loop") {
-        Write-Host "External GPT Pro URL is missing. Do not final: continue locally with CaptureReview/AssessFeedback/NextDecision/ExecuteNextLocalAction, or ask once for this project's ChatGPT URL." -ForegroundColor Yellow
-      }
-    }
+    Invoke-ReviewLoopCycle -ProjectRoot $ProjectRoot -CycleName "Run" -RuntimeReason "run_local_first" -ExperienceTrigger "run_local_first" -LocalFirstLesson "One-command runs should still preserve why GPT was skipped so future projects can tune quota and routing behavior." -AllowSensitiveData:$AllowSensitive -ForceFullBaseline:$ForceBaseline -Mode $QuotaMode -PromptLimit $MaxPromptChars -CapabilityScanRequested:$CapabilityScan -AuditContextText $AuditContext -ForceExternalReviewRequested:$ForceExternalReview -LocalCouncilRequested:$LocalCouncil -BrowserPreflightRequested:$PreflightBrowser -MarkSent:$Send -GoalMode $GoalDiscoveryMode -ArchitectureMode $ArchitectureAnalysisMode -BriefMaxChars $ArchitectureBriefMaxChars | Out-Null
   }
 }
 

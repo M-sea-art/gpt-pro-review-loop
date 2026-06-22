@@ -1,6 +1,6 @@
 # Experience Collection
 
-The loop automatically records concise project-local experience after key review-loop state transitions. Use `RecordExperience` manually after a review round only when the result teaches something reusable enough to promote into a sanitized issue draft or cross-project improvement note.
+The loop automatically records concise project-local experience only when it changes future behavior. It is not a full event log. Use `RecordExperience` manually after a review round only when the result teaches something reusable enough to promote into a sanitized issue draft or cross-project improvement note.
 
 Automatic records are written when the loop captures GPT Pro feedback, captures local council or efficiency review output, records progress, runs Done Gate, skips GPT because local work should continue, or writes a `NextDecision` loop-run record.
 
@@ -15,7 +15,17 @@ Local outputs:
 - `docs/ai-review-loop/experience-log.md`: private project-local history.
 - `docs/ai-review-loop/experience-issues/<timestamp>-github-issue-draft.md`: sanitized public issue draft.
 
-Automatic records write only to `experience-log.md`. Manual `RecordExperience` writes to `experience-log.md` and creates an issue draft.
+Automatic records write only to `experience-log.md`. Routine successful local council, local-first, efficiency-capture, repeated same-signal, or unbound progress events are suppressed and counted in `suppressed_experience_count`. Manual `RecordExperience` writes to `experience-log.md` and creates an issue draft.
+
+Summarize existing records without creating a new event:
+
+```powershell
+& "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action SummarizeExperience -Root "<project-root>"
+```
+
+This writes:
+
+- `docs/ai-review-loop/experience-summary.md`: compact trigger/outcome/send-reason statistics and keep-worthy recent lessons.
 
 Record:
 
@@ -32,4 +42,4 @@ Do not record:
 - Large source snippets or proprietary business data.
 - Full ChatGPT conversations when a short behavior summary is enough.
 
-Promote a draft to a GitHub issue only if it would improve the reusable skill for future projects.
+Promote a draft to a GitHub issue only if it would improve the reusable skill for future projects. Prefer 10 high-value lessons over hundreds of routine loop state entries.
