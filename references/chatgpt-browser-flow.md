@@ -12,6 +12,14 @@ Run one lightweight local preflight per review-loop iteration:
 
 This records `browser_preflight_status`, `browser_backend_type`, and `runtime_brief` in `review-state.json`. The Codex agent should reuse that runtime brief instead of repeatedly inspecting browser-client exports, tab APIs, or locator APIs in the same iteration.
 
+If the Edge/Chrome extension backend fails with a browser runtime schema error such as `missing field sandboxPolicy`, record the failed handoff instead of marking the prompt as sent:
+
+```powershell
+& "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action PreflightBrowser -Root "<project-root>" -BrowserPreflightError "missing field sandboxPolicy"
+```
+
+This writes `browser_preflight_status=blocked_schema_mismatch` and `browser_preflight_error_category=browser_runtime_schema_mismatch`. Keep the prompt path and target URL for manual handoff or later retry. Do not run `SendPrompt -Send` and do not capture or invent a GPT Pro review.
+
 ## Send Review Prompt
 
 1. Run `Prepare` or `Run` to generate the prompt file.
@@ -36,6 +44,7 @@ Before operating ChatGPT, read the current `edge-browser-control` skill body and
 - Tab objects are controlled through `tab.playwright`. Do not assume a raw Playwright `page` property exists.
 - If claiming an existing tab fails with a tab grouping or window grouping error, do not retry the same claim in a tight loop.
 - After a claim/grouping failure, reconnect the browser runtime once, list tabs once, and either open a fresh extension tab or mark the browser handoff blocked with the target URL and prompt path.
+- If the browser runtime reports `missing field sandboxPolicy`, treat it as a schema mismatch between Codex and the bundled browser backend. Record it through `PreflightBrowser -BrowserPreflightError`, keep local loop state honest, and use manual paste or retry after runtime update.
 - If the browser is open but no ChatGPT conversation tab is present, navigate the current tab or a fresh extension tab to the previously configured target URL printed by `SendPrompt`, `SendAssessment`, or `Status`. This is the normal recovery path, not a blocker.
 - Use the in-app browser only as a last-resort diagnostic or when a logged-in ChatGPT state is not required. It may not share the user's Edge ChatGPT login.
 - If the ChatGPT page already shows a submitted message or a stop-generating control, do not submit the same prompt again. Mark the prompt as sent, then move to low-frequency capture.

@@ -6,6 +6,13 @@ Chinese trigger: `Pro 审阅循环`.
 
 Default quota strategy: `economy`. The local ledger keeps full evidence, while ChatGPT handoffs receive compact Markdown summaries unless `-QuotaMode balanced` or `-QuotaMode deep` is explicitly requested.
 
+v1.11 adds a formal loop contract and two run profiles:
+
+- `conservative`: default. Review, evidence, goal contracts, local council, efficiency audit, and gates first.
+- `testline_95_auto`: explicit opt-in. Run an isolated candidate/test line toward `candidate_score >= 95`; do not claim formal project completion, merge, publish, deploy, or touch protected lines.
+
+Before `testline_95_auto` starts, the operator must confirm version control is effective and the work is on an isolated test branch, temporary worktree, or disposable test line. A linked Git worktree with a `.git` file containing `gitdir: ...` is valid when Git reports `--is-inside-work-tree=true`. The script records that confirmation in `loop-contract.json` and `review-state.json`.
+
 ## What It Does
 
 The loop is intentionally simple:
@@ -28,6 +35,7 @@ review package -> external/internal review -> local assessment -> next decision
 - GPT Pro is optional by default. Local-only progress, local evidence, and local expert council planning happen without opening ChatGPT unless the next decision actually needs external review.
 - The local expert council runs as `reviewer=local-expert-council`: brainstorm first, post-evaluate later, then place candidate new goals into backlog.
 - Codex efficiency audit is the process supervisor, not a plain extra reviewer. It supplies capability routing, periodic audit, stall/pivot status, Done Gate, and final closure evidence.
+- The loop profile is explicit. Conservative mode is the default; the 95-point test-line mode is candidate-only and requires an isolated branch or worktree confirmation before it runs.
 - When a Pro conversation is no longer needed, the loop can record a target-tab close request so the outer Edge control flow closes the matching ChatGPT tab.
 
 This skill sends static Markdown only. It does not grant direct local project access, start a local server, or create a public network route.
@@ -66,6 +74,42 @@ Initialize a project once:
 & "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action Init -Root "<project-root>" -TargetChatGptUrl "https://chatgpt.com/..."
 ```
 
+The first local ledger now includes a loop contract:
+
+```powershell
+& "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action ShowLoopContract -Root "<project-root>"
+```
+
+If a project predates `loop-contract.json`, run the clarification entry before continuous work:
+
+```powershell
+& "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action ClarifyLoopNeeds -Root "<project-root>"
+```
+
+Default conservative profile:
+
+```powershell
+& "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action ConfigureLoopProfile -Root "<project-root>" -LoopProfile conservative
+```
+
+Explicit 95-point isolated test-line profile:
+
+```powershell
+# First create or switch to an isolated test branch/worktree.
+# Do not run this on main/master/release/production/stable.
+& "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action ConfigureLoopProfile -Root "<project-root>" -LoopProfile testline_95_auto -ConfirmTestlineIsolation
+```
+
+Without `-ConfirmTestlineIsolation`, or when the project is not in Git or appears to be on a formal branch, the crazy loop pauses with `NEEDS_HUMAN_DECISION`.
+
+If an older run wrote `testline_isolation_status=not_git_repo` for a linked worktree, rerun:
+
+```powershell
+& "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action CheckTestlineIsolation -Root "<project-root>" -ConfirmTestlineIsolation
+```
+
+When Git confirms the worktree, the loop recovers from the stale `CANDIDATE_BLOCKED` state and continues as a test-line candidate cycle.
+
 For a new project using GPT Pro, this is the one-time URL confirmation gate. If `pro_review_mode=required` and the project has no ChatGPT target URL, external review actions stop and require the operator to ask the user once for the target ChatGPT project or conversation URL. If `pro_review_mode=optional`, `Prepare`, `SendPrompt`, and `SendAssessment` still require a URL, but `Run` and `RunLoop` degrade to a local review loop with `send_reason=pro_url_missing_local_loop` instead of ending the session or pretending GPT Pro reviewed it. `Status` also prints `status_guidance=optional_pro_url_missing_continue_local_loop` and a `RunLoop` command so outer Codex agents do not mistake a missing optional Pro URL for a stopping condition. After `Init -TargetChatGptUrl` records a URL, later iterations reuse the project-local URL without asking again unless it changes or becomes invalid. `pro_review_mode=disabled` does not require a ChatGPT URL.
 
 Choose Pro behavior:
@@ -87,9 +131,58 @@ Start a continuous loop after explicit authorization:
 & "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action RunLoop -Root "<project-root>" -PreflightBrowser
 ```
 
-`RunLoop` marks the start of the outer Codex loop. In `optional` mode it is local-first: if the current next action does not require GPT Pro, it records a runtime brief and runs the local expert council instead of generating an empty GPT handoff. If an external Pro review is requested but no project ChatGPT URL is configured, it records `send_reason=pro_url_missing_local_loop`, keeps `loop_status=running`, and sets `local_only_next_action=capture_or_run_local_review`; the operator must continue locally rather than final. `-PreflightBrowser` records the intended Edge/Chrome extension route once for this iteration only when a Pro handoff is needed. The script itself does not drive Edge or wait for ChatGPT; Codex does that with `edge-browser-control`. Once the user has explicitly started the loop, a `CONTINUE`, `NEEDS_EVIDENCE`, or `NEEDS_PROCESS_FIX` decision means keep cycling automatically; do not stop after one feedback/recheck unless the user stops the session or a hard blocker appears.
+`RunLoop` marks the start of the outer Codex loop. In `optional` mode it is local-first: if the current next action does not require GPT Pro, it records a runtime brief and runs the local expert council instead of generating an empty GPT handoff. If an external Pro review is requested but no project ChatGPT URL is configured, it records the original URL-confirmation action in `raw_next_action`, keeps `loop_status=running`, and continues with an effective local action; the operator must continue locally rather than final. `-PreflightBrowser` records the intended Edge/Chrome extension route once for this iteration only when a Pro handoff is needed. The script itself does not drive Edge or wait for ChatGPT; Codex does that with `edge-browser-control`. Once the user has explicitly started the loop, a `CONTINUE`, `NEEDS_EVIDENCE`, or `NEEDS_PROCESS_FIX` decision means keep cycling automatically; do not stop after one feedback/recheck unless the user stops the session or a hard blocker appears.
 
-For high-frequency Codex projects, run a one-time capability scan before the first serious loop. This aligns project goals with available plugin/skill/app/MCP routes before execution:
+v1.10 makes that local-first step gate-aware. If the project has an open blocker, goal slice, or evidence gap, `RunLoop` and `ExecuteNextLocalAction` must select that concrete item before generic `capture_or_run_local_review` or local council work. Missing optional GPT Pro URL is recorded as an external-review limitation, but it must not erase the current blocker action.
+
+If the loop has no blocker queue, no backlog, and no open goal slice but Done Gate or the project guard still says the project is not done, the script performs empty-queue recovery. It derives blockers from Goal Contract evidence gaps and Human Gate entries, then falls back to building goal slices or rebuilding `project-goal-plan.md`. Repeating only `run_local_council` is treated as stale progress; after repeated no-progress recovery the loop pauses with a concrete `NEEDS_HUMAN_DECISION` reason instead of pretending the loop completed.
+
+### Test-Line 95 Auto Profile
+
+Use this only after explicit user opt-in:
+
+```powershell
+& "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action RunLoop -Root "<project-root>" -LoopProfile testline_95_auto -ConfirmTestlineIsolation -TargetScore 95
+```
+
+The fixed cycle is:
+
+```text
+run/open/generate candidate -> collect evidence -> score -> find top deductions -> plan 1-3 fixes -> rerun/reverify/rescore
+```
+
+Score weights:
+
+- `goal_fit`: 25
+- `runnable_usability`: 20
+- `result_quality`: 20
+- `ux_readability`: 15
+- `stability_correctness`: 10
+- `delivery_completeness`: 10
+
+Verdicts:
+
+- `CANDIDATE_PASS`: `candidate_score >= target_score` and no P0 blocker. This stops the candidate cycle only; it is not project-total completion.
+- `CANDIDATE_PARTIAL`: `80-94` or otherwise below target but still improvable. Continue automatically on the highest deductions.
+- `CANDIDATE_REJECTED`: current route failed but an alternative route exists.
+- `CANDIDATE_BLOCKED`: no safe route remains or a hard safety/human gate is hit.
+
+Crazy loop output is intentionally short and always uses:
+
+```text
+【状态】
+【总分】
+【各项评分】
+【本轮实际改动】
+【运行/查看/使用方式】
+【证据】
+【最高扣分项】
+【下一轮自动目标】
+```
+
+Never report a below-95 candidate as complete, and never treat `CANDIDATE_PASS` as formal project completion.
+
+For high-frequency Codex projects, run a one-time capability scan before the first serious loop. This aligns project goals with available capability routes before execution:
 
 ```powershell
 & "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action RunCapabilityScan -Root "<project-root>" -AuditContext "<project goal, stack, and important constraints>"
@@ -149,10 +242,12 @@ Prepare a compact package without starting the outer loop:
 Use larger handoffs only when needed:
 
 ```powershell
-& "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action Prepare -Root "<project-root>" -QuotaMode balanced
-& "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action Prepare -Root "<project-root>" -QuotaMode deep
+& "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action PrepareCompactReview -Root "<project-root>" -QuotaMode balanced
+& "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action PrepareCompactReview -Root "<project-root>" -QuotaMode deep
 & "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action BuildArchitectureBrief -Root "<project-root>" -ArchitectureBriefMaxChars 12000
 ```
+
+`Prepare` is kept as a legacy alias for `PrepareCompactReview`; new examples should use `PrepareCompactReview`.
 
 If GPT Pro says context is insufficient, regenerate only the compressed architecture brief with a larger limit such as `12000`; do not send raw project files or the full local ledger.
 
@@ -171,7 +266,7 @@ The script prints the ChatGPT target and prompt file. Send that prompt through E
 Force a full baseline resend when the ChatGPT conversation changed or lost context:
 
 ```powershell
-& "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action Prepare -Root "<project-root>" -ForceBaseline
+& "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action PrepareCompactReview -Root "<project-root>" -ForceBaseline
 ```
 
 Capture GPT Pro's reply:
@@ -179,6 +274,8 @@ Capture GPT Pro's reply:
 ```powershell
 & "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action CaptureReview -Root "<project-root>" -Reviewer gpt-pro -Phase initial -ReviewText "<GPT Pro reply>"
 ```
+
+`CaptureFeedback` is kept as a legacy alias for `CaptureReview -Reviewer gpt-pro -Phase initial`. `WaitFeedback` and `ShowLatestReview` are debugging/status helpers, not core loop steps.
 
 Capture a recheck reply:
 
@@ -207,7 +304,7 @@ When project-total blockers remain, build the local project goal plan and ask fo
 & "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action ExecuteNextLocalAction -Root "<project-root>"
 ```
 
-`ExecuteNextLocalAction` writes `action-contracts/*.json` first, then executes only safe local ledger actions such as refreshing project understanding, rebuilding the project goal plan, running the local council, or recording evidence. If the action mentions push, publish, deploy, merge, delete, reset, credentials, permissions, Human Gate, or protected authorization, it pauses with `NEEDS_HUMAN_DECISION`.
+`ExecuteNextLocalAction` writes `action-contracts/*.json` first, then executes only safe local ledger actions such as refreshing project understanding, rebuilding the project goal plan, running the local council, or recording evidence. For `needs_evidence` / `collect_evidence` actions it writes `loop-runs/*-evidence-strategy.json`, records CodeGraph fallback status without initializing CodeGraph, gathers bounded local file evidence from the goal contract and architecture map, writes a Markdown evidence artifact, binds it to the current gate/blocker when available, resets stale counters, and refreshes the project goal plan. If the action mentions push, publish, deploy, merge, delete, reset, credentials, permissions, Human Gate, or protected authorization, it pauses with `NEEDS_HUMAN_DECISION`.
 
 Run the local expert council after each progress update:
 
@@ -258,6 +355,8 @@ Each project gets a local ledger under:
 docs/ai-review-loop/
   project-config.json
   review-state.json
+  loop-contract.json
+  loop-contract.md
   decisions.md
   project-goal-contract.json
   project-goal-contract.md
@@ -307,6 +406,13 @@ Generated review-loop files are excluded from later code maps and sensitive scan
 ```json
 {
   "quota_mode": "economy",
+  "loop_profile": "conservative",
+  "target_score": 95,
+  "candidate_status": null,
+  "candidate_score": null,
+  "testline_isolation_status": "not_required",
+  "formal_line_protected": true,
+  "formal_completion_claim_allowed": false,
   "runtime_brief": "docs/ai-review-loop/loop-runs/...",
   "browser_preflight_status": "pending_edge_browser_control",
   "browser_target_tab_id": null,
@@ -386,6 +492,8 @@ Generated review-loop files are excluded from later code maps and sensitive scan
 2. `Post-Evaluation`: classifies ideas as immediately local, evidence-needed, external-Pro-needed, human-decision-needed, or future scope.
 
 The council updates `local-council.md` and `goal-backlog.md`. Generated goals stay in backlog and do not expand implementation scope automatically. Human Gate, core-system, publish, push, authorization, and protected-scope goals are marked `needs_human_decision`. Post-evaluation includes a `recommended_capability_route` for each candidate goal when a capability scan exists.
+
+When the blocker queue is empty but project-total completion is still not allowed, the council consumes Goal Contract, Done Gate, goal slices, and evidence gaps. It must either create backlog from those inputs or preserve the recovery action selected by the state machine; it must not use another meeting record as the only next step.
 
 ## Codex Efficiency Closed Loop
 
@@ -524,6 +632,7 @@ This footer is courtesy text only. It is not written into verdicts, gates, local
 - `edge-browser-control` not visible as a tool: treat it as a skill, read its `SKILL.md`, and use the official Codex Edge/Chrome extension backend through the bundled browser-client. Do not fall back to a generic Playwright browser or unauthenticated in-app browser for ChatGPT login state.
 - Edge tab grouping error: reconnect the browser runtime once, list tabs once, then open a fresh extension tab or stop with the prompt path. Do not repeatedly retry the same tab claim.
 - Edge opened but GPT page is absent: use the target URL printed by `SendPrompt`, `SendAssessment`, or `Status` and navigate the current or a fresh Edge tab there.
+- Edge runtime schema mismatch such as `missing field sandboxPolicy`: record it with `-Action PreflightBrowser -BrowserPreflightError "missing field sandboxPolicy"`. This sets `browser_preflight_status=blocked_schema_mismatch`; do not run `SendPrompt -Send` and do not claim GPT Pro reviewed the prompt. Use the printed prompt path and target URL for manual handoff or retry after the browser runtime updates.
 - In-app browser fallback: use it only as a diagnostic or when ChatGPT login state is not required. Its tab API uses `tab.playwright`, not a raw `.page` property, and it may not share Edge login.
 - Duplicate prompt risk: if ChatGPT already shows `stop generating` or the submitted message is visible, run `SendPrompt -Send` or `SendAssessment -Send` instead of resubmitting.
 - PowerShell error on path APIs: run with PowerShell 7+.
