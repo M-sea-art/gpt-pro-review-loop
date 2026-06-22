@@ -3106,7 +3106,17 @@ function Ensure-ReviewLoop {
   $quotaDefaults = Get-QuotaSettings -Mode $QuotaMode -PromptLimit $MaxPromptChars
   $effectiveGoalScope = if ($GoalScopeProvided) { $GoalScope } elseif ($config.active_goal_scope) { [string]$config.active_goal_scope } else { "project_total" }
   $effectiveTerminalGoalScope = if ($TerminalGoalScopeProvided) { $TerminalGoalScope } elseif ($config.terminal_goal_scope) { [string]$config.terminal_goal_scope } else { "project_total" }
-  $effectiveProReviewMode = if ($ProReviewModeProvided) { $ProReviewMode } elseif ($config.pro_review_mode) { [string]$config.pro_review_mode } else { "optional" }
+  $effectiveProReviewMode = if ($ProReviewModeProvided) {
+    $ProReviewMode
+  } elseif ($targetUrl) {
+    "optional"
+  } elseif ($config.pro_review_mode) {
+    [string]$config.pro_review_mode
+  } elseif (Test-ChatGptUrl $targetUrl) {
+    "optional"
+  } else {
+    "disabled"
+  }
   if ($effectiveProReviewMode -notin @("optional", "required", "disabled")) { $effectiveProReviewMode = "optional" }
   $effectiveEfficiencyAuditMode = if ($EfficiencyAuditModeProvided) { $EfficiencyAuditMode } elseif ($config.efficiency_audit_mode) { [string]$config.efficiency_audit_mode } else { "standard" }
   if ($effectiveEfficiencyAuditMode -notin @("off", "light", "standard", "strict")) { $effectiveEfficiencyAuditMode = "standard" }
@@ -3187,7 +3197,7 @@ function Ensure-ReviewLoop {
       latest_review = $null
       latest_assessment = $null
       goal_verdict = "CONTINUE"
-      next_action = "prepare_review"
+      next_action = "run_local_council"
       stop_reason = $null
       pending_prompts = @()
       pending_reviews = @()
@@ -3201,8 +3211,8 @@ function Ensure-ReviewLoop {
       latest_assessment_target_url = $null
       latest_assessment_opened_tab_url = $null
       continuation_required = $false
-      url_confirmation_required = -not (Test-ChatGptUrl $targetUrl)
-      url_confirmation_reason = if (Test-ChatGptUrl $targetUrl) { $null } else { "missing_target_chatgpt_url" }
+      url_confirmation_required = ($effectiveProReviewMode -eq "required" -and -not (Test-ChatGptUrl $targetUrl))
+      url_confirmation_reason = if ((Test-ChatGptUrl $targetUrl) -or $effectiveProReviewMode -ne "required") { $null } else { "missing_target_chatgpt_url" }
       quota_mode = $quotaDefaults.mode
       runtime_brief = $null
       browser_preflight_status = $null
@@ -3220,9 +3230,9 @@ function Ensure-ReviewLoop {
       cumulative_prompt_chars = 0
       external_review_count = 0
       local_only_iteration_count = 0
-      should_send_to_gpt = $true
-      send_reason = "initial_review"
-      local_only_next_action = $null
+      should_send_to_gpt = ((Test-ChatGptUrl $targetUrl) -and $effectiveProReviewMode -ne "disabled")
+      send_reason = if ((Test-ChatGptUrl $targetUrl) -and $effectiveProReviewMode -ne "disabled") { "initial_review" } else { "local_review_default" }
+      local_only_next_action = "run_local_council"
       active_goal_scope = $effectiveGoalScope
       terminal_goal_scope = $effectiveTerminalGoalScope
       subgoal_verdict = $null
@@ -3333,17 +3343,17 @@ function Ensure-ReviewLoop {
         if ($field -eq "loop_mode") { $default = "continuous_until_stopped" }
         if ($field -eq "loop_status") { $default = "idle" }
         if ($field -eq "goal_verdict") { $default = "CONTINUE" }
-        if ($field -eq "next_action") { $default = "prepare_review" }
+        if ($field -eq "next_action") { $default = "run_local_council" }
         if ($field -eq "continuation_required") { $default = $false }
-        if ($field -eq "url_confirmation_required") { $default = $true }
+        if ($field -eq "url_confirmation_required") { $default = ($effectiveProReviewMode -eq "required" -and -not (Test-ChatGptUrl $targetUrl)) }
         if ($field -eq "quota_mode") { $default = $quotaDefaults.mode }
         if ($field -eq "attach_visual_evidence_requested") { $default = $false }
         if ($field -eq "last_prompt_chars") { $default = 0 }
         if ($field -eq "cumulative_prompt_chars") { $default = 0 }
         if ($field -eq "external_review_count") { $default = 0 }
         if ($field -eq "local_only_iteration_count") { $default = 0 }
-        if ($field -eq "should_send_to_gpt") { $default = $true }
-        if ($field -eq "send_reason") { $default = "initial_review" }
+        if ($field -eq "should_send_to_gpt") { $default = ((Test-ChatGptUrl $targetUrl) -and $effectiveProReviewMode -ne "disabled") }
+        if ($field -eq "send_reason") { $default = if ((Test-ChatGptUrl $targetUrl) -and $effectiveProReviewMode -ne "disabled") { "initial_review" } else { "local_review_default" } }
         if ($field -eq "active_goal_scope") { $default = $effectiveGoalScope }
         if ($field -eq "terminal_goal_scope") { $default = $effectiveTerminalGoalScope }
         if ($field -eq "project_goal_verdict") { $default = "CONTINUE" }
@@ -4750,9 +4760,11 @@ function New-ReviewPackage {
   $requestPath = New-RoundRequest -ProjectRoot $ProjectRoot -RoundId $roundId -ScanPath $ScanPath
   $baselineHash = Get-StableBaselineHash -ProjectRoot $ProjectRoot -Paths @($dossierPath, $codeMapPath)
   $config = Get-Config -ProjectRoot $ProjectRoot
+  $targetUrl = if ($config.target_chatgpt_conversation_url) { $config.target_chatgpt_conversation_url } else { $config.target_chatgpt_url }
   $proDisabled = ($state.pro_review_mode -eq "disabled" -or $config.pro_review_mode -eq "disabled")
+  $proReady = (-not $proDisabled -and (Test-ChatGptUrl $targetUrl) -and -not [bool]$state.url_confirmation_required)
   $promptPath = $null
-  if (-not $proDisabled) {
+  if ($proReady) {
     $promptPath = New-ReviewPrompt -ProjectRoot $ProjectRoot -RoundId $roundId -DossierPath $dossierPath -CodeMapPath $codeMapPath -RequestPath $requestPath -BaselineHash $baselineHash -ForceFullBaseline:$ForceFullBaseline -Mode $Mode -PromptLimit $PromptLimit
   }
   $state = Get-State -ProjectRoot $ProjectRoot
@@ -4763,12 +4775,12 @@ function New-ReviewPackage {
   Set-ObjectProperty $state "latest_code_map" (Get-RelativePath -Root $ProjectRoot -Path $codeMapPath)
   Set-ObjectProperty $state "latest_round_request" (Get-RelativePath -Root $ProjectRoot -Path $requestPath)
   Set-ObjectProperty $state "loop_status" "running"
-  if ($proDisabled) {
+  if (-not $proReady) {
     Set-ObjectProperty $state "latest_prompt" $null
-    Set-ObjectProperty $state "next_action" "run_local_council"
+    Set-ObjectProperty $state "next_action" "run_local_council_or_next_local_action"
     Set-ObjectProperty $state "should_send_to_gpt" $false
-    Set-ObjectProperty $state "send_reason" "pro_review_disabled"
-    Set-ObjectProperty $state "local_only_next_action" "run_local_council"
+    Set-ObjectProperty $state "send_reason" $(if ($proDisabled) { "local_review_default" } else { "pro_url_not_confirmed_local_review" })
+    Set-ObjectProperty $state "local_only_next_action" "run_local_council_or_next_local_action"
   } else {
     Set-ObjectProperty $state "latest_prompt" (Get-RelativePath -Root $ProjectRoot -Path $promptPath)
     Set-ObjectProperty $state "next_action" "send_or_capture_review"
@@ -4785,7 +4797,7 @@ function New-ReviewPackage {
   if ($promptPath) {
     Write-Host "  Prompt: $promptPath"
   } else {
-    Write-Host "  Prompt: (not generated; pro_review_mode=disabled)"
+    Write-Host "  Prompt: (not generated; local review default or Pro URL not confirmed)"
   }
   return $promptPath
 }
@@ -4800,8 +4812,6 @@ function Invoke-PrepareCompactReviewAction {
     [int]$PromptLimit = 0
   )
   Ensure-ReviewLoop -ProjectRoot $ProjectRoot -ChatUrl $ChatUrl | Out-Null
-  $config = Get-Config -ProjectRoot $ProjectRoot
-  if ($config.pro_review_mode -ne "disabled") { Assert-TargetChatGptUrl -ProjectRoot $ProjectRoot | Out-Null }
   $scan = Invoke-SensitiveScan -ProjectRoot $ProjectRoot -Allow:$AllowSensitiveData
   New-ReviewPackage -ProjectRoot $ProjectRoot -ScanPath $scan -ForceFullBaseline:$ForceFullBaseline -Mode $Mode -PromptLimit $PromptLimit | Out-Null
 }
@@ -5518,6 +5528,28 @@ function Invoke-ReviewLoopCycle {
   $needsExternal = $ForceExternalReviewRequested -or $config.pro_review_mode -eq "required" -or (Test-ActionRequestsExternalReview -ActionText $nextActionText)
   $targetUrl = if ($config.target_chatgpt_conversation_url) { $config.target_chatgpt_conversation_url } else { $config.target_chatgpt_url }
   $urlConfirmationOnly = ($nextActionText -eq "confirm_target_chatgpt_url" -or ($state.url_confirmation_reason -eq "missing_target_chatgpt_url" -and [bool]$state.url_confirmation_required))
+  if ($ForceExternalReviewRequested -and -not (Test-ChatGptUrl $targetUrl)) {
+    Set-ObjectProperty $state "loop_status" "paused"
+    Set-ObjectProperty $state "goal_verdict" "NEEDS_HUMAN_DECISION"
+    Set-ObjectProperty $state "next_action" "confirm_target_chatgpt_url"
+    Set-ObjectProperty $state "local_only_next_action" $null
+    Set-ObjectProperty $state "should_send_to_gpt" $false
+    Set-ObjectProperty $state "send_reason" "force_external_review_missing_target_url"
+    Set-ObjectProperty $state "url_confirmation_required" $true
+    Set-ObjectProperty $state "url_confirmation_reason" "force_external_review_missing_target_url"
+    Set-ObjectProperty $state "continuation_required" $false
+    Set-ObjectProperty $state "stop_reason" "force_external_review_requires_chatgpt_url"
+    Save-State $ProjectRoot $state
+    Write-Host "ForceExternalReview requires a project ChatGPT URL. Run Init with -TargetChatGptUrl before external Pro review." -ForegroundColor Yellow
+    return [pscustomobject]@{ paused = $true; reason = "force_external_review_missing_target_url" }
+  }
+  if ($ForceExternalReviewRequested -and (Test-ChatGptUrl $targetUrl) -and $config.pro_review_mode -eq "disabled") {
+    Set-ObjectProperty $config "pro_review_mode" "optional"
+    ConvertTo-JsonFile $config (Get-ReviewPaths -ProjectRoot $ProjectRoot).Config
+    Set-ObjectProperty $state "pro_review_mode" "optional"
+    Save-State $ProjectRoot $state
+    $config = Get-Config -ProjectRoot $ProjectRoot
+  }
   $missingOptionalProUrl = ($config.pro_review_mode -eq "optional" -and ($needsExternal -or $urlConfirmationOnly) -and -not (Test-ChatGptUrl $targetUrl))
   if ($config.pro_review_mode -eq "required" -and $needsExternal) { Assert-TargetChatGptUrl -ProjectRoot $ProjectRoot | Out-Null }
   if ($missingOptionalProUrl) {
@@ -5894,6 +5926,7 @@ function Show-Status {
   $state = if (Test-Path -LiteralPath $paths.State) { Read-JsonFile $paths.State } else { $null }
   $targetUrl = if ($config) { if ($config.target_chatgpt_conversation_url) { $config.target_chatgpt_conversation_url } else { $config.target_chatgpt_url } } else { $null }
   $proMode = if ($state -and $state.pro_review_mode) { [string]$state.pro_review_mode } elseif ($config -and $config.pro_review_mode) { [string]$config.pro_review_mode } else { $null }
+  $proReviewAvailable = (Test-ChatGptUrl $targetUrl)
   $statusGuidance = $null
   $recommendedNextAction = $null
   $recommendedNextCommand = $null
@@ -5903,7 +5936,13 @@ function Show-Status {
   $optionalProUrlMissing = $state -and $proMode -eq "optional" -and [bool]$state.url_confirmation_required -and $state.url_confirmation_reason -eq "missing_target_chatgpt_url"
   $requiredProUrlMissing = $state -and $proMode -eq "required" -and [bool]$state.url_confirmation_required -and $state.url_confirmation_reason -eq "missing_target_chatgpt_url"
   $capabilityPreview = if ($state -and $state.recommended_capability_routes) { [string]::Join(", ", [string[]]@($state.recommended_capability_routes | Select-Object -First 8)) } else { $null }
-  if ($optionalProUrlMissing) {
+  if ($proMode -eq "disabled" -and -not $proReviewAvailable) {
+    $statusGuidance = "local_review_loop_default"
+    $recommendedNextAction = "run_loop_local_review"
+    $recommendedNextCommand = '& "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action RunLoop -Root "{0}"' -f $ProjectRoot
+    $effectiveNextAction = if ($state -and $state.next_action) { [string]$state.next_action } else { "run_local_council" }
+    $effectiveLocalOnlyNextAction = if ($state -and $state.local_only_next_action) { [string]$state.local_only_next_action } else { "run_local_council" }
+  } elseif ($optionalProUrlMissing) {
     $statusGuidance = "optional_pro_url_missing_continue_local_loop"
     $openBlocker = Get-CurrentOrNextOpenBlocker -State $state
     $fallbackLocal = if ($openBlocker) {
@@ -5933,6 +5972,8 @@ function Show-Status {
     review_loop_exists = (Test-Path -LiteralPath $paths.Base)
     transport = if ($config) { $config.transport } else { $null }
     target_chatgpt_url = $targetUrl
+    pro_review_available = $proReviewAvailable
+    pro_join_action = "init_with_target_chatgpt_url"
     loop_mode = if ($state) { $state.loop_mode } else { $null }
     loop_status = if ($state) { $state.loop_status } else { $null }
     round_counter = if ($state) { $state.round_counter } else { 0 }

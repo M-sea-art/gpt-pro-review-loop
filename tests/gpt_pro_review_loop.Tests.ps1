@@ -340,27 +340,65 @@ Describe "gpt-pro-review-loop state machine" {
     $updated.stop_reason | Should -Be "candidate_pass_testline_only_not_project_total"
   }
 
-  It "requires one-time target URL confirmation before prepare" {
-    $project = New-TestProject "missing-url"
+  It "defaults new projects to local review without requiring a ChatGPT URL" {
+    $project = New-TestProject "local-default-no-url"
     & $script:Skill -Action Init -Root $project
 
     $state = Read-State $project
-    $state.url_confirmation_required | Should -BeTrue
-    $state.url_confirmation_reason | Should -Be "missing_target_chatgpt_url"
-
-    { & $script:Skill -Action Prepare -Root $project } | Should -Throw -ExpectedMessage "*Ask the user once*"
-
-    & $script:Skill -Action Init -Root $project -TargetChatGptUrl "https://chatgpt.com/g/test-project"
-    $state = Read-State $project
+    $config = Read-Config $project
+    $config.pro_review_mode | Should -Be "disabled"
+    $state.pro_review_mode | Should -Be "disabled"
     $state.url_confirmation_required | Should -BeFalse
     $state.url_confirmation_reason | Should -Be $null
+    $state.should_send_to_gpt | Should -BeFalse
+    $state.send_reason | Should -Be "local_review_default"
+
+    & $script:Skill -Action PrepareCompactReview -Root $project
+    $state = Read-State $project
+    $state.latest_dossier | Should -Match "^docs/ai-review-loop/dossiers/"
+    $state.latest_code_map | Should -Match "^docs/ai-review-loop/code-maps/"
+    $state.latest_round_request | Should -Match "^docs/ai-review-loop/round-requests/"
+    $state.latest_prompt | Should -Be $null
+    $state.should_send_to_gpt | Should -BeFalse
+    $state.send_reason | Should -Be "local_review_default"
+  }
+
+  It "pauses for a ChatGPT URL when ForceExternalReview is requested without one" {
+    $project = New-TestProject "force-external-missing-url"
+    & $script:Skill -Action Init -Root $project
+
+    & $script:Skill -Action RunLoop -Root $project -ForceExternalReview
+
+    $state = Read-State $project
+    $state.loop_status | Should -Be "paused"
+    $state.goal_verdict | Should -Be "NEEDS_HUMAN_DECISION"
+    $state.next_action | Should -Be "confirm_target_chatgpt_url"
+    $state.url_confirmation_required | Should -BeTrue
+    $state.url_confirmation_reason | Should -Be "force_external_review_missing_target_url"
+    $state.send_reason | Should -Be "force_external_review_missing_target_url"
+  }
+
+  It "enables GPT Pro prompt generation when a target URL is configured" {
+    $project = New-TestProject "manual-pro-with-url"
+    & $script:Skill -Action Init -Root $project -TargetChatGptUrl "https://chatgpt.com/g/test-project"
+
+    $state = Read-State $project
+    $state.pro_review_mode | Should -Be "optional"
+    $state.url_confirmation_required | Should -BeFalse
+    $state.url_confirmation_reason | Should -Be $null
+
+    & $script:Skill -Action PrepareCompactReview -Root $project
+    $state = Read-State $project
+    $state.latest_prompt | Should -Match "^docs/ai-review-loop/prompts/"
+    $state.should_send_to_gpt | Should -BeTrue
+    $state.send_reason | Should -Be "review_package_created"
   }
 
   It "continues locally instead of finaling when optional Pro URL is missing" {
     $project = New-TestProject "optional-pro-url-missing"
     Set-Content -LiteralPath (Join-Path $project "AGENTS.md") -Encoding UTF8 -Value "# Project`n`nProject Identity`nShip without fake external review.`n`nAcceptance gate: verifier pass."
-    & $script:Skill -Action Init -Root $project
-    & $script:Skill -Action RunLoop -Root $project -ForceExternalReview
+    & $script:Skill -Action Init -Root $project -ProReviewMode optional
+    & $script:Skill -Action RunLoop -Root $project
 
     $state = Read-State $project
     $state.loop_status | Should -Be "running"
@@ -382,7 +420,7 @@ Describe "gpt-pro-review-loop state machine" {
   It "does not preserve confirm target URL as the local next action in optional RunLoop" {
     $project = New-TestProject "optional-runloop-no-url"
     Set-Content -LiteralPath (Join-Path $project "AGENTS.md") -Encoding UTF8 -Value "# Project`n`nProject Identity`nContinue locally when Pro is optional.`n`nAcceptance gate: local verifier pass."
-    & $script:Skill -Action Init -Root $project
+    & $script:Skill -Action Init -Root $project -ProReviewMode optional
     & $script:Skill -Action RunLoop -Root $project
 
     $state = Read-State $project
@@ -454,14 +492,14 @@ Describe "gpt-pro-review-loop state machine" {
 
   It "recommends local RunLoop continuation from Status when optional Pro URL is missing" {
     $project = New-TestProject "status-optional-pro-url-missing"
-    & $script:Skill -Action Init -Root $project
+    & $script:Skill -Action Init -Root $project -ProReviewMode optional
 
     $statusText = (& $script:Skill -Action Status -Root $project | Out-String)
 
     $statusText | Should -Match "optional_pro_url_missing_continue_local_loop"
     $statusText | Should -Match "run_loop_local_without_pro"
-    $statusText | Should -Match "next_action\s+: capture_or_run_local_review"
-    $statusText | Should -Match "local_only_next_action\s+: capture_or_run_local_review"
+    $statusText | Should -Match "next_action\s+: run_local_council"
+    $statusText | Should -Match "local_only_next_action\s+: run_local_council"
     $statusText | Should -Match "raw_next_action\s+: confirm_target_chatgpt_url"
     $statusText | Should -Match "RunLoop"
   }
@@ -475,10 +513,12 @@ Describe "gpt-pro-review-loop state machine" {
     $config.target_chatgpt_url = "https://chatgpt.com/g/new-project"
     $config | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $configPath -Encoding UTF8
 
-    { & $script:Skill -Action Prepare -Root $project } | Should -Throw -ExpectedMessage "*one-time user confirmation*"
+    & $script:Skill -Action Prepare -Root $project
     $state = Read-State $project
     $state.url_confirmation_required | Should -BeTrue
     $state.url_confirmation_reason | Should -Be "target_chatgpt_url_changed"
+    $state.should_send_to_gpt | Should -BeFalse
+    $state.latest_prompt | Should -Be $null
 
     & $script:Skill -Action Init -Root $project -TargetChatGptUrl "https://chatgpt.com/g/new-project"
     $state = Read-State $project
@@ -680,7 +720,7 @@ Describe "gpt-pro-review-loop state machine" {
     @($state.pending_prompts).Count | Should -Be 0
     $state.latest_prompt | Should -Be $null
     $state.should_send_to_gpt | Should -BeFalse
-    $state.send_reason | Should -Be "pro_review_disabled"
+    $state.send_reason | Should -Be "local_review_default"
   }
 
   It "requires GPT Pro evidence before terminal completion when Pro mode is required" {
@@ -1173,7 +1213,7 @@ Human Gate: manual visual signoff required
 
   It "normalizes optional Pro URL confirmation before executing a local action" {
     $project = New-TestProject "execute-optional-url-confirm"
-    & $script:Skill -Action Init -Root $project
+    & $script:Skill -Action Init -Root $project -ProReviewMode optional
     & $script:Skill -Action ExecuteNextLocalAction -Root $project
 
     $state = Read-State $project
@@ -1200,7 +1240,7 @@ Human Gate: manual visual signoff required
 
   It "writes the effective local-loop action into the project goal plan when optional Pro URL is missing" {
     $project = New-TestProject "goal-plan-optional-url-confirm"
-    & $script:Skill -Action Init -Root $project
+    & $script:Skill -Action Init -Root $project -ProReviewMode optional
     & $script:Skill -Action BuildProjectGoalPlan -Root $project
 
     $state = Read-State $project

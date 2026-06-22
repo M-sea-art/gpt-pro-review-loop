@@ -9,13 +9,13 @@ Chinese alias: `Pro 审阅循环`.
 
 ## What This Skill Does
 
-This skill turns a local Codex project into review material that GPT Pro can read in a normal ChatGPT conversation. Codex prepares the project dossier, code map, per-round delta, and prompt; GPT Pro reviews that material; Codex captures the reply; Codex efficiency review can add process or goal audit notes; Codex then checks all review events against local facts and records one next decision.
+This skill turns a local Codex project into a local-first review loop. Codex builds project understanding, runs a local expert council, records Codex efficiency review, binds evidence, and decides the next action. GPT Pro can join later as an optional external expert through a normal ChatGPT conversation, but it is not part of the default path.
 
-The loop is useful when the user wants an outside GPT Pro review without granting direct local project access.
+The loop is useful when the user wants local review discipline by default, with an optional outside GPT Pro review when explicitly requested, without granting direct local project access.
 
-v1.5 makes GPT Pro optional. The default is `pro_review_mode=optional`: Codex runs the project-total guard and local expert council first, then sends GPT Pro only for a new external judgment, a recheck request, a forced review, or a required-mode completion gate. `pro_review_mode=disabled` never generates GPT prompts or opens ChatGPT.
+GPT Pro is a manual add-on. New projects default to `pro_review_mode=disabled`: Codex runs the project-total guard, local expert council, efficiency audit, and local evidence loop without asking for a ChatGPT URL. `pro_review_mode=optional` means the user has allowed GPT Pro to join when a target URL is configured or an external review is explicitly requested. `pro_review_mode=required` keeps project-total completion from closing until a GPT Pro event is captured or a blocker prevents completion.
 
-Default quota mode is `economy`: keep full evidence in the project ledger, but send GPT Pro compact Markdown summaries and deltas unless the user or GPT explicitly needs a broader baseline.
+Default quota mode is `economy`: keep full evidence in the project ledger, and send GPT Pro compact Markdown summaries only when GPT Pro has been explicitly enabled.
 
 Default terminal goal scope is `project_total`. A task, milestone, or test-line can be achieved without ending the continuous loop; Codex must continue upward until the project-total completion guard passes, the user stops the session, or a hard blocker appears.
 
@@ -64,12 +64,12 @@ Use this skill only after an explicit user request such as "use GPT Pro to revie
 
 This skill is offline by design:
 
-- Send review material as Markdown through ChatGPT.
+- Send review material as Markdown through ChatGPT only when the user explicitly enables GPT Pro.
 - Use ChatGPT conversation memory as the long-running review context.
 - Keep all local reads, writes, tests, and implementation inside Codex.
 - Do not give GPT Pro direct local file access.
 - Do not assume GPT Pro can write local files.
-- Treat GPT Pro as optional external review unless the project config says `pro_review_mode=required`.
+- Treat GPT Pro as a user-invited external expert unless the project config says `pro_review_mode=required`.
 
 Codex owns all local reads, writes, tests, and final execution decisions. GPT Pro reviews only the Markdown material and conversation context that Codex sends through ChatGPT.
 
@@ -105,21 +105,27 @@ GPT Pro, Codex efficiency review, and the local expert council are `reviewer` va
 
    `testline_95_auto` must warn that version management and isolation are required. Without `-ConfirmTestlineIsolation`, without Git, or on a formal-looking branch, pause with `NEEDS_HUMAN_DECISION` and `next_action=confirm_testline_isolation`.
 
-3. Ensure the project has a target ChatGPT project or conversation URL:
+3. Default to local review. A target ChatGPT project or conversation URL is not required unless the user explicitly asks for GPT Pro review:
 
    ```powershell
-   & "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action Init -Root "<project-root>" -TargetChatGptUrl "https://chatgpt.com/..."
+   & "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action Init -Root "<project-root>"
    ```
 
-   If the project has no configured URL, ask the user once for the ChatGPT project/conversation URL before preparing or sending review material. After the user confirms it, store it with `Init -TargetChatGptUrl`; do not ask again in later loop iterations unless the URL changes, is invalid, or the browser is clearly on a different ChatGPT conversation. In `pro_review_mode=optional`, a missing URL is not a loop stop: `Status` must show `status_guidance=optional_pro_url_missing_continue_local_loop` and a `RunLoop` command so the outer Codex agent continues with local review, local council, efficiency audit, assessment, and local action.
+   If the user explicitly asks for GPT Pro review, store the ChatGPT target once:
 
-   If the user wants a fully local loop, initialize or update with:
+   ```powershell
+   & "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action Init -Root "<project-root>" -TargetChatGptUrl "https://chatgpt.com/..." -ProReviewMode optional
+   ```
+
+   Ask the user for a ChatGPT URL only for `SendPrompt`, `SendAssessment`, `-ForceExternalReview`, `pro_review_mode=required`, or an explicit user request to involve GPT Pro. After the user confirms it, store it with `Init -TargetChatGptUrl`; do not ask again in later loop iterations unless the URL changes, is invalid, or the browser is clearly on a different ChatGPT conversation.
+
+   If the user wants to force a fully local loop, initialize or update with:
 
    ```powershell
    & "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action Init -Root "<project-root>" -ProReviewMode disabled
    ```
 
-   `-ProReviewMode optional|required|disabled` controls whether GPT Pro is a supplement, a required completion reviewer, or completely disabled.
+   `-ProReviewMode disabled|optional|required` controls whether GPT Pro is absent, user-invited, or required for terminal project-total completion.
 
    `-EfficiencyAuditMode off|light|standard|strict` controls how much Codex efficiency supervision is attached. Default is `standard`.
 
@@ -149,7 +155,7 @@ GPT Pro, Codex efficiency review, and the local expert council are `reviewer` va
    & "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action PrepareCompactReview -Root "<project-root>"
    ```
 
-   This writes under `docs/ai-review-loop/`, refreshes project understanding, runs the sensitive-data scan, creates a project dossier, creates a code map, creates a round request, assembles a compact ChatGPT prompt, and writes a runtime brief. Use `-ForceBaseline` when the ChatGPT conversation lost context or the user explicitly wants a full baseline resend. Use `-QuotaMode balanced` or `-QuotaMode deep` only when the compact prompt is insufficient.
+   This writes under `docs/ai-review-loop/`, refreshes project understanding, runs the sensitive-data scan, creates a project dossier, creates a code map, creates a round request, and writes a runtime brief. It assembles a compact ChatGPT prompt only when GPT Pro is enabled and a target URL is confirmed. Use `-ForceBaseline` when the ChatGPT conversation lost context or the user explicitly wants a full baseline resend. Use `-QuotaMode balanced` or `-QuotaMode deep` only when the compact prompt is insufficient.
 
    `Prepare` remains as a legacy alias for `PrepareCompactReview`. `CaptureFeedback` remains as a legacy alias for `CaptureReview -Reviewer gpt-pro -Phase initial`. `WaitFeedback` and `ShowLatestReview` are debugging/status helpers, not core loop steps.
 
@@ -168,7 +174,7 @@ GPT Pro, Codex efficiency review, and the local expert council are `reviewer` va
 
    Use `-GoalScope task|milestone|test_line|project_total` to label the current review target. Keep `project_total` as the terminal scope unless the user explicitly changes the project governance model. Compact prompts include `Goal Context` so GPT Pro and Codex efficiency review can distinguish a subgoal from total project completion.
 
-   If `pro_review_mode=disabled`, this step still creates local dossier/code-map/request material but does not create a GPT prompt.
+   If `pro_review_mode=disabled` or no Pro URL is confirmed, this step still creates local dossier/code-map/request material but does not create a GPT prompt.
 
    Useful quota parameters:
 
@@ -398,7 +404,7 @@ If the loop is `running` but has no `project_blocker_queue`, no `goal_backlog`, 
 
 In `standard` and `strict` efficiency modes, `RunLoop` ensures a capability scan exists first so the council and decision engine have capability-route context. The PowerShell script prepares local ledger material and writes a runtime brief; it does not control Edge or wait for ChatGPT by itself. After explicit authorization, Codex must continue ordinary next rounds without confirmation until `NextDecision` reports terminal project-total completion, `NEEDS_HUMAN_DECISION`, `BLOCKED`, or the user stops the session. A `running` loop status with `continuation_required=true` is an instruction to keep working, not a final-answer point. Safety blockers, human gates, external account/login/CAPTCHA, publish/push, destructive file operations, and permission changes still pause.
 
-If the user says "reload", "resume", "rerun", "重新载入", "重新使用", or "继续" for a project that already has `loop_status=running`, do not stop after `Status`. Read `Status` only to orient, then immediately execute the recommended `RunLoop` command unless the status is `paused`, `blocked`, `complete`, `NEEDS_HUMAN_DECISION`, or the user explicitly asked for status only. If `Status` reports `optional_pro_url_missing_continue_local_loop`, continue locally with `RunLoop`; do not ask for a ChatGPT URL unless the user specifically wants external Pro review or `pro_review_mode=required`.
+If the user says "reload", "resume", "rerun", "重新载入", "重新使用", or "继续" for a project that already has `loop_status=running`, do not stop after `Status`. Read `Status` only to orient, then immediately execute the recommended `RunLoop` command unless the status is `paused`, `blocked`, `complete`, `NEEDS_HUMAN_DECISION`, or the user explicitly asked for status only. If `Status` reports `local_review_loop_default` or `optional_pro_url_missing_continue_local_loop`, continue locally with `RunLoop`; do not ask for a ChatGPT URL unless the user specifically wants external Pro review or `pro_review_mode=required`.
 
 For subgoal reviews:
 
@@ -459,7 +465,7 @@ The loop records:
 - Do not inspect cookies, passwords, browser storage, or session files.
 - Do not enter account credentials, purchases, or permission changes through browser automation.
 - If the ChatGPT conversation changes or GPT says context is missing, resend a compressed baseline before asking for another verdict.
-- If a new project has no ChatGPT target URL, stop and ask the user once. Do not guess a conversation URL from unrelated projects.
+- If a new project has no ChatGPT target URL, continue the local loop. Ask the user for a URL only when GPT Pro is explicitly requested or required. Do not guess a conversation URL from unrelated projects.
 - The script requires PowerShell 7+.
 
 ## References
