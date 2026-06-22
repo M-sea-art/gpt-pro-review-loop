@@ -34,6 +34,31 @@ jobs:
           Import-Module Pester -MinimumVersion 5.0 -Force
           Invoke-Pester -CI
 
+      - name: Guard removed connector path terms
+        shell: pwsh
+        run: |
+          $terms = @(
+            ("Dev" + "Space"),
+            ("cloud" + "flared"),
+            ("try" + "cloudflare"),
+            ("quick" + " tunnel"),
+            ("Start" + "Session"),
+            ("Stop" + "Session"),
+            ("Preflight" + "Connector"),
+            ("docs/ai" + "-bridge"),
+            ("/" + "mcp")
+          )
+          $tracked = git ls-files
+          $hits = @()
+          foreach ($term in $terms) {
+            $matches = Select-String -Path $tracked -Pattern ([regex]::Escape($term)) -SimpleMatch:$false -ErrorAction SilentlyContinue
+            if ($matches) { $hits += $matches }
+          }
+          if ($hits.Count) {
+            $hits | ForEach-Object { "$($_.Path):$($_.LineNumber):$($_.Line)" }
+            exit 1
+          }
+
       - name: Diff check
         shell: pwsh
         run: git diff --check

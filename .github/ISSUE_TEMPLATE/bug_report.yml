@@ -1,0 +1,35 @@
+name: Bug report
+description: Report a reproducible problem in the review loop skill.
+title: "bug: "
+labels: ["bug"]
+body:
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: What happened, and what did you expect?
+    validations:
+      required: true
+  - type: textarea
+    id: command
+    attributes:
+      label: Command or workflow
+      description: Paste the action command or short workflow that triggered the issue.
+      render: powershell
+  - type: textarea
+    id: state
+    attributes:
+      label: Relevant state
+      description: Include sanitized `Status` output, loop profile, Pro mode, and goal scope if available.
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Evidence
+      description: Add sanitized file paths, test output, or error text. Do not include secrets.
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: Safety check
+      options:
+        - label: I removed secrets, tokens, cookies, and private local data from this report.
+          required: true
