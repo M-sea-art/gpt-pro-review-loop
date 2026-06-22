@@ -6,6 +6,37 @@ Chinese trigger: `Pro 审阅循环`.
 
 Default quota strategy: `economy`. The local ledger keeps full evidence, while ChatGPT handoffs receive compact Markdown summaries unless `-QuotaMode balanced` or `-QuotaMode deep` is explicitly requested.
 
+## 90-Second Path
+
+```powershell
+# Install or update
+git clone https://github.com/M-sea-art/gpt-pro-review-loop.git "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop"
+# If already installed:
+git -C "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop" pull
+
+# Verify the skill package
+python "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\quick_validate.py" "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop"
+
+# Initialize a project
+& "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action Init -Root "<project-root>" -ProReviewMode optional
+
+# Run one local-first loop iteration
+& "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action RunLoop -Root "<project-root>"
+```
+
+Use `-TargetChatGptUrl "https://chatgpt.com/..."` when you want external GPT Pro review. Without a URL, optional Pro mode continues the local loop instead of pretending external review happened.
+
+## Documentation Map
+
+- `README.md`: install, quick start, main workflows, safety model.
+- `SKILL.md`: Codex operator behavior and trigger rules.
+- `references/bridge-protocol.md`: project-local ledger protocol.
+- `references/chatgpt-browser-flow.md`: Edge/ChatGPT handoff rules.
+- `references/experience-collection.md`: what usage lessons are worth recording.
+- `CONTRIBUTING.md`: maintainer validation and contribution rules.
+- `CHANGELOG.md`: public behavior changes and release notes.
+- `agents/openai.yaml`: optional display metadata for environments that surface agent/skill cards.
+
 v1.11 adds a formal loop contract and two run profiles:
 
 - `conservative`: default. Review, evidence, goal contracts, local council, efficiency audit, and gates first.
@@ -644,6 +675,8 @@ This footer is courtesy text only. It is not written into verdicts, gates, local
 - License: MIT.
 - `examples/minimal-project/` is a fake project for trying the workflow.
 - `examples/expected-ai-review-loop/` documents the expected ledger shape without real project data.
+- `agents/openai.yaml` is optional display/routing metadata for OpenAI-style agent launchers; the PowerShell script does not require it.
+- Maintainers should update `CHANGELOG.md` and `CONTRIBUTING.md` when changing public behavior or validation rules.
 
 ## Maintenance
 
@@ -663,6 +696,8 @@ git -C "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop" diff --check
 ```
 
 The Codex desktop system `skill-creator` validator can also be run when available; the repository-local validator keeps GitHub Actions self-contained.
+
+For contribution workflow, issue templates, and pull request expectations, see `CONTRIBUTING.md`.
 
 Useful smoke path:
 

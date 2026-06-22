@@ -1,0 +1,36 @@
+name: Feature request
+description: Suggest a focused improvement to the skill.
+title: "feat: "
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What repeated workflow pain should this solve?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposal
+      description: Describe the smallest behavior change that would help.
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - Project understanding
+        - Local evidence loop
+        - GPT Pro handoff
+        - Experience collection
+        - Test-line 95 profile
+        - Documentation
+        - CI or tests
+  - type: textarea
+    id: boundaries
+    attributes:
+      label: Boundaries
+      description: What should the skill still not do automatically?
