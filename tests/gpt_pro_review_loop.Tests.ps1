@@ -164,6 +164,17 @@ Describe "gpt-pro-review-loop state machine" {
     { & $script:Skill -Action Init -Root $project -TargetChatGptUrl "https://example.com/not-chatgpt" } | Should -Throw
   }
 
+  It "provides a Ponytail-style thin command surface" {
+    $project = New-TestProject "thin-surface"
+    $wrapper = Join-Path $script:Root "scripts/pro_loop.ps1"
+
+    (& $wrapper -Command help -Root $project | Out-String) | Should -Match "Pro Loop thin command surface"
+
+    & $script:Skill -Action Init -Root $project
+    (& $wrapper -Command gain -Root $project | Out-String) | Should -Match "Pro Loop Gain"
+    (& $wrapper -Command debt -Root $project | Out-String) | Should -Match "Pro Loop Debt"
+  }
+
   It "records loop needs clarification as a formal contract gate" {
     $project = New-TestProject "clarify-loop-needs"
     & $script:Skill -Action Init -Root $project

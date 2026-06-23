@@ -21,19 +21,37 @@ git -C "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop" pull
 # Verify the skill package
 python "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\quick_validate.py" "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop"
 
-# Initialize a project
-& "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action Init -Root "<project-root>" -ProReviewMode optional
+# Initialize and run one local-first loop iteration
+& "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\pro_loop.ps1" -Command local -Root "<project-root>"
 
-# Run one local-first loop iteration
-& "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action RunLoop -Root "<project-root>"
+# Check state
+& "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\pro_loop.ps1" -Command status -Root "<project-root>"
 ```
 
 Use `-TargetChatGptUrl "https://chatgpt.com/..."` only when you want external GPT Pro review. Without a URL, the default local loop continues and does not generate a GPT prompt.
+
+## Thin Command Surface
+
+The Ponytail-inspired public surface is deliberately small:
+
+```powershell
+scripts/pro_loop.ps1 -Command local -Root "<project-root>"
+scripts/pro_loop.ps1 -Command pro -Root "<project-root>" -TargetChatGptUrl "https://chatgpt.com/..."
+scripts/pro_loop.ps1 -Command required-pro -Root "<project-root>" -TargetChatGptUrl "https://chatgpt.com/..."
+scripts/pro_loop.ps1 -Command testline -Root "<project-root>" -ConfirmTestlineIsolation
+scripts/pro_loop.ps1 -Command status -Root "<project-root>"
+scripts/pro_loop.ps1 -Command audit -Root "<project-root>"
+scripts/pro_loop.ps1 -Command gain -Root "<project-root>"
+scripts/pro_loop.ps1 -Command debt -Root "<project-root>"
+```
+
+Use `scripts/gpt_pro_review_loop.ps1` directly for advanced maintenance, debugging, and compatibility actions.
 
 ## Documentation Map
 
 - `README.md`: install, quick start, main workflows, safety model.
 - `SKILL.md`: Codex operator behavior and trigger rules.
+- `AGENTS.md`: compact always-on rule for agents that read repository instructions.
 - `references/bridge-protocol.md`: project-local ledger protocol.
 - `references/chatgpt-browser-flow.md`: Edge/ChatGPT handoff rules.
 - `references/experience-collection.md`: what usage lessons are worth recording.
@@ -699,6 +717,12 @@ $errors = $null
 if ($errors.Count) { $errors | ForEach-Object { "$($_.Extent.StartLineNumber):$($_.Message)" }; exit 1 }
 
 git -C "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop" diff --check
+```
+
+Check the public surface after command or documentation changes:
+
+```powershell
+python "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\surface_check.py" "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop"
 ```
 
 The Codex desktop system `skill-creator` validator can also be run when available; the repository-local validator keeps GitHub Actions self-contained.

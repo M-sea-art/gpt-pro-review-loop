@@ -58,6 +58,14 @@ The mental model is:
 review package -> external/internal review -> local assessment -> next decision
 ```
 
+For ordinary use, prefer the thin command wrapper:
+
+```powershell
+scripts/pro_loop.ps1 -Command local|pro|required-pro|testline|status|audit|gain|debt -Root "<project-root>"
+```
+
+Use `scripts/gpt_pro_review_loop.ps1` directly only for advanced maintenance, debugging, and compatibility actions.
+
 ## Core Rule
 
 Use this skill only after an explicit user request such as "use GPT Pro to review this project", "start the review loop", "$gpt-pro-review-loop", or "Pro 审阅循环".
