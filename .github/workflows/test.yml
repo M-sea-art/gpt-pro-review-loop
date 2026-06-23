@@ -14,16 +14,21 @@ jobs:
         shell: pwsh
         run: python scripts/quick_validate.py .
 
+      - name: Check public surface
+        shell: pwsh
+        run: python scripts/surface_check.py .
+
       - name: Parse PowerShell
         shell: pwsh
         run: |
-          $path = "scripts/gpt_pro_review_loop.ps1"
-          $tokens = $null
-          $errors = $null
-          [System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path $path), [ref]$tokens, [ref]$errors) | Out-Null
-          if ($errors.Count) {
-            $errors | ForEach-Object { "$($_.Extent.StartLineNumber):$($_.Message)" }
-            exit 1
+          foreach ($path in @("scripts/gpt_pro_review_loop.ps1", "scripts/pro_loop.ps1")) {
+            $tokens = $null
+            $errors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path $path), [ref]$tokens, [ref]$errors) | Out-Null
+            if ($errors.Count) {
+              $errors | ForEach-Object { "${path}:$($_.Extent.StartLineNumber):$($_.Message)" }
+              exit 1
+            }
           }
 
       - name: Run Pester
