@@ -135,6 +135,9 @@ docs/ai-review-loop/
 - `top_capability_family`: top recommendation from capability scan, such as `game-studio` for game contexts.
 - `top_capability_status`: status label such as `enabled`, `available-in-session`, or `installed-not-exposed`.
 - `recommended_capability_routes`: compact route mentions for future work, such as `$game-studio:game-playtest`, `codegraph`, or browser testing.
+- `latest_reuse_recon`: latest compact reuse reconnaissance report under `reuse-recon/`.
+- `reuse_recon_decision`: latest reuse recommendation such as `USE_LOCAL`, `APPLY_EXISTING_SKILL`, or `BUILD_CUSTOM_MINIMAL`.
+- `reuse_recon_external_allowed`: whether that report allowed external/GitHub candidate summaries.
 - `stale_count`: repeated local-only action count used by stall/pivot rules.
 - `stall_pivot_status`: `CONTINUE`, `STALE_PROGRESS`, `REPEATED_FAILURE`, `RECOVERY_NEEDED`, `SCOPE_DRIFT`, or `BLOCKED`.
 - `done_gate_verdict`: `DONE_GATE_PASS`, `READY_FOR_FINAL_AUDIT`, `NEEDS_FIX`, `NEEDS_HUMAN_DECISION`, or `BLOCKED`.
@@ -192,6 +195,7 @@ Review material files should use project-relative paths and avoid local absolute
 - `reviews/`: all external and internal review events. GPT Pro initial review, GPT Pro recheck, Codex efficiency process audit, and Codex efficiency goal audit all live here.
 - `assessments/`: local-practice and combined-next-decision assessments.
 - `loop-runs/`: small JSON records emitted by `NextDecision` and `runtime-brief.json` snapshots for low-quota reuse.
+- `reuse-recon/`: compact local-first reuse decision packages for non-trivial module starts.
 - `action-contracts/`: structured contracts generated from `local_only_next_action` before local execution.
 - `evidence/`: local proof artifacts and `evidence.jsonl` records produced by safe ledger actions.
 - `project-goal-plan.md`: compact local plan generated from `project_blocker_queue`.

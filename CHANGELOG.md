@@ -6,7 +6,8 @@ This project uses human-readable version labels for the skill behavior. Public r
 
 ## Unreleased
 
-- Added a Ponytail-inspired thin command wrapper at `scripts/pro_loop.ps1` for local, Pro, required-Pro, testline, status, audit, gain, debt, help, and off commands.
+- Added a Ponytail-inspired thin command wrapper at `scripts/pro_loop.ps1` for local, Pro, required-Pro, testline, status, audit, reuse recon, gain, debt, help, and off commands.
+- Added a compact `ReuseRecon` gate that reuses capability scan output and writes local-first reuse decision reports without web search or dependency installation.
 - Added `AGENTS.md` as the compact always-on rule for local-first review behavior.
 - Added `scripts/surface_check.py` and a lightweight benchmark skeleton to guard the public command surface and default local-first documentation.
 - Added key-events-only experience collection to reduce redundant local loop logs.

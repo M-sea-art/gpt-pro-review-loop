@@ -7,10 +7,11 @@ This repository provides a local-first Codex review loop.
 1. Identify the project goal contract.
 2. Run the local loop first.
 3. Bind claims to local evidence.
-4. Invite GPT Pro only when the user explicitly asks or a required external gate exists.
-5. Treat GPT Pro as advisory input, not the final judge.
-6. Route every recommendation through local assessment, efficiency audit, project-total guard, and Done Gate.
-7. Do not claim project-total completion until evidence gates and Human Gate boundaries allow it.
+4. For non-trivial new module work, run a compact Reuse Recon Gate before building.
+5. Invite GPT Pro only when the user explicitly asks or a required external gate exists.
+6. Treat GPT Pro as advisory input, not the final judge.
+7. Route every recommendation through local assessment, efficiency audit, project-total guard, and Done Gate.
+8. Do not claim project-total completion until evidence gates and Human Gate boundaries allow it.
 
 ## Default Behavior
 
@@ -30,6 +31,7 @@ scripts/pro_loop.ps1 -Command local -Root "<project-root>"
 scripts/pro_loop.ps1 -Command status -Root "<project-root>"
 scripts/pro_loop.ps1 -Command pro -Root "<project-root>" -TargetChatGptUrl "https://chatgpt.com/..."
 scripts/pro_loop.ps1 -Command testline -Root "<project-root>" -ConfirmTestlineIsolation
+scripts/pro_loop.ps1 -Command recon -Root "<project-root>" -ModuleGoal "<module goal>"
 scripts/pro_loop.ps1 -Command gain -Root "<project-root>"
 scripts/pro_loop.ps1 -Command debt -Root "<project-root>"
 ```

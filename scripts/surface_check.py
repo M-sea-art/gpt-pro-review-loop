@@ -11,17 +11,23 @@ import sys
 from pathlib import Path
 
 
-PUBLIC_COMMANDS = {"local", "pro", "required-pro", "testline", "status", "audit", "gain", "debt", "help", "off"}
+PUBLIC_COMMANDS = {"local", "pro", "required-pro", "testline", "status", "audit", "recon", "gain", "debt", "help", "off"}
 REQUIRED_PHRASES = {
     "README.md": [
         "Default path: local review first",
         "GPT Pro is a manual add-on",
         "Thin Command Surface",
+        "Reuse Recon Gate",
+        "Scoped Reporting",
+        "Council Lite",
     ],
     "SKILL.md": [
         "New projects default to `pro_review_mode=disabled`",
         "GPT Pro is a manual add-on",
         "If a new project has no ChatGPT target URL, continue the local loop",
+        "Reuse Recon Gate",
+        "Scoped result reports must split the two claims",
+        "Council Lite is a local prompt/output framework",
     ],
     "AGENTS.md": [
         "Default Behavior",
