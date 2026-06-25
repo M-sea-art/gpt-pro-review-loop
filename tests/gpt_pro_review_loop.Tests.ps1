@@ -108,6 +108,9 @@ Describe "gpt-pro-review-loop state machine" {
     $state.PSObject.Properties.Name | Should -Contain "latest_experience_record"
     $state.PSObject.Properties.Name | Should -Contain "latest_auto_experience_key"
     $state.PSObject.Properties.Name | Should -Contain "auto_experience_count"
+    $state.PSObject.Properties.Name | Should -Contain "latest_reuse_recon"
+    $state.PSObject.Properties.Name | Should -Contain "reuse_recon_decision"
+    $state.PSObject.Properties.Name | Should -Contain "reuse_recon_external_allowed"
     @($state.pending_prompts).Count | Should -Be 0
     @($state.captured_reviews).Count | Should -Be 0
     $state.baseline_sent_to_url | Should -Be $null
@@ -169,10 +172,33 @@ Describe "gpt-pro-review-loop state machine" {
     $wrapper = Join-Path $script:Root "scripts/pro_loop.ps1"
 
     (& $wrapper -Command help -Root $project | Out-String) | Should -Match "Pro Loop thin command surface"
+    (& $wrapper -Command help -Root $project | Out-String) | Should -Match "recon"
 
     & $script:Skill -Action Init -Root $project
     (& $wrapper -Command gain -Root $project | Out-String) | Should -Match "Pro Loop Gain"
     (& $wrapper -Command debt -Root $project | Out-String) | Should -Match "Pro Loop Debt"
+  }
+
+  It "writes a local-first reuse recon report without requiring GPT Pro" {
+    $project = New-TestProject "reuse-recon"
+    Set-Content -LiteralPath (Join-Path $project "src/import_workflow.txt") -Encoding UTF8 -Value "import workflow helper"
+
+    & $script:Skill -Action Init -Root $project
+    & $script:Skill -Action ReuseRecon -Root $project -ModuleGoal "import workflow" -ModuleCategory "tooling"
+    & $script:Skill -Action ReuseRecon -Root $project -ModuleGoal "import workflow" -ModuleCategory "tooling"
+    & (Join-Path $script:Root "scripts/pro_loop.ps1") -Command recon -Root $project -ModuleGoal "import workflow" -ModuleCategory "tooling"
+
+    $state = Read-State $project
+    $report = Join-Path $project $state.latest_reuse_recon
+    $scanFiles = @(Get-ChildItem -LiteralPath (Join-Path $project "docs/ai-review-loop/loop-runs") -Filter "*-capability-scan.json")
+
+    Test-Path -LiteralPath $report | Should -BeTrue
+    (Get-Content -Raw -LiteralPath $report) | Should -Match "Reuse Recon Report"
+    (Get-Content -Raw -LiteralPath $report) | Should -Match "src/import_workflow.txt"
+    $state.reuse_recon_decision | Should -Be "USE_LOCAL"
+    $state.reuse_recon_external_allowed | Should -BeFalse
+    $state.url_confirmation_required | Should -BeFalse
+    $scanFiles.Count | Should -Be 1
   }
 
   It "records loop needs clarification as a formal contract gate" {
@@ -372,6 +398,10 @@ Describe "gpt-pro-review-loop state machine" {
     $state.latest_prompt | Should -Be $null
     $state.should_send_to_gpt | Should -BeFalse
     $state.send_reason | Should -Be "local_review_default"
+
+    $statusText = (& $script:Skill -Action Status -Root $project | Out-String)
+    $statusText | Should -Match "local_review_loop_active\s+: True"
+    $statusText | Should -Match "external_pro_status\s+: not_requested"
   }
 
   It "pauses for a ChatGPT URL when ForceExternalReview is requested without one" {
@@ -387,6 +417,9 @@ Describe "gpt-pro-review-loop state machine" {
     $state.url_confirmation_required | Should -BeTrue
     $state.url_confirmation_reason | Should -Be "force_external_review_missing_target_url"
     $state.send_reason | Should -Be "force_external_review_missing_target_url"
+
+    $statusText = (& $script:Skill -Action Status -Root $project | Out-String)
+    $statusText | Should -Match "external_pro_status\s+: blocked"
   }
 
   It "enables GPT Pro prompt generation when a target URL is configured" {
@@ -403,6 +436,9 @@ Describe "gpt-pro-review-loop state machine" {
     $state.latest_prompt | Should -Match "^docs/ai-review-loop/prompts/"
     $state.should_send_to_gpt | Should -BeTrue
     $state.send_reason | Should -Be "review_package_created"
+
+    $statusText = (& $script:Skill -Action Status -Root $project | Out-String)
+    $statusText | Should -Match "external_pro_status\s+: requested"
   }
 
   It "continues locally instead of finaling when optional Pro URL is missing" {
@@ -499,6 +535,18 @@ Describe "gpt-pro-review-loop state machine" {
     $state = Read-State $project
     @($state.goal_backlog).Count | Should -BeGreaterThan 0
     $state.local_only_next_action | Should -Not -Be "run_local_council"
+    $councilText = Get-Content -Raw -LiteralPath (Join-Path $project "docs/ai-review-loop/local-council.md")
+    $councilText | Should -Match "## Project Context"
+    $councilText | Should -Match "## Unjudged Ideas"
+    $councilText | Should -Match "## Five Advisor Views"
+    $councilText | Should -Match "Goal Clarifier / 目标澄清者"
+    $councilText | Should -Match "Skeptical Reviewer / 反方审阅者"
+    $councilText | Should -Match "Reuse Amplifier / 复用放大者"
+    $councilText | Should -Match "User-Maintainer Observer / 用户维护者视角"
+    $councilText | Should -Match "Next-Step Implementer / 下一步执行者"
+    $councilText | Should -Match "## Conflict Resolution"
+    $councilText | Should -Match "## Final Council Decision"
+    $councilText | Should -Match "## Next Smallest Action"
   }
 
   It "recommends local RunLoop continuation from Status when optional Pro URL is missing" {
@@ -513,6 +561,18 @@ Describe "gpt-pro-review-loop state machine" {
     $statusText | Should -Match "local_only_next_action\s+: run_local_council"
     $statusText | Should -Match "raw_next_action\s+: confirm_target_chatgpt_url"
     $statusText | Should -Match "RunLoop"
+  }
+
+  It "reports scoped review separately from project-total completion" {
+    $project = New-TestProject "status-scoped-reporting"
+    & $script:Skill -Action Init -Root $project -GoalScope task
+
+    $statusText = (& $script:Skill -Action Status -Root $project | Out-String)
+
+    $statusText | Should -Match "active_review_scope\s+: task"
+    $statusText | Should -Match "task_scope_review_status\s+: scope_selected_not_yet_reviewed"
+    $statusText | Should -Match "project_total_completion_status\s+: not_complete_or_not_claimed"
+    $statusText | Should -Match "scoped_result_reporting\s+: Report task-scope review separately from project-total completion"
   }
 
   It "requires one-time confirmation after target URL changes outside Init" {
@@ -802,7 +862,7 @@ Human Gate: manual visual signoff required
     Test-Path -LiteralPath (Join-Path $project "docs/ai-review-loop/goal-backlog.md") | Should -BeTrue
     $reviewPath = Join-Path $project ($state.latest_local_council_review -replace "/", "\")
     $reviewText = Get-Content -Raw -LiteralPath $reviewPath
-    $reviewText.IndexOf("## Brainstorm") | Should -BeLessThan $reviewText.IndexOf("## Post-Evaluation")
+    $reviewText.IndexOf("## Unjudged Ideas") | Should -BeLessThan $reviewText.IndexOf("## Conflict Resolution")
     $reviewText | Should -Match "鼓励自由发挥"
     $reviewText | Should -Match "暂停评判"
     $reviewText | Should -Match "数量优先"
@@ -811,7 +871,47 @@ Human Gate: manual visual signoff required
     $reviewText | Should -Match "后期评估"
     $reviewText | Should -Match "开放和包容"
     $reviewText | Should -Match "capability_route"
+    $reviewText | Should -Match "## Five Advisor Views"
+    $reviewText | Should -Match "Goal Clarifier / 目标澄清者"
+    $reviewText | Should -Match "Skeptical Reviewer / 反方审阅者"
+    $reviewText | Should -Match "Reuse Amplifier / 复用放大者"
+    $reviewText | Should -Match "User-Maintainer Observer / 用户维护者视角"
+    $reviewText | Should -Match "Next-Step Implementer / 下一步执行者"
+    $reviewText | Should -Match "## Final Council Decision"
+    $reviewText | Should -Match "decision:"
+    $reviewText | Should -Match "next_action:"
+    $reviewText | Should -Match "evidence_needed:"
+    $reviewText | Should -Match "human_gate_needed:"
+    $reviewText | Should -Match "pro_review_needed:"
     (Get-Content -Raw -LiteralPath (Join-Path $project "docs/ai-review-loop/goal-backlog.md")) | Should -Match "Capability route"
+  }
+
+  It "keeps low-confidence council decisions human-gated instead of inventing completion" {
+    $project = New-TestProject "local-council-low-confidence"
+    & $script:Skill -Action Init -Root $project
+
+    $statePath = Join-Path $project "docs/ai-review-loop/review-state.json"
+    $state = Read-State $project
+    $state.goal_contract_confidence = "low"
+    $state.latest_goal_contract = "docs/ai-review-loop/project-goal-contract.json"
+    $state.project_blocker_queue = @([pscustomobject]@{
+        id = "PB-LOW"
+        category = "needs_evidence"
+        scope = "project_total"
+        status = "open"
+        raw_text = "Project total goal is unclear."
+        action_kind = "clarify_goal"
+        recommended_next_action = "clarify_project_total_goal"
+      })
+    $state | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $statePath -Encoding UTF8
+
+    & $script:Skill -Action RunLocalCouncil -Root $project
+
+    $reviewPath = Join-Path $project ((Read-State $project).latest_local_council_review -replace "/", "\")
+    $reviewText = Get-Content -Raw -LiteralPath $reviewPath
+    $reviewText | Should -Match "I don't know"
+    $reviewText | Should -Match "decision: needs_human_decision"
+    $reviewText | Should -Match "Final Council Decision"
   }
 
   It "records progress artifacts and generates a council review" {

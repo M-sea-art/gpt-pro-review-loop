@@ -61,7 +61,7 @@ review package -> external/internal review -> local assessment -> next decision
 For ordinary use, prefer the thin command wrapper:
 
 ```powershell
-scripts/pro_loop.ps1 -Command local|pro|required-pro|testline|status|audit|gain|debt -Root "<project-root>"
+scripts/pro_loop.ps1 -Command local|pro|required-pro|testline|status|audit|recon|gain|debt -Root "<project-root>"
 ```
 
 Use `scripts/gpt_pro_review_loop.ps1` directly only for advanced maintenance, debugging, and compatibility actions.
@@ -125,7 +125,7 @@ GPT Pro, Codex efficiency review, and the local expert council are `reviewer` va
    & "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action Init -Root "<project-root>" -TargetChatGptUrl "https://chatgpt.com/..." -ProReviewMode optional
    ```
 
-   Ask the user for a ChatGPT URL only for `SendPrompt`, `SendAssessment`, `-ForceExternalReview`, `pro_review_mode=required`, or an explicit user request to involve GPT Pro. After the user confirms it, store it with `Init -TargetChatGptUrl`; do not ask again in later loop iterations unless the URL changes, is invalid, or the browser is clearly on a different ChatGPT conversation.
+   Ask the user for a ChatGPT URL only for `SendPrompt`, `SendAssessment`, `-ForceExternalReview`, `pro_review_mode=required`, or an explicit user request to send material to GPT Pro. A plain request to use `gpt-pro-review-loop`, `Pro 审阅循环`, or the review-loop skill starts the local expert council path by default. After the user confirms a URL, store it with `Init -TargetChatGptUrl`; do not ask again in later loop iterations unless the URL changes, is invalid, or the browser is clearly on a different ChatGPT conversation.
 
    If the user wants to force a fully local loop, initialize or update with:
 
@@ -182,7 +182,7 @@ GPT Pro, Codex efficiency review, and the local expert council are `reviewer` va
 
    Use `-GoalScope task|milestone|test_line|project_total` to label the current review target. Keep `project_total` as the terminal scope unless the user explicitly changes the project governance model. Compact prompts include `Goal Context` so GPT Pro and Codex efficiency review can distinguish a subgoal from total project completion.
 
-   If `pro_review_mode=disabled` or no Pro URL is confirmed, this step still creates local dossier/code-map/request material but does not create a GPT prompt.
+   If `pro_review_mode=disabled` or no Pro URL is confirmed, this step still creates local dossier/code-map/request material but does not create a GPT prompt. In this state `external_pro_status=not_requested`; do not count an external GPT Pro gate as failed.
 
    Useful quota parameters:
 
@@ -298,7 +298,7 @@ GPT Pro, Codex efficiency review, and the local expert council are `reviewer` va
    & "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action PromoteGoal -Root "<project-root>"
    ```
 
-   The council writes `reviews/*local-expert-council*`, `local-council.md`, and `goal-backlog.md`. Brainstorm ideas are recorded before any judgment. Post-evaluation then classifies ideas as immediately local, evidence-needed, Pro-needed, human decision, or future scope. Generated goals stay in backlog until promoted, and human-gated goals remain marked `needs_human_decision`.
+   The council writes `reviews/*local-expert-council*`, `local-council.md`, and `goal-backlog.md`. Council Lite is a local prompt/output framework, not a five-agent swarm, and it does not enable GPT Pro or require a ChatGPT URL. Brainstorm ideas are recorded before any judgment. The five fixed project views are `Goal Clarifier / 目标澄清者`, `Skeptical Reviewer / 反方审阅者`, `Reuse Amplifier / 复用放大者`, `User-Maintainer Observer / 用户维护者视角`, and `Next-Step Implementer / 下一步执行者`. The output must include `Project Context`, `Unjudged Ideas`, `Five Advisor Views`, `Conflict Resolution`, `Final Council Decision`, and `Next Smallest Action`. The final decision is advisory and must include `decision`, `next_action`, `evidence_needed`, `human_gate_needed`, and `pro_review_needed`. Generated goals stay in backlog until promoted, and human-gated goals remain marked `needs_human_decision`.
 
    If a capability scan exists, post-evaluation must cite recommended capability routes for candidate goals. For game projects this can include `@game-studio`, `$game-studio:game-playtest`, or related Game Studio child skills. If the route status is `installed-not-exposed`, treat it as a recommendation only, not a callable active capability.
 
@@ -345,6 +345,16 @@ Rules:
 - `stale_count >= 2` means pivot/process fix; do not keep repeating the same `local_only_next_action`.
 - `RunDoneGate` is mandatory before default project-total terminal completion.
 - `RunFinalClosure` records final process closure after project-total guard and Done Gate pass.
+
+## Reuse Recon Gate
+
+Use `ReuseRecon` only for non-trivial new module, workflow, UI, test, or dependency decisions. Skip it for tiny copy edits, report updates, and small localized fixes.
+
+```powershell
+& "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\pro_loop.ps1" -Command recon -Root "<project-root>" -ModuleGoal "<module goal>" -ModuleCategory "<optional category>"
+```
+
+`ReuseRecon` reuses `RunCapabilityScan` and writes `docs/ai-review-loop/reuse-recon/*-reuse-recon.md`. It decides between local reuse, existing skill/capability use, minimal custom work, external pattern study, or human-gated adoption. It does not run every `RunLoop` iteration, does not search the web by default, does not install dependencies, and does not copy external code. Use `-AllowWebResearch` only when the outer Codex agent should add external/GitHub candidate summaries.
 
 ## One-Command Prepare
 
@@ -421,6 +431,10 @@ For subgoal reviews:
 ```
 
 This can mark the test-line as achieved, but it must not stop the overall loop unless the project-total guard also passes.
+
+Scoped result reports must split the two claims. For `GoalScope task|milestone|test_line`, write the requested review outcome as the scoped result and write project-total completion separately as `NOT_COMPLETE` unless the terminal guard and Done Gate pass. Do not describe a task-scope review as failed merely because project-total completion is still blocked.
+
+Only mention Plan Mode in a final report when the current collaboration mode actually prevented writes. If the user has moved into Default/execution mode and the skill created `docs/ai-review-loop/`, report those files as executed artifacts instead of repeating an old "Plan Mode does not write files" caveat.
 
 ## Local Practice Assessment Rules
 

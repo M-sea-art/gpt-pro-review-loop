@@ -1,11 +1,15 @@
 param(
-  [ValidateSet("local", "pro", "required-pro", "testline", "status", "audit", "gain", "debt", "help", "off")]
+  [ValidateSet("local", "pro", "required-pro", "testline", "status", "audit", "recon", "gain", "debt", "help", "off")]
   [string]$Command = "help",
   [string]$Root = ".",
   [string]$TargetChatGptUrl,
   [switch]$ConfirmTestlineIsolation,
   [int]$TargetScore = 95,
   [string]$AuditContext = "",
+  [string]$ModuleGoal,
+  [string]$ModuleCategory,
+  [switch]$AllowWebResearch,
+  [switch]$AllowToolDiscovery,
   [string]$DebtNote,
   [string]$DebtTrigger
 )
@@ -19,11 +23,6 @@ function Resolve-LoopRoot {
   return (Resolve-Path -LiteralPath $Path).Path
 }
 
-function Invoke-Main {
-  param([string[]]$ArgsList)
-  & $MainScript @ArgsList
-}
-
 function Show-Help {
   @"
 Pro Loop thin command surface
@@ -35,6 +34,7 @@ Commands:
   testline     Enter isolated 95-point candidate loop. Requires -ConfirmTestlineIsolation.
   status       Show current loop state.
   audit        Run capability scan and periodic efficiency audit.
+  recon        Write a compact reuse reconnaissance decision package.
   gain         Show compact local gain metrics from the loop ledger.
   debt         List or record pro-loop debt notes.
   off          Force fully local mode and show status.
@@ -44,6 +44,7 @@ Examples:
   scripts/pro_loop.ps1 -Command local -Root <project-root>
   scripts/pro_loop.ps1 -Command pro -Root <project-root> -TargetChatGptUrl https://chatgpt.com/...
   scripts/pro_loop.ps1 -Command testline -Root <project-root> -ConfirmTestlineIsolation
+  scripts/pro_loop.ps1 -Command recon -Root <project-root> -ModuleGoal "add import workflow"
 "@
 }
 
@@ -134,35 +135,55 @@ $projectRoot = Resolve-LoopRoot $Root
 switch ($Command) {
   "help" { Show-Help }
   "local" {
-    Invoke-Main @("-Action", "Init", "-Root", $projectRoot, "-ProReviewMode", "disabled")
-    Invoke-Main @("-Action", "RunLoop", "-Root", $projectRoot)
+    & $MainScript -Action Init -Root $projectRoot -ProReviewMode disabled
+    & $MainScript -Action RunLoop -Root $projectRoot
   }
   "off" {
-    Invoke-Main @("-Action", "Init", "-Root", $projectRoot, "-ProReviewMode", "disabled")
-    Invoke-Main @("-Action", "Status", "-Root", $projectRoot)
+    & $MainScript -Action Init -Root $projectRoot -ProReviewMode disabled
+    & $MainScript -Action Status -Root $projectRoot
   }
   "pro" {
     if (-not $TargetChatGptUrl) { throw "TargetChatGptUrl is required for -Command pro." }
-    Invoke-Main @("-Action", "Init", "-Root", $projectRoot, "-TargetChatGptUrl", $TargetChatGptUrl, "-ProReviewMode", "optional")
-    Invoke-Main @("-Action", "PrepareCompactReview", "-Root", $projectRoot)
+    & $MainScript -Action Init -Root $projectRoot -TargetChatGptUrl $TargetChatGptUrl -ProReviewMode optional
+    & $MainScript -Action PrepareCompactReview -Root $projectRoot
   }
   "required-pro" {
     if (-not $TargetChatGptUrl) { throw "TargetChatGptUrl is required for -Command required-pro." }
-    Invoke-Main @("-Action", "Init", "-Root", $projectRoot, "-TargetChatGptUrl", $TargetChatGptUrl, "-ProReviewMode", "required")
-    Invoke-Main @("-Action", "PrepareCompactReview", "-Root", $projectRoot)
+    & $MainScript -Action Init -Root $projectRoot -TargetChatGptUrl $TargetChatGptUrl -ProReviewMode required
+    & $MainScript -Action PrepareCompactReview -Root $projectRoot
   }
   "testline" {
-    $args = @("-Action", "ConfigureLoopProfile", "-Root", $projectRoot, "-LoopProfile", "testline_95_auto", "-TargetScore", [string]$TargetScore)
-    if ($ConfirmTestlineIsolation) { $args += "-ConfirmTestlineIsolation" }
-    Invoke-Main $args
-    Invoke-Main @("-Action", "RunLoop", "-Root", $projectRoot, "-GoalScope", "test_line")
+    $configureArgs = @{
+      Action = "ConfigureLoopProfile"
+      Root = $projectRoot
+      LoopProfile = "testline_95_auto"
+      TargetScore = $TargetScore
+    }
+    if ($ConfirmTestlineIsolation) { $configureArgs.ConfirmTestlineIsolation = $true }
+    & $MainScript @configureArgs
+    & $MainScript -Action RunLoop -Root $projectRoot -GoalScope test_line
   }
-  "status" { Invoke-Main @("-Action", "Status", "-Root", $projectRoot) }
+  "status" { & $MainScript -Action Status -Root $projectRoot }
   "audit" {
-    $capabilityArgs = @("-Action", "RunCapabilityScan", "-Root", $projectRoot)
-    if ($AuditContext) { $capabilityArgs += @("-AuditContext", $AuditContext) }
-    Invoke-Main $capabilityArgs
-    Invoke-Main @("-Action", "RunEfficiencyAudit", "-Root", $projectRoot, "-PeriodicAudit")
+    $capabilityArgs = @{
+      Action = "RunCapabilityScan"
+      Root = $projectRoot
+    }
+    if ($AuditContext) { $capabilityArgs.AuditContext = $AuditContext }
+    & $MainScript @capabilityArgs
+    & $MainScript -Action RunEfficiencyAudit -Root $projectRoot -PeriodicAudit
+  }
+  "recon" {
+    $reconArgs = @{
+      Action = "ReuseRecon"
+      Root = $projectRoot
+    }
+    if ($ModuleGoal) { $reconArgs.ModuleGoal = $ModuleGoal }
+    if ($ModuleCategory) { $reconArgs.ModuleCategory = $ModuleCategory }
+    if ($AuditContext) { $reconArgs.AuditContext = $AuditContext }
+    if ($AllowWebResearch) { $reconArgs.AllowWebResearch = $true }
+    if ($AllowToolDiscovery) { $reconArgs.AllowToolDiscovery = $true }
+    & $MainScript @reconArgs
   }
   "gain" { Show-Gain -ProjectRoot $projectRoot }
   "debt" { Show-OrRecordDebt -ProjectRoot $projectRoot -Note $DebtNote -Trigger $DebtTrigger }

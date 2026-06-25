@@ -41,6 +41,7 @@ scripts/pro_loop.ps1 -Command required-pro -Root "<project-root>" -TargetChatGpt
 scripts/pro_loop.ps1 -Command testline -Root "<project-root>" -ConfirmTestlineIsolation
 scripts/pro_loop.ps1 -Command status -Root "<project-root>"
 scripts/pro_loop.ps1 -Command audit -Root "<project-root>"
+scripts/pro_loop.ps1 -Command recon -Root "<project-root>" -ModuleGoal "add import workflow"
 scripts/pro_loop.ps1 -Command gain -Root "<project-root>"
 scripts/pro_loop.ps1 -Command debt -Root "<project-root>"
 ```
@@ -246,6 +247,18 @@ For high-frequency Codex projects, run a one-time capability scan before the fir
 
 The scan is read-only. It recommends tool families, explains whether they are directly usable, whether install/enable/exposure is needed, and whether Human Gate authorization is required before write-capable or external actions. `Status` exposes `top_capability_family`, `top_capability_status`, and `recommended_capability_routes_preview` for the outer loop.
 
+## Reuse Recon Gate
+
+Before non-trivial module work, run a compact reuse reconnaissance pass:
+
+```powershell
+& "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\pro_loop.ps1" -Command recon -Root "<project-root>" -ModuleGoal "<module goal>" -ModuleCategory "<optional category>"
+```
+
+`recon` reuses the existing capability scan and writes `docs/ai-review-loop/reuse-recon/*-reuse-recon.md`. It is local-first: it checks project paths, loop ledger, and recommended capability routes. It does not install dependencies, copy external code, or search the network. Pass `-AllowWebResearch` only when the outer Codex agent should add external/GitHub candidate summaries to the decision package.
+
+Possible decisions are `USE_LOCAL`, `APPLY_EXISTING_SKILL`, `BUILD_CUSTOM_MINIMAL`, `STUDY_EXTERNAL_PATTERN_ONLY`, `ADOPT_EXTERNAL_AFTER_HUMAN_APPROVAL`, `DEFER`, and `REJECT`.
+
 Default efficiency mode is `standard`:
 
 ```powershell
@@ -287,6 +300,17 @@ Use a narrower active scope when the current review is only for a subgoal. The l
 ```powershell
 & "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action RunLoop -Root "<project-root>" -GoalScope test_line
 ```
+
+### Scoped Reporting
+
+When `GoalScope` is `task`, `milestone`, or `test_line`, report the review result separately from project-total completion:
+
+```text
+task-scope review: PASS/PARTIAL/FAIL for the requested review scope
+project-total completion: NOT_COMPLETE unless the terminal guard and Done Gate pass
+```
+
+A blocked project-total Done Gate is not the same as a failed task-scope review. In execution mode, do not repeat stale Plan Mode caveats such as "Plan Mode does not write files" after ledger files have actually been created.
 
 Prepare a compact package without starting the outer loop:
 
@@ -392,10 +416,12 @@ Check state:
 & "$env:USERPROFILE\.codex\skills\gpt-pro-review-loop\scripts\gpt_pro_review_loop.ps1" -Action Status -Root "<project-root>"
 ```
 
-When `pro_review_mode=optional` and no ChatGPT target URL is configured, `Status` is expected to recommend local continuation, not final completion:
+When no external Pro review has been explicitly requested, `Status` reports local review as active and `external_pro_status=not_requested`; that is not a failed gate. If `pro_review_mode=optional` has no ChatGPT target URL, `Status` is still expected to recommend local continuation, not final completion:
 
 ```text
 status_guidance          : optional_pro_url_missing_continue_local_loop
+local_review_loop_active : true
+external_pro_status      : not_requested
 recommended_next_action  : run_loop_local_without_pro_or_ask_once_for_target_url
 recommended_next_command : ... -Action RunLoop -Root "<project-root>"
 ```
@@ -541,10 +567,15 @@ Generated review-loop files are excluded from later code maps and sensitive scan
 
 ## Local Expert Council
 
-`RunLocalCouncil` writes a unified review event with `reviewer=local-expert-council`. It is a brainstorming meeting, not a risk audit. The record has two stages:
+`RunLocalCouncil` writes a unified review event with `reviewer=local-expert-council`. Council Lite is a local prompt/output framework, not a five-agent swarm, and it does not enable GPT Pro or require a ChatGPT URL. It is a brainstorming meeting, not a risk audit. The record uses five project-oriented views:
 
-1. `Brainstorm`: applies the seven rules: free ideas, suspend judgment, quantity first, build on each other, record all ideas, evaluate later, and keep the meeting open and inclusive.
-2. `Post-Evaluation`: classifies ideas as immediately local, evidence-needed, external-Pro-needed, human-decision-needed, or future scope.
+- `Goal Clarifier / 目标澄清者`: project total goal, current scope, and false-completion boundaries.
+- `Skeptical Reviewer / 反方审阅者`: weak assumptions, acceptance gaps, and false-completion risk.
+- `Reuse Amplifier / 复用放大者`: existing code, skills, plugins, scripts, capability scan, and ReuseRecon routes.
+- `User-Maintainer Observer / 用户维护者视角`: usability, readability, maintainability, and handoff clarity.
+- `Next-Step Implementer / 下一步执行者`: one smallest local action, evidence path, and pause condition.
+
+The record contains `Project Context`, `Unjudged Ideas`, `Five Advisor Views`, `Conflict Resolution`, `Final Council Decision`, and `Next Smallest Action`. The final decision is advisory and must include `decision`, `next_action`, `evidence_needed`, `human_gate_needed`, and `pro_review_needed`.
 
 The council updates `local-council.md` and `goal-backlog.md`. Generated goals stay in backlog and do not expand implementation scope automatically. Human Gate, core-system, publish, push, authorization, and protected-scope goals are marked `needs_human_decision`. Post-evaluation includes a `recommended_capability_route` for each candidate goal when a capability scan exists.
 
